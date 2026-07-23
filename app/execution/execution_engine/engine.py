@@ -699,6 +699,10 @@ class ExecutionEngine(Service):
         self, symbol: str, side: OrderSide, reason: RejectReason, rule: str, detail: str
     ) -> None:
         """Publish an order rejection plus its risk explanation."""
+        self._log.warning(
+            "Order rejected %s %s — %s: %s (%s)",
+            symbol, side.value, rule, detail, reason.value,
+        )
         request = OrderRequest(symbol=symbol, side=side, quantity=0.0, reason=detail)
         order = self._orders.create(request)
         self._orders.reject(order, reason)

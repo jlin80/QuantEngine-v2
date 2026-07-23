@@ -35,6 +35,22 @@ _log = logging.getLogger("app.brokers.mt5.broker")
 _RETCODE_DONE = 10009
 
 
+def _mt5_comment(reason: str | None) -> str:
+    """Sanitize an order comment for MT5's ``order_send``.
+
+    MT5 sólo acepta ASCII imprimible y ~31 caracteres en el campo ``comment``;
+    acentos o símbolos (é, ñ, —, ≤...) provocan ``order_send`` → ``[-2] Invalid
+    "comment" argument`` y la orden nunca llega al broker.
+    """
+    text = reason or "quantengine"
+    ascii_only = text.encode("ascii", "ignore").decode("ascii")
+    # Exness/MT5 rechaza puntuación (paréntesis, ':', '%'...) en el comentario:
+    # se conserva sólo alfanumérico y espacio, que el servidor acepta siempre.
+    cleaned = "".join(ch if ch.isalnum() or ch == " " else " " for ch in ascii_only)
+    cleaned = " ".join(cleaned.split())  # colapsa espacios repetidos
+    return cleaned[:31].strip() or "quantengine"
+
+
 class MT5Broker:
     """Venue de ejecución real contra una cuenta demo vía MetaTrader 5.
 
@@ -125,19 +141,43 @@ class MT5Broker:
             "price": price,
             "deviation": self._deviation,
             "magic": self._magic,
-            "comment": (request.reason or "quantengine")[:31],
+            "comment": _mt5_comment(request.reason),
             "type_time": getattr(mt5, "ORDER_TIME_GTC", 0),
-            "type_filling": self._filling_mode(mt5, real_symbol),
         }
         if request.stop_loss is not None:
             payload["sl"] = float(request.stop_loss)
         if request.take_profit is not None:
             payload["tp"] = float(request.take_profit)
 
-        with self._conn.lock:
-            result = mt5.order_send(payload)
-
+        result = self._send_with_fallbacks(mt5, real_symbol, payload)
         return self._interpret(result, request, ticker, volume, mt5)
+
+    def _send_with_fallbacks(self, mt5: ModuleType, symbol: str, payload: dict[str, Any]) -> Any:
+        """``order_send`` probando modos de llenado válidos (y sin comentario).
+
+        Exness rechaza algunos ``type_filling`` con retcode 10030 (Unsupported
+        filling mode) y los comentarios no alfanuméricos con ``[-2]``. Se prueban
+        los modos soportados por el símbolo y, si el comentario molesta, se
+        reintenta sin él, antes de dar la orden por rechazada.
+        """
+        invalid_fill = int(getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030))
+        result: Any = None
+        with self._conn.lock:
+            for mode in self._filling_modes(mt5, symbol):
+                payload["type_filling"] = mode
+                result = mt5.order_send(payload)
+                if result is None:
+                    code, _ = self._last_error(mt5)
+                    if code == -2 and "comment" in payload:
+                        _log.warning("order_send [-2] con comment; reintento sin comment")
+                        payload.pop("comment", None)
+                        result = mt5.order_send(payload)
+                if result is None:
+                    return None
+                if int(getattr(result, "retcode", -1)) != invalid_fill:
+                    return result  # éxito o rechazo por otra causa: no reintentar
+                _log.warning("retcode 10030 con type_filling=%s; probando siguiente", mode)
+        return result
 
     # ------------------------------------------------------------------
     # Internos
@@ -210,13 +250,31 @@ class MT5Broker:
         volume = round(steps * step, 8)
         return max(vmin, volume)
 
-    def _filling_mode(self, mt5: ModuleType, symbol: str) -> int:
-        """Elige un modo de llenado compatible con el símbolo (FOK/IOC/RETURN)."""
+    def _filling_modes(self, mt5: ModuleType, symbol: str) -> list[int]:
+        """Modos ``ORDER_FILLING_*`` a probar según el bitmask del símbolo.
+
+        ``symbol_info.filling_mode`` es un BITMASK de modos permitidos
+        (``SYMBOL_FILLING_FOK=1``, ``SYMBOL_FILLING_IOC=2``), distinto de las
+        constantes de orden ``ORDER_FILLING_*``. Pasar el bitmask crudo como
+        ``type_filling`` provoca retcode 10030; aquí se mapea correctamente y se
+        devuelven candidatos en orden de preferencia (IOC → FOK → RETURN).
+        """
+        fok = int(getattr(mt5, "ORDER_FILLING_FOK", 0))
+        ioc = int(getattr(mt5, "ORDER_FILLING_IOC", 1))
+        ret = int(getattr(mt5, "ORDER_FILLING_RETURN", 2))
+        sym_fok = int(getattr(mt5, "SYMBOL_FILLING_FOK", 1))
+        sym_ioc = int(getattr(mt5, "SYMBOL_FILLING_IOC", 2))
         info = mt5.symbol_info(symbol)
-        default = getattr(mt5, "ORDER_FILLING_IOC", 1)
-        if info is None:
-            return int(default)
-        return int(getattr(info, "filling_mode", default) or default)
+        allowed = int(getattr(info, "filling_mode", 0)) if info is not None else 0
+        preferred: list[int] = []
+        if allowed & sym_ioc:
+            preferred.append(ioc)
+        if allowed & sym_fok:
+            preferred.append(fok)
+        for mode in (ioc, fok, ret):  # fallback si el bitmask no está disponible
+            if mode not in preferred:
+                preferred.append(mode)
+        return preferred
 
     def _reject(self, reason: RejectReason) -> BrokerExecution:
         """Cuenta y devuelve un rechazo."""
