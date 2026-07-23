@@ -387,6 +387,7 @@ class ExecutionEngine(Service):
 
     async def manage_once(self) -> None:
         """Run one management pass over every open position."""
+        await self._reconcile_broker_positions()
         for position in self._positions.open_positions:
             ticker = self._market.get_ticker(position.symbol)
             if ticker is None:
@@ -400,6 +401,83 @@ class ExecutionEngine(Service):
             if reason is not None:
                 await self.close_position(position, reason)
         await self._refresh_risk()
+
+    async def _reconcile_broker_positions(self) -> None:
+        """Detect positions closed outside the bot (broker terminal/manual).
+
+        Sólo aplica a brokers reales que exponen ``open_position_tickets``
+        (p. ej. :class:`~app.brokers.mt5.broker.MT5Broker`); el paper broker no
+        lo tiene y esta función no hace nada en ese caso. Sin esto, si el
+        usuario cierra a mano una posición en Exness, el Position Manager
+        nunca se entera y el dashboard sigue mostrándola "open" con PnL/
+        balance calculados sobre una posición que ya no existe.
+        """
+        live_tickets_of = getattr(self._paper, "open_position_tickets", None)
+        if live_tickets_of is None:
+            return
+        tracked = [p for p in self._positions.open_positions if p.metadata.get("broker_ref")]
+        if not tracked:
+            return
+        symbols = {p.symbol for p in tracked}
+        live_by_symbol = {symbol: live_tickets_of(symbol) for symbol in symbols}
+        for position in tracked:
+            ref = str(position.metadata.get("broker_ref"))
+            if ref in {str(t) for t in live_by_symbol.get(position.symbol, set())}:
+                continue
+            await self._settle_external_close(position)
+
+    async def _settle_external_close(self, position: Position) -> None:
+        """Settle internally a position that no longer exists in the broker.
+
+        No hay fill real que traducir (el cierre ya ocurrió fuera del bot), así
+        que se liquida al último precio de mercado conocido con comisión 0 —
+        es una aproximación honesta, no un cierre simulado con costes.
+        """
+        ticker = self._market.get_ticker(position.symbol)
+        exit_price = ticker.mid if ticker is not None else position.mark_price
+        close_side = OrderSide.SELL if position.is_long else OrderSide.BUY
+        fill = Fill(
+            request_id=f"external-close-{position.position_id}",
+            symbol=position.symbol,
+            side=close_side,
+            quantity=position.quantity,
+            requested_quantity=position.quantity,
+            reference_price=exit_price,
+            price=exit_price,
+            commission=0.0,
+        )
+        gross_pnl = self._positions.close(
+            position,
+            exit_price=fill.price,
+            close_commission=0.0,
+            reason=ExitReason.MANUAL,
+            exit_reasons=("cerrada fuera del bot (terminal/broker)",),
+        )
+        self._portfolio.on_trade_closed(gross_pnl=gross_pnl, close_commission=0.0)
+        self._risk.on_trade_closed(position.realized_pnl)
+        self._journal.record(self._trade_record(position, fill))
+        await self._publish(
+            ev.PositionClosed(
+                source="execution_engine",
+                position_id=position.position_id,
+                symbol=position.symbol,
+                side=position.side.value,
+                quantity=position.quantity,
+                exit_price=fill.price,
+                pnl=round(position.realized_pnl, 6),
+                r_multiple=round(position.r_multiple(fill.price), 4),
+                exit_reason=ExitReason.MANUAL.value,
+                holding_seconds=position.holding_seconds(),
+            )
+        )
+        self._log.warning(
+            "Posición %s %s ya no existe en el broker (cierre externo); "
+            "se liquida en el bot a %.4f PnL=%.2f",
+            position.symbol,
+            position.side.value,
+            fill.price,
+            position.realized_pnl,
+        )
 
     async def _refresh_risk(self) -> None:
         """Update drawdown-driven risk state and flatten on kill switch."""

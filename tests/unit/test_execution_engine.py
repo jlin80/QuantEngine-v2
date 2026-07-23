@@ -123,3 +123,43 @@ async def test_full_flow_publishes_events():
     assert "OrderExecuted" in seen
     assert "PositionOpened" in seen
     assert "PositionClosed" in seen
+
+
+async def test_reconciliation_settles_position_closed_outside_the_bot():
+    """Si el usuario cierra la posición a mano en el broker, el bot lo detecta."""
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await engine.process_decision(_decision())
+    assert position is not None
+    position.metadata["broker_ref"] = "12345"
+
+    class _BrokerWithoutThatTicket:
+        def open_position_tickets(self, symbol: str) -> set[int]:
+            return set()  # el broker real ya no tiene ninguna posición abierta
+
+    engine._paper.open_position_tickets = _BrokerWithoutThatTicket().open_position_tickets  # type: ignore[attr-defined]
+
+    await engine.manage_once()
+
+    assert not engine.positions.open_positions
+    assert engine.journal.count == 1
+    trade = engine.journal.all()[0]
+    assert trade.exit_reason is ExitReason.MANUAL
+
+
+async def test_reconciliation_leaves_matching_positions_alone():
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await engine.process_decision(_decision())
+    assert position is not None
+    position.metadata["broker_ref"] = "12345"
+
+    class _BrokerWithThatTicket:
+        def open_position_tickets(self, symbol: str) -> set[int]:
+            return {12345}
+
+    engine._paper.open_position_tickets = _BrokerWithThatTicket().open_position_tickets  # type: ignore[attr-defined]
+
+    await engine.manage_once()
+
+    assert engine.positions.open_positions  # sigue abierta, no se tocó

@@ -165,6 +165,7 @@ class PositionManager:
                 "atr": atr,
                 "volatility": volatility,
                 "entry_slippage_bps": fill.slippage_bps,
+                "broker_ref": fill.broker_ref,
             },
         )
         self._open[position.position_id] = position

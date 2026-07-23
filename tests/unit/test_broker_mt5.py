@@ -246,3 +246,14 @@ def test_reduce_only_without_matching_position_is_rejected() -> None:
 
     assert result.reject_reason is RejectReason.BROKER_REJECTED
     assert not fake.sent
+
+
+def test_open_position_tickets_reflects_live_broker_state() -> None:
+    open_position = SimpleNamespace(
+        ticket=581758329, symbol="XAUUSD", type=FakeMT5.POSITION_TYPE_BUY, time=100
+    )
+    fake = FakeMT5(positions=[open_position])
+    broker = _connected_broker(fake)
+
+    assert broker.open_position_tickets("XAUUSD") == {581758329}
+    assert broker.open_position_tickets("ETHUSD") == set()

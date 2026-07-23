@@ -167,6 +167,21 @@ class MT5Broker:
         result = self._send_with_fallbacks(mt5, real_symbol, payload)
         return self._interpret(result, request, ticker, volume, mt5)
 
+    def open_position_tickets(self, symbol: str) -> set[int]:
+        """Tickets de las posiciones realmente abiertas en MT5 para ``symbol``.
+
+        Usado por la reconciliación del Execution Engine para detectar
+        posiciones que el bot cree abiertas pero que ya no existen en la
+        cuenta real (p. ej. porque se cerraron a mano en el terminal/Exness).
+        """
+        if not self._conn.connected:
+            return set()
+        real_symbol = self._conn.resolve_symbol(symbol)
+        positions = self._conn.mt5.positions_get(symbol=real_symbol)
+        if not positions:
+            return set()
+        return {int(p.ticket) for p in positions}
+
     def _matching_position_ticket(
         self, mt5: ModuleType, symbol: str, closing_is_buy: bool
     ) -> int | None:
@@ -250,6 +265,7 @@ class MT5Broker:
         fill_price = float(getattr(result, "price", 0.0)) or ticker.mid
         filled_volume = float(getattr(result, "volume", requested_volume)) or requested_volume
         self._executed += 1
+        order_ticket = getattr(result, "order", None)
         fill = Fill(
             request_id=request.request_id,
             symbol=request.symbol,
@@ -262,6 +278,7 @@ class MT5Broker:
             commission=abs(float(getattr(result, "commission", 0.0) or 0.0)),
             liquidity="taker",
             executed_at=utc_now(),
+            broker_ref=str(order_ticket) if order_ticket else None,
         )
         return BrokerExecution(fill, RejectReason.NONE)
 

@@ -109,6 +109,8 @@ class Fill:
         liquidity: ``maker`` o ``taker``.
         gapped: Si el precio saltó (gap) respecto a la referencia.
         executed_at: Momento de ejecución (UTC).
+        broker_ref: Identificador de la operación en el broker real (p. ej. el
+            ticket de posición en MT5), si aplica. ``None`` en paper trading.
     """
 
     fill_id: str = field(default_factory=_new_id)
@@ -126,6 +128,7 @@ class Fill:
     liquidity: str = "taker"
     gapped: bool = False
     executed_at: datetime = field(default_factory=utc_now)
+    broker_ref: str | None = None
 
     @property
     def notional(self) -> float:
