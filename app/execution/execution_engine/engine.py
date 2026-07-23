@@ -513,6 +513,7 @@ class ExecutionEngine(Service):
             self._settings.exit_on_regime_change
             and self._context is not None
             and position.regime not in ("", "unknown")
+            and position.holding_seconds() >= self._settings.regime_change_min_holding_seconds
         )
         if regime_exit:
             view = await self._market_view(position.symbol)

@@ -768,6 +768,10 @@ class ExecutionSettings(BaseModel):
     trailing_atr_multiple: float = 2.0
     max_holding_minutes: float = 240.0  # salida por tiempo (0 desactiva)
     exit_on_regime_change: bool = True
+    # Tiempo mínimo antes de que un cambio de régimen pueda cerrar: sin esto,
+    # el régimen "parpadea" entre etiquetas vela a vela (más en cripto, velas
+    # 1m ruidosas) y corta la posición casi al entrar, antes de que se mueva.
+    regime_change_min_holding_seconds: float = 180.0
     report_interval_seconds: float = 3600.0  # resumen periódico a Discord
     journal_path: Path = _PROJECT_ROOT / "data" / "execution" / "journal.jsonl"
     persist_journal: bool = True

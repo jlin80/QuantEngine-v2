@@ -1,10 +1,12 @@
 """Execution Engine: flujo completo de paper trading, extremo a extremo."""
 
 import asyncio
+from datetime import timedelta
 
 from app.core.events.base import Event
 from app.core.events.bus import EventBus
 from app.engine.events import DecisionGenerated
+from app.execution.execution_engine.engine import _MarketView
 from app.execution.models import ExitReason
 from app.market.services import MarketDataService, MarketStateStore
 
@@ -123,6 +125,36 @@ async def test_full_flow_publishes_events():
     assert "OrderExecuted" in seen
     assert "PositionOpened" in seen
     assert "PositionClosed" in seen
+
+
+async def test_regime_change_exit_respects_min_holding_seconds():
+    """Un régimen que 'parpadea' justo al abrir no debe cortar la posición
+    de inmediato — solo tras el tiempo mínimo de retención configurado."""
+    market, _ = _market()
+    engine = make_engine(market, make_execution_settings(regime_change_min_holding_seconds=120.0))
+    position = await engine.process_decision(_decision())
+    assert position is not None
+    position.regime = "trending"
+    engine._context = object()  # type: ignore[assignment]  # activa la rama de salida por régimen
+
+    async def fake_view(symbol: str) -> _MarketView:
+        return _MarketView(
+            atr=None,
+            atr_pct=None,
+            spread_bps=None,
+            regime="ranging",
+            volatility="normal",
+            volume=None,
+            last_price=None,
+            session="america",
+        )
+
+    engine._market_view = fake_view  # type: ignore[method-assign]
+
+    assert await engine._exit_reason(position) is None  # recién abierta
+
+    position.opened_at = position.opened_at - timedelta(seconds=200)
+    assert await engine._exit_reason(position) is ExitReason.REGIME_CHANGE
 
 
 async def test_reconciliation_settles_position_closed_outside_the_bot():
