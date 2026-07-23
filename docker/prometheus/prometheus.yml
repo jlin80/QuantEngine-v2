@@ -1,0 +1,21 @@
+# Prometheus — el backend expone /metrics desde la Fase 9 (antes daba 404).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+scrape_configs:
+  - job_name: "quant-engine-backend"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["backend:8000"]
+
+# Alertmanager: opcional. Si ya corre uno en el homelab (CT103), apuntar aquí
+# en vez de levantar otro. Las alertas del motor son infraestructura y salen
+# por donde lo haga el homelab; el motor mismo sigue notificando solo a Discord.
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["192.168.100.30:9093"]

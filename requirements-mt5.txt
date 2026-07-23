@@ -1,0 +1,10 @@
+# Dependencias SÓLO para el modo demo con MetaTrader 5 (Windows).
+#
+# NO se incluyen en requirements.txt porque:
+#   - MetaTrader5 no tiene wheels fuera de Windows (rompería el build Linux/CI).
+#   - numpy debe quedar <2: en CPUs sin SSE4.2/AVX (VPS Bobcat) numpy>=2 aborta
+#     el proceso al importar, y MetaTrader5 depende de numpy.
+#
+# Instalar en el servidor demo:  pip install -r requirements-mt5.txt
+MetaTrader5==5.0.5735
+numpy<2

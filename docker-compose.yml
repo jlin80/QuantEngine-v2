@@ -1,0 +1,133 @@
+# ============================================================================
+# Quant Engine V2 — orquestación local completa.
+# Perfiles:
+#   (default)     -> backend + postgres + redis
+#   dashboard     -> frontend Next.js (fase futura; Dockerfile preparado)
+#   timescale     -> TimescaleDB (opcional, series de tiempo)
+#   monitoring    -> Prometheus + Grafana (preparados)
+# Uso: docker compose up -d
+#      docker compose --profile monitoring up -d
+# ============================================================================
+name: quant-engine
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: qe-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Dentro de la red de compose los hosts son los nombres de servicio.
+      QE_DATABASE__HOST: postgres
+      QE_CACHE__HOST: redis
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  dashboard:
+    profiles: ["dashboard"]
+    build:
+      context: ./dashboard
+      dockerfile: ../docker/dashboard.Dockerfile
+    container_name: qe-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: qe-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${QE_DATABASE__USER:-quant}
+      POSTGRES_PASSWORD: ${QE_DATABASE__PASSWORD:-quant_dev_password}
+      POSTGRES_DB: ${QE_DATABASE__NAME:-quant_engine}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${QE_DATABASE__USER:-quant} -d ${QE_DATABASE__NAME:-quant_engine}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: qe-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  timescaledb:
+    profiles: ["timescale"]
+    image: timescale/timescaledb:latest-pg16
+    container_name: qe-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${QE_DATABASE__USER:-quant}
+      POSTGRES_PASSWORD: ${QE_DATABASE__PASSWORD:-quant_dev_password}
+      POSTGRES_DB: quant_timeseries
+    ports:
+      - "5433:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:latest
+    container_name: qe-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:latest
+    container_name: qe-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  timescale_data:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,129 @@
+# ============================================================================
+# Reglas de alerta del motor (Fase 9).
+#
+# Estas reglas las evalúa Prometheus y las enruta Alertmanager — NO el motor.
+# La regla de oro del proyecto (notificaciones exclusivamente por Discord)
+# aplica a lo que envía QuantEngine; el stack de monitoreo es infraestructura
+# aparte y puede alertar por donde ya lo haga el homelab.
+#
+# Estilo alineado con /root/monitoring/alert_rules.yml de CT103.
+# ============================================================================
+groups:
+  - name: quantengine-critico
+    rules:
+      - alert: MotorCaido
+        expr: up{job="quant-engine-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "QuantEngine no responde"
+          description: "El endpoint /metrics lleva 2+ min sin contestar. El bot puede estar caído."
+
+      # El fallo más peligroso no es que el motor caiga: es que siga en pie
+      # sin recibir datos. Discord nunca avisa de esto porque no ocurre nada.
+      - alert: MercadoSinDatos
+        expr: rate(quantengine_market_ticks_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sin ticks de mercado hace 10 min"
+          description: "El motor está vivo pero no entra ningún dato. Feed muerto o desconectado."
+
+      - alert: KillSwitchActivo
+        expr: quantengine_production_kill_switch_active == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kill switch global activado"
+          description: "El motor dejó de operar. Requiere liberación manual con actor y motivo."
+
+      # Invariante de la Fase 9: si esto salta, algo se saltó el Live Gate.
+      - alert: LiveTradingHabilitado
+        expr: quantengine_live_enabled == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LIVE TRADING ACTIVO"
+          description: "El modo resuelto es live. Verificar que fue una decisión deliberada y aprobada."
+
+  - name: quantengine-medio
+    rules:
+      - alert: SafeModeActivo
+        expr: quantengine_safe_mode_active == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Safe Mode lleva 5+ min activo"
+          description: "No se abren posiciones nuevas. El sistema no termina de recuperarse."
+
+      - alert: DrawdownAlto
+        expr: quantengine_portfolio_drawdown_percent > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Drawdown {{ $value | printf \"%.1f\" }}% sostenido"
+          description: "Acercándose al umbral del kill switch."
+
+      - alert: EventLoopBloqueado
+        expr: quantengine_event_loop_lag_ms > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bucle de eventos con {{ $value | printf \"%.0f\" }} ms de retraso"
+          description: "Algo bloquea el loop asyncio: la ejecución de órdenes llegará tarde."
+
+      - alert: ErroresEnJobs
+        expr: increase(quantengine_scheduler_job_errors_total[15m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "El job {{ $labels.job }} falla repetidamente"
+          description: "{{ $value | printf \"%.0f\" }} errores en 15 min."
+
+      - alert: DiscordFallando
+        expr: increase(quantengine_notifications_failed_total[15m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Las notificaciones de Discord están fallando"
+          description: "El canal único del motor no entrega: se está operando a ciegas."
+
+      - alert: CacheDegradado
+        expr: quantengine_cache_degraded == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache degradado a memoria"
+          description: "Redis no responde. Es un fallback por diseño, pero lleva 15+ min así."
+
+  - name: quantengine-info
+    rules:
+      - alert: DriftDetectado
+        expr: quantengine_ml_drift_detected == 1
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "El ML detecta deriva"
+          description: "Se programará reentrenamiento. El ML asesora, no opera: no hay riesgo inmediato."
+
+      - alert: RechazosDeBrokerAltos
+        expr: |
+          increase(quantengine_broker_rejected_total[1h])
+            / clamp_min(increase(quantengine_broker_executed_total[1h]), 1) > 0.2
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Más del 20% de las órdenes se rechazan"
+          description: "Revisar spread, liquidez o los límites del Risk Manager."

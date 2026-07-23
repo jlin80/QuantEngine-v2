@@ -1,0 +1,321 @@
+================================================================================
+QUANT ENGINE V2 — NOTAS DEL PROYECTO (Fase 1 → Fase 5)
+Motor cuantitativo modular para scalping de cripto + XAUUSD (oro).
+Paper trading primero; live SOLO tras criterios estadísticos definidos.
+Última actualización: 2026-07-17 · versión actual: v0.5.0
+================================================================================
+
+--------------------------------------------------------------------------------
+0. PRINCIPIOS Y REGLAS TRANSVERSALES (aplican a todas las fases)
+--------------------------------------------------------------------------------
+- Python 3.12 (objetivo) · Clean Architecture + SOLID + DRY · event-driven.
+- Tipado completo con MyPy strict · docstrings estilo Google · Ruff + Black ·
+  Pytest (asyncio_mode=auto). La "batería" de calidad debe quedar en verde.
+- Configuración 100% por variables de entorno: prefijo QE_ y anidamiento con
+  doble guion bajo (QE_SECCION__CAMPO). 4 ambientes: development / testing /
+  paper / production. `testing` fuerza Discord OFF. Secretos con SecretStr,
+  nunca hardcodeados.
+- NOTIFICACIONES EXCLUSIVAMENTE POR DISCORD WEBHOOK (regla global). Sin
+  Telegram/Slack/email. Webhook en `.env` (QE_DISCORD__WEBHOOK_URL).
+- Inyección de dependencias con un contenedor explícito; el ÚNICO sitio donde
+  se arma el grafo es el composition root: app/engine/bootstrap.py.
+- Comunicación entre módulos por eventos en un EventBus asíncrono propio;
+  nunca llamadas directas cuando basta un evento. Eventos inmutables y
+  JSON-safe.
+- Cada servicio de larga vida implementa `Service` (start/stop/healthcheck
+  uniformes, con estados CREATED→STARTING→RUNNING→STOPPING→STOPPED/FAILED).
+- Gating de fases ESTRICTO: no se añade código de una fase hasta que el
+  usuario la abre. Regla de oro persistente: NADA de live trading todavía.
+- Sin auto-commits: el usuario commitea a mano. (El repo sigue SIN commitear.)
+- Documentación: ADRs y arquitectura en docs/ ; bitácora en docs/bitacora.md
+  vía DocumentationService (backend Markdown ahora; Notion preparado a futuro).
+- Máquina local sólo tiene Python 3.14 (no 3.12); la imagen Docker es
+  python:3.12-slim. El .venv local usa 3.14. Docker CLI NO instalado aquí.
+
+Ubicación: C:\Users\jinlh\OneDrive\Documents\Projects\QuantEngineV2 (repo git
+propio, rama main). Es una reconstrucción desde cero, separada del QuantEngine
+original.
+
+--------------------------------------------------------------------------------
+1. ESTRUCTURA GENERAL DEL CÓDIGO
+--------------------------------------------------------------------------------
+app/
+  core/         -> EventBus, contenedor DI, Service (ciclo de vida), excepciones,
+                   interfaces (protocolos), eventos base.
+  config/       -> settings.py (pydantic-settings, todas las secciones), entornos.
+  cache/        -> CacheService (Redis primario + fallback en memoria).
+  database/     -> SQLAlchemy async + Alembic (migraciones).
+  logging/      -> logging estructurado con rotación por módulo.
+  monitoring/   -> HealthMonitor + Watchdog (supervisión y reinicio).
+  scheduler/    -> AsyncScheduler (jobs periódicos).
+  notifications/-> NotificationService + canal Discord (webhook, embeds).
+  documentation/-> DocumentationService (bitácora Markdown; Notion preparado).
+  market/       -> Data Engine (Fase 2): proveedores, normalizadores, pipeline.
+  analytics/    -> indicadores puros (Fase 4).
+  engine/       -> Quant Core (Fase 3) + bootstrap + orquestador QuantEngine.
+  strategies/   -> biblioteca de estrategias plugin (Fase 4).
+  execution/    -> Execution Engine + Paper Trading (Fase 5).
+  dashboard/    -> API FastAPI (/api/*, /ws/events).
+tests/          -> unit/ + integration/ (382 tests).
+docs/           -> architecture.md, conventions.md, strategies.md, execution.md,
+                   bitacora.md, decisions/ (ADRs).
+
+--------------------------------------------------------------------------------
+2. FASE 1 — INFRAESTRUCTURA  (v0.1.x, cerrada 2026-07-16)
+--------------------------------------------------------------------------------
+Objetivo: sólo cimientos. Sin estrategias, sin ML, sin brokers, sin backtesting.
+
+Entregado:
+- EventBus asíncrono: publicación no bloqueante (cola interna + worker),
+  aislamiento de errores por handler, dead-letters, métricas, suscripción por
+  tipo (incluye subclases) o comodín.
+- Contenedor DI minimalista (register_instance / register_factory / resolve),
+  singletons; usado sólo en el bootstrap.
+- `Service` (clase base de ciclo de vida) + orquestador `QuantEngine` que arranca
+  y apaga los servicios en orden (bus primero, API al final; apagado inverso) y
+  los pone bajo el Watchdog con heartbeats.
+- CacheService (Redis + fallback memoria con cooldown de reintento).
+- Base de datos perezosa (sin conectar hasta el primer uso) + Alembic.
+- NotificationService desacoplado + canal Discord (embeds, color por severidad,
+  manejo de rate-limit 429 y reintentos con backoff).
+- Scheduler, HealthMonitor (CPU/RAM/disco + reporte horario), Watchdog.
+- Logging estructurado con rotación; DocumentationService (bitácora Markdown).
+- API FastAPI base: /api/health, /api/system/status, /ws/events.
+- Config tipada completa (pydantic-settings), 4 ambientes, precedencia
+  entorno > .env > config/<env>.env.
+- Docker Compose preparado (backend+postgres+redis; perfiles dashboard/
+  timescale/monitoring).
+
+Cierre: test de integración de arranque del engine en puerto efímero (DI,
+SystemStarted, supervisión). Cobertura ~83%.
+
+--------------------------------------------------------------------------------
+3. FASE 2 — DATA ENGINE  (v0.2.0, cerrada 2026-07-16)
+--------------------------------------------------------------------------------
+Objetivo: ingesta de datos de mercado en tiempo real, robusta y broker-agnóstica.
+
+Entregado (app/market/):
+- Proveedores funcionales (WS + REST): Binance, Bybit, OKX. Preparados como
+  stubs detrás de la interfaz `MarketDataProvider` + `ProviderRegistry`:
+  Bitget, OANDA, MT5, IBKR.
+- Normalizadores por exchange -> modelos internos inmutables y tipados (Ticker,
+  Trade, Candle, OrderBook…), con doble timestamp UTC (exchange + local) y
+  latencia. El formato original del exchange muere en el normalizador.
+- `WSConnection`: reconexión con backoff+jitter, heartbeat, detección de
+  staleness, resuscripción; transporte inyectable (tests sin red).
+- Pipeline `TickCollector`: validador de calidad -> MarketStateStore ->
+  CandleAggregator (buckets UTC por timeframe) -> OrderBookManager (con
+  detección de gaps de secuencia y resync REST) -> MarketCache (mkt:*) ->
+  MarketDataWriter (batched, con spill a JSONL si cae la DB) -> eventos.
+- Alembic 0001 (market_ticks, market_candles).
+- `MarketDataService`: la API interna broker-agnóstica (get_ticker, get_candles,
+  get_last_price, get_spread, get_orderbook, snapshots…). La consumen las fases
+  superiores.
+- Endpoints /api/market/*; jobs de mercado en el scheduler.
+
+Gotchas resueltos: colisión de nombre Service._state (el collector usa
+_market_state), import circular roto vía TYPE_CHECKING, Event.to_dict()
+recursivamente JSON-safe, el writer captura OSError crudo (asyncpg).
+Smoke real vs Binance WS (~500 msg/s) OK. QE_MARKET__ENABLED: false por defecto
+y en testing, true en dev/paper/prod. Cobertura ~79%, 136 tests.
+
+--------------------------------------------------------------------------------
+4. FASE 3 — QUANT CORE + STRATEGY ENGINE  (v0.3.0, cerrada 2026-07-16)
+--------------------------------------------------------------------------------
+Objetivo: el "cerebro" que decide, siempre explicable. NO ejecuta órdenes.
+
+Arquitectura (app/engine/):
+- `BaseStrategy` (plugins auto-descubiertos desde app/strategies/): una
+  estrategia NUNCA devuelve "BUY"; devuelve una `StrategySignal` (dirección,
+  confianza, score, zona de entrada, SL/TP, razones, advertencias). Nunca opera.
+- `StrategyEngine`: ejecuta cada estrategia según su cadencia (tick/segundo/
+  vela/intervalo), con lock por estrategia (+ contador de skips), aislamiento
+  de errores y estadísticas de tiempo de ejecución.
+- `SignalEngine`: valida, deduplica/supersede, TTL, detecta conflictos.
+- `DecisionEngine`: EL ÚNICO que decide. 5 algoritmos de consenso intercambiables
+  (majority_voting, weighted_voting, weighted_average, dynamic_weighting,
+  regime_weighting), `ConfidenceEngine` separado del score, `MarketContextEngine`
+  + `RegimeDetector`, y una `FilterChain` que evalúa TODOS los filtros (para
+  explicabilidad) -> produce una `Decision` SIEMPRE explicable (nunca "no operar"
+  a secas: detalla el porqué).
+- `FeatureStore`: cache "computa una vez" para indicadores.
+- Historial que nunca borra; persiste vía signal_sink -> HistoryWriter (batched
+  + spill, Alembic 0002).
+- Fachada `QuantCore` + endpoints /api/engine/* (status, strategies, signals,
+  decisions, regime, context, filters, consensus, performance).
+
+Reglas: app/engine/__init__.py debe quedar SOLO con docstring (evita import
+circular: las rutas importan app.engine.*, el bootstrap importa el main del
+dashboard). QE_QUANT__ENABLED: false en testing, true en el resto; quant
+requiere market habilitado. Batería verde (199 archivos), 234 tests, cov 83%.
+
+--------------------------------------------------------------------------------
+5. FASE 4 — BIBLIOTECA DE ESTRATEGIAS  (v0.4.0, cerrada 2026-07-17)
+--------------------------------------------------------------------------------
+Objetivo: 20 estrategias profesionales como plugins. Analizan, puntúan,
+explican y proponen Entry/SL/TP — nunca operan por sí mismas.
+
+Entregado:
+- 20 estrategias en app/strategies/{trend,momentum,orderflow,smc,volume,
+  volatility,mean_reversion,breakout} (un archivo cada una): VWAP Mean
+  Reversion, VWAP Breakout, Anchored VWAP, Liquidity Sweep, Order Block, Fair
+  Value Gap, BOS, CHOCH, MSS, Delta Confirmation, CVD, Order Book Imbalance,
+  Volume Profile, Opening Range Breakout, Momentum Continuation, ATR Expansion,
+  Volatility Compression, Trend Pullback, Mean Reversion y Range Breakout.
+- Base `QuantStrategy` (strategies/base/): pipeline común pre-chequeos ->
+  evaluate() -> confirmaciones -> score de 5 componentes (calidad/fortaleza/
+  contexto/probabilidad/riesgo, pesos configurables) -> confianza multi-factor
+  -> señal estructurada. CERO constantes hardcodeadas: parámetros por capas
+  (base -> subclase -> QE_QUANT__STRATEGIES__<nombre>__…), optimizables a futuro.
+- Indicadores puros y deterministas en app/analytics/indicators/ (SMC,
+  market structure, order flow -con spoofing/iceberg experimentales-, VWAP +
+  bandas, volume profile, ATR, momentum, liquidez), cacheados vía FeatureStore.
+  APIs estables detect_*/calculate_* en strategies/shared/api.py.
+- `ConfirmationEngine` (10 tipos; los fallos marcan required_confirmation,
+  nunca en silencio).
+- Framework de Evaluación Continua (app/engine/evaluation/): operaciones
+  virtuales por señal resueltas contra velas de 1m -> win rate, PF,
+  expectativa (R), drawdown, falsas señales, tiempo medio. Snapshot JSON +
+  hook factor(). AÚN NO se usa para operar.
+- Eventos de detección publicados por el StrategyEngine desde ctx.detections
+  (las estrategias nunca tocan el bus).
+
+Docs: docs/strategies.md (catálogo con supuestos/parámetros/limitaciones por
+estrategia). ROADMAP renumerado. Batería verde (210 archivos), 335 tests, cov
+83%. IMPORTANTE: los parámetros por defecto NO están calibrados (backtest/
+optimizador llegan en fases posteriores).
+
+--------------------------------------------------------------------------------
+6. FASE 5 — EXECUTION ENGINE + PAPER TRADING  (v0.5.0, ACTUAL, 2026-07-17)
+--------------------------------------------------------------------------------
+REGLA DE ORO: SOLO PAPER TRADING. Ninguna orden llega a un broker real. El modo
+`live` se fuerza a `paper` (ExecutionSettings.resolved_mode() siempre "paper");
+no existe adaptador de broker. Objetivo: validar el sistema en condiciones
+realistas (spread, slippage, latencia, comisiones, rechazos) sin arriesgar
+capital.
+
+Flujo (ninguna estrategia envía órdenes; sólo dispara una decisión ACEPTADA):
+  Market Data (bid/ask, velas)
+      -> Strategy Engine -> Decision Engine --DecisionGenerated-->
+      -> Execution Engine:
+           - Market Context/ATR (contexto: ATR, spread, régimen, volatilidad)
+           - Position Sizer (riesgo -> cantidad)
+           - Risk Manager (límites, filtros, kill switch, circuit breaker)
+           -> OrderRequest -> Paper Engine (spread+slippage+latencia+comisión+
+                                             rechazo+parcial+gap) -> Fill
+           -> Position Manager (SL/TP/trailing/break-even)
+           -> Portfolio Manager (balance/equity/drawdown/exposición)
+           -> Trade Journal (registro exhaustivo)
+           -> Eventos -> Execution Notifier -> Discord
+
+En paralelo, un BUCLE DE GESTIÓN (manage_interval_seconds) valora las posiciones
+abiertas, aplica break-even y trailing, y cierra por stop / objetivo / tiempo /
+cambio de régimen. Los CIERRES nunca se rechazan ni se ejecutan parciales (una
+salida jamás debe quedar atascada).
+
+Módulos (app/execution/), una responsabilidad por módulo:
+- models/         Order, OrderRequest, Fill (Order mutable con apply_fill),
+                  Position (SL/TP/trailing/BE + matemática en R), PortfolioSnapshot,
+                  TradeRecord, enums (tipos de orden/estado/salida/rechazo).
+- events.py       OrderCreated/Rejected/Executed, PositionOpened/Closed,
+                  PositionModified, StopMoved, BreakEvenActivated, TrailingUpdated,
+                  RiskTriggered, KillSwitchTriggered, CircuitBreakerTriggered,
+                  DiscordNotificationSent/Failed.
+- commission/     por nocional (bps) / por unidad / fijo, maker vs taker,
+                  overrides por símbolo. Nada hardcodeado.
+- slippage/       dinámico: crece con volatilidad (ATR), falta de liquidez,
+                  tamaño relativo y fuera de sesión; extra para órdenes stop;
+                  NUNCA mejora el precio; acotado por max_bps.
+- latency/        red + broker + exchange + interna + jitter -> deriva de precio
+                  en bps (el precio se mueve entre decidir y ejecutar).
+- sizing/         monto fijo, % del capital, ATR, riesgo fijo, riesgo dinámico
+                  (por confianza), Kelly parcial (con respaldo a riesgo fijo sin
+                  historial); tope de exposición por operación.
+- paper_engine/   PaperBroker.execute(): usa bid/ask reales, aplica slippage +
+                  deriva de latencia en contra, probabilidad de rechazo y de
+                  parcial, marca gaps. Cierres con allow_reject=False +
+                  allow_partial=False.
+- order_manager/  ciclo de vida de órdenes + estructura OCO preparada.
+- position_manager/ posiciones abiertas/cerradas, PnL flotante, exposición,
+                  riesgo vivo; break-even (stop a la entrada al llegar a +Nr),
+                  trailing por ATR, detección de salida (clasifica SL/trailing/BE).
+- portfolio_manager/ contabilidad de margen: balance = caja; equity = balance +
+                  flotante; capital usado = Σ nocional/apalancamiento; libre =
+                  equity - usado; drawdown contra equity pico.
+- risk_manager/   límites: riesgo por trade, pérdida diaria/semanal/mensual,
+                  pérdidas consecutivas, nº posiciones (total y por símbolo),
+                  exposición total/símbolo/correlación; filtros spread y liquidez;
+                  KILL SWITCH (drawdown -> bloquea y APLANA todo); CIRCUIT BREAKER
+                  (pérdida rápida en ventana móvil -> pausa entradas).
+- journal/        registro append-only (memoria + JSON Lines) de cada operación,
+                  con precios, costes, R, ATR, régimen, score, confianza, razones.
+- performance/    win rate, profit factor, expectativa (moneda y R), R:R,
+                  drawdown máx, Sharpe, Sortino, Calmar, Ulcer Index, recovery
+                  factor, tiempo medio en mercado, actividad por día/sesión.
+- notifications/  ExecutionNotifier (Service) se suscribe al bus y traduce cada
+                  evento a un embed de Discord (plantillas) + reportes periódicos.
+                  Totalmente desacoplado: el engine sólo publica eventos.
+- execution_engine/ ExecutionEngine (Service): orquesta entrada, gestión y salida.
+- api.py          ExecutionCore: fachada de lectura para el dashboard.
+
+Sizing/salidas: la distancia de stop se deriva del ATR (atr_stop_multiplier;
+respaldo 0.5% si no hay ATR); el objetivo, de reward_risk. Marca del PnL: bid
+para largos, ask para cortos (precio de salida realista).
+
+Wiring:
+- bootstrap._build_execution (requiere market habilitado; ahora también registra
+  MarketContextEngine en el contenedor para reusarlo).
+- engine.py: en la lista de servicios el notificador va ANTES del engine (para
+  captar eventos desde el arranque) + jobs de reporte horario y diario.
+- Config QE_EXECUTION__* (ExecutionSettings con sub-secciones commission,
+  slippage, latency, sizing, risk).
+- Endpoints /api/execution/{status,portfolio,positions,trades,performance,risk,
+  report,notifications}.
+
+Notificaciones Discord (embeds con color por severidad): posición abierta/
+cerrada, break-even, trailing, orden rechazada, riesgo, kill switch, circuit
+breaker; y reportes periódicos con equity, drawdown, exposición, win rate,
+profit factor y expectativa. Campos típicos: Activo, Dirección, Cantidad,
+Entrada/Salida, SL, TP, PnL, R, Motivo, Tiempo, ID.
+
+Docs de la fase: docs/execution.md (arquitectura, flujo, modelo de riesgo,
+contabilidad, formato de notificaciones, endpoints, pruebas).
+
+Batería: ruff + black + mypy strict en verde (246 archivos de app). 382 tests
+(47 nuevos): simulación (comisión/slippage/latencia), sizing, paper, managers,
+riesgo, performance, journal, notificaciones (canal falso) y flujo extremo a
+extremo con publicación de eventos + API de integración. Smoke completo de DI y
+de ciclo de vida (start/stop) OK; status.mode == "paper".
+
+Pendiente conocido (NO de esta fase): 3 errores de mypy PRE-EXISTENTES en
+tests/unit/test_engine_evaluation.py (un make_signal(**dict) de la Fase 4);
+archivo no tocado en esta fase.
+
+--------------------------------------------------------------------------------
+7. CÓMO EJECUTAR LA BATERÍA (con el .venv del proyecto)
+--------------------------------------------------------------------------------
+  .venv/Scripts/python.exe -m ruff check app tests
+  .venv/Scripts/python.exe -m black --check app tests
+  .venv/Scripts/python.exe -m mypy app
+  .venv/Scripts/python.exe -m pytest
+
+Arranque del sistema: python -m app  (usa QE_ENVIRONMENT para elegir ambiente).
+Para activar la ejecución en paper: QE_EXECUTION__ENABLED=true (requiere también
+QE_MARKET__ENABLED=true y, para contexto/estrategias, QE_QUANT__ENABLED=true).
+
+--------------------------------------------------------------------------------
+8. PRÓXIMOS PASOS (según ROADMAP)
+--------------------------------------------------------------------------------
+- Definir y AUTOMATIZAR los criterios estadísticos de paso a live sobre los
+  resultados del paper trading (antes de cualquier operación con dinero real).
+- Fase Dashboard: frontend Next.js + React + TS + Tailwind + shadcn/ui +
+  TradingView Lightweight Charts sobre la API REST/WebSocket ya existente.
+- Fase ML y optimización: pipeline de features, entrenamiento programado,
+  optimizador walk-forward sobre los parámetros ya externalizados.
+- Fase Live Trading: habilitación gradual SOLO si el paper cumple los criterios;
+  observabilidad completa y runbooks.
+- Transversal: integración Notion del DocumentationService; endurecer CI/CD.
+
+RECORDATORIO FINAL: el repositorio sigue SIN commitear (el usuario commitea a
+mano). No se habilita live trading. Todo el flujo es exclusivamente paper.
+================================================================================

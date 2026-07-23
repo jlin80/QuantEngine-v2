@@ -1,0 +1,108 @@
+[project]
+name = "quant-engine"
+version = "0.7.0"
+description = "Quant Engine V2 — motor cuantitativo modular para scalping de criptomonedas y XAUUSD (paper -> live)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "jlin80" }]
+
+# ---------------------------------------------------------------------------
+# Ruff — linter
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app", "tests"]
+exclude = ["app/database/migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+    "ASYNC", # flake8-async
+    "D",   # pydocstyle (Google)
+]
+ignore = [
+    "D203", # incompatible con D211
+    "D213", # incompatible con D212 (Google style usa primera línea)
+    "D107", # __init__ docstring: se documenta en la clase
+]
+# Caracteres matemáticos legítimos en docstrings/razones en español.
+allowed-confusables = ["σ", "×", "–"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: sin docstrings obligatorios; el polling con sleep es idiomático ahí.
+"tests/**" = ["D", "ASYNC109", "ASYNC110"]
+"app/database/migrations/*" = ["D"]
+"scripts/**" = ["D"]
+
+# ---------------------------------------------------------------------------
+# Black — formateador
+# ---------------------------------------------------------------------------
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+# ---------------------------------------------------------------------------
+# MyPy — chequeo estático de tipos
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["app", "tests"]
+mypy_path = "."
+explicit_package_bases = true
+strict = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+pretty = true
+exclude = "app/database/migrations/versions"
+
+[[tool.mypy.overrides]]
+module = ["psutil.*", "redis.*", "uvicorn.*", "MetaTrader5.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
+disallow_any_generics = false
+
+# redis.asyncio.from_url no está tipado en redis-py 5.x.
+[[tool.mypy.overrides]]
+module = "app.cache.redis_backend"
+disallow_untyped_calls = false
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+markers = [
+    "integration: pruebas de integración (pueden requerir servicios externos)",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/database/migrations/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

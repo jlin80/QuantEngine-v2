@@ -1,0 +1,96 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "schemaVersion": 39,
+  "tags": ["quant-engine", "fase-9"],
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "title": "Quant Engine — Producción",
+  "uid": "quant-engine-prod",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Salud del sistema",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "healthy", "color": "green" } } },
+            { "type": "value", "options": { "0.5": { "text": "degraded", "color": "orange" } } },
+            { "type": "value", "options": { "0": { "text": "unhealthy", "color": "red" } } }
+          ]
+        }
+      },
+      "targets": [{ "expr": "quantengine_health_status", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Live habilitado (debe ser 0)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }
+        }
+      },
+      "targets": [{ "expr": "quantengine_live_enabled", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Kill switch",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "quantengine_production_kill_switch_active", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "Safe mode",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "quantengine_safe_mode_active", "refId": "A" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU / Memoria (%)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "quantengine_cpu_percent", "legendFormat": "CPU", "refId": "A" },
+        { "expr": "quantengine_memory_percent", "legendFormat": "RAM", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latencia del event loop (ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [{ "expr": "quantengine_event_loop_lag_ms", "legendFormat": "lag", "refId": "A" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Equity y drawdown",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "quantengine_portfolio_equity", "legendFormat": "Equity", "refId": "A" },
+        { "expr": "quantengine_portfolio_drawdown_percent", "legendFormat": "Drawdown %", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Criterios del Live Gate sin cumplir",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{ "expr": "quantengine_live_gate_failed_criteria", "legendFormat": "fallidos", "refId": "A" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Errores por job del scheduler",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [{ "expr": "rate(quantengine_scheduler_job_errors_total[5m])", "legendFormat": "{{job}}", "refId": "A" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Notificaciones entregadas / fallidas",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        { "expr": "quantengine_notifications_delivered_total", "legendFormat": "entregadas", "refId": "A" },
+        { "expr": "quantengine_notifications_failed_total", "legendFormat": "fallidas", "refId": "B" }
+      ]
+    }
+  ]
+}

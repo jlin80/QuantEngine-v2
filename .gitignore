@@ -1,0 +1,48 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# --- Entornos / secretos ---
+.env
+.env.*
+!.env.example
+config/*.local.env
+secrets/
+
+# --- Herramientas ---
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Logs y datos en runtime ---
+logs/
+*.log
+data/
+*.sqlite
+*.db
+
+# --- Docker ---
+docker/**/data/
+
+# --- IDE / SO ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Node (dashboard futuro) ---
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
