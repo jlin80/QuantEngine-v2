@@ -144,13 +144,49 @@ class MT5Broker:
             "comment": _mt5_comment(request.reason),
             "type_time": getattr(mt5, "ORDER_TIME_GTC", 0),
         }
-        if request.stop_loss is not None:
-            payload["sl"] = float(request.stop_loss)
-        if request.take_profit is not None:
-            payload["tp"] = float(request.take_profit)
+
+        if request.reduce_only:
+            # Cuenta hedging (Exness): una orden opuesta normal ABRE una posición
+            # nueva en vez de cerrar la existente. Hay que referenciar el ticket
+            # de la posición contraria con "position" para que MT5 la cierre.
+            ticket = self._matching_position_ticket(mt5, real_symbol, is_buy)
+            if ticket is None:
+                _log.error(
+                    "reduce_only sin posición %s abierta en %s; no se envía cierre",
+                    "SELL" if is_buy else "BUY",
+                    real_symbol,
+                )
+                return self._reject(RejectReason.BROKER_REJECTED)
+            payload["position"] = ticket
+        else:
+            if request.stop_loss is not None:
+                payload["sl"] = float(request.stop_loss)
+            if request.take_profit is not None:
+                payload["tp"] = float(request.take_profit)
 
         result = self._send_with_fallbacks(mt5, real_symbol, payload)
         return self._interpret(result, request, ticker, volume, mt5)
+
+    def _matching_position_ticket(
+        self, mt5: ModuleType, symbol: str, closing_is_buy: bool
+    ) -> int | None:
+        """Ticket de la posición abierta que esta orden de cierre debe saldar.
+
+        Un cierre BUY salda una posición SELL (y viceversa): se busca la
+        posición contraria más antigua del símbolo para no cerrar la que no
+        corresponde cuando hay varias abiertas.
+        """
+        positions = mt5.positions_get(symbol=symbol)
+        if not positions:
+            return None
+        sell_type = getattr(mt5, "POSITION_TYPE_SELL", 1)
+        buy_type = getattr(mt5, "POSITION_TYPE_BUY", 0)
+        target_type = int(sell_type if closing_is_buy else buy_type)
+        matching = [p for p in positions if int(getattr(p, "type", -1)) == target_type]
+        if not matching:
+            return None
+        matching.sort(key=lambda p: int(getattr(p, "time", 0)))
+        return int(matching[0].ticket)
 
     def _send_with_fallbacks(self, mt5: ModuleType, symbol: str, payload: dict[str, Any]) -> Any:
         """``order_send`` probando modos de llenado válidos (y sin comentario).

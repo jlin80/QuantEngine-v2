@@ -28,6 +28,8 @@ class FakeMT5:
     ORDER_TIME_GTC = 0
     ORDER_FILLING_IOC = 1
     TRADE_RETCODE_DONE = 10009
+    POSITION_TYPE_BUY = 0
+    POSITION_TYPE_SELL = 1
 
     def __init__(
         self,
@@ -38,6 +40,7 @@ class FakeMT5:
         volume_max: float = 100.0,
         volume_step: float = 0.01,
         account_ok: bool = True,
+        positions: list[Any] | None = None,
     ) -> None:
         self._retcode = retcode
         self._symbol_known = symbol_known
@@ -45,8 +48,14 @@ class FakeMT5:
         self._vmax = volume_max
         self._vstep = volume_step
         self._account_ok = account_ok
+        self._positions = positions or []
         self.sent: list[dict[str, Any]] = []
         self.initialized = False
+
+    def positions_get(self, symbol: str | None = None) -> Any:
+        if symbol is None:
+            return list(self._positions)
+        return [p for p in self._positions if p.symbol == symbol]
 
     def initialize(self, *args: Any, **kwargs: Any) -> bool:
         self.initialized = True
@@ -210,3 +219,30 @@ def test_healthcheck_reflects_account_info() -> None:
 
 def test_broker_name_is_demo() -> None:
     assert _connected_broker(FakeMT5()).broker_name == "mt5_demo"
+
+
+def test_reduce_only_close_sends_position_ticket() -> None:
+    """En hedging, cerrar un BUY existente debe mandar un SELL con ``position``."""
+    open_position = SimpleNamespace(
+        ticket=581758329, symbol="XAUUSD", type=FakeMT5.POSITION_TYPE_BUY, time=100
+    )
+    fake = FakeMT5(positions=[open_position])
+    broker = _connected_broker(fake)
+
+    result = broker.execute(_order(side=OrderSide.SELL, reduce_only=True), _ticker())
+
+    assert result.accepted
+    payload = fake.sent[-1]
+    assert payload["position"] == 581758329
+    assert "sl" not in payload
+    assert "tp" not in payload
+
+
+def test_reduce_only_without_matching_position_is_rejected() -> None:
+    fake = FakeMT5(positions=[])
+    broker = _connected_broker(fake)
+
+    result = broker.execute(_order(side=OrderSide.SELL, reduce_only=True), _ticker())
+
+    assert result.reject_reason is RejectReason.BROKER_REJECTED
+    assert not fake.sent
