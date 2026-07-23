@@ -711,6 +711,11 @@ class SizingSettings(BaseModel):
     risk_per_trade_pct: float = 0.5  # % del equity arriesgado hasta el stop
     atr_stop_multiplier: float = 1.5  # distancia de stop = ATR × múltiplo
     atr_period: int = 14
+    # Piso de la distancia del stop como % del precio: evita stops más
+    # angostos que el propio spread cuando el ATR (velas desde ticks
+    # dispersos) sale artificialmente bajo — sin esto el stop se dispara
+    # casi al entrar por simple ruido/spread, no por movimiento real.
+    min_stop_pct: float = 0.15
     reward_risk: float = 1.5  # objetivo = riesgo × esta relación
     kelly_fraction: float = 0.25  # fracción parcial de Kelly
     max_position_pct: float = 20.0  # tope de notional como % del equity

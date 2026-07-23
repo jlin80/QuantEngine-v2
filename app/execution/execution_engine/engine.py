@@ -688,10 +688,16 @@ class ExecutionEngine(Service):
         return atr_indicator(candles, period)
 
     def _stop_distance(self, view: _MarketView, reference: float) -> float:
-        """Stop distance: ATR × multiple, con respaldo del 0.5% si no hay ATR."""
+        """Stop distance: ATR × multiple, con piso de % del precio.
+
+        Sin el piso, un ATR subestimado (velas construidas desde ticks
+        dispersos) puede dar una distancia menor que el propio spread: el
+        stop se dispara por ruido/spread al entrar, no por movimiento real.
+        """
+        floor = reference * (self._settings.sizing.min_stop_pct / 100.0)
         if view.atr and view.atr > 0:
-            return view.atr * self._settings.sizing.atr_stop_multiplier
-        return reference * 0.005
+            return max(view.atr * self._settings.sizing.atr_stop_multiplier, floor)
+        return max(reference * 0.005, floor)
 
     def _stops(self, side: OrderSide, reference: float, distance: float) -> tuple[float, float]:
         """Compute (stop_loss, take_profit) around the entry reference."""

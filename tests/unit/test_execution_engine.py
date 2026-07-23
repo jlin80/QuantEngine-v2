@@ -147,6 +147,22 @@ async def test_reconciliation_settles_position_closed_outside_the_bot():
     assert trade.exit_reason is ExitReason.MANUAL
 
 
+async def test_stop_distance_never_narrower_than_the_configured_floor():
+    """Un ATR subestimado (velas casi planas) no debe dar un stop más angosto
+    que el spread real — sin el piso, el stop se dispara por ruido al entrar."""
+    market, _ = make_market_with_state(
+        candles=make_candles([1880.0, 1880.05, 1879.98, 1880.02, 1880.0] * 6),
+        ticker=make_ticker(bid=1881.0, ask=1881.05),
+    )
+    engine = make_engine(market, make_execution_settings(sizing={"min_stop_pct": 0.15}))
+    position = await engine.process_decision(_decision())
+    assert position is not None
+    assert position.stop_loss is not None
+    distance = abs(position.entry_price - position.stop_loss)
+    floor = position.entry_price * (0.15 / 100.0)
+    assert distance >= floor - 1e-9
+
+
 async def test_reconciliation_leaves_matching_positions_alone():
     market, _ = _market()
     engine = make_engine(market)
