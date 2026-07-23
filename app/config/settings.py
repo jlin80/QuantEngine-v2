@@ -568,6 +568,9 @@ class QuantFiltersSettings(BaseModel):
         ]
     )
     allowed_sessions: list[str] = Field(default=["asia", "europe", "america"])
+    # Símbolos que cotizan 24/7 (cripto): el filtro de sesión no aplica —
+    # forex/XAUUSD sí cierra fuera de las ventanas configuradas, cripto no.
+    always_open_symbols: list[str] = Field(default_factory=list)
     max_drawdown_pct: float = 5.0
     correlation_groups: list[list[str]] = Field(default_factory=list)
     correlation_window_minutes: float = 30.0

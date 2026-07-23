@@ -19,14 +19,22 @@ from app.utils.time import utc_now
 
 
 class SessionFilter(SignalFilter):
-    """Bloquea fuera de las sesiones permitidas."""
+    """Bloquea fuera de las sesiones permitidas.
 
-    def __init__(self, allowed: list[str]) -> None:
+    Args:
+        allowed: Sesiones horarias permitidas (forex/XAUUSD, que sí cierra).
+        always_open: Símbolos que cotizan 24/7 (cripto) — exentos del filtro.
+    """
+
+    def __init__(self, allowed: list[str], always_open: list[str] | None = None) -> None:
         super().__init__("session")
         self._allowed = {name.lower() for name in allowed}
+        self._always_open = {symbol.upper() for symbol in (always_open or [])}
 
     def check(self, context: MarketContext, consensus: ConsensusResult) -> FilterResult:
-        """Pass if any active session is allowed."""
+        """Pass if any active session is allowed, or the symbol trades 24/7."""
+        if context.symbol.upper() in self._always_open:
+            return FilterResult(name=self.name, passed=True)
         active = {name.lower() for name in context.sessions}
         if active & self._allowed:
             return FilterResult(name=self.name, passed=True)
@@ -220,7 +228,7 @@ def build_filter_chain(
         Cadena con los filtros habilitados, en orden de configuración.
     """
     registry: dict[str, Callable[[], SignalFilter]] = {
-        "session": lambda: SessionFilter(settings.allowed_sessions),
+        "session": lambda: SessionFilter(settings.allowed_sessions, settings.always_open_symbols),
         "spread": SpreadFilter,
         "volatility": VolatilityFilter,
         "liquidity": LiquidityFilter,

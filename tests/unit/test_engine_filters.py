@@ -43,6 +43,16 @@ def test_session_filter():
     assert SessionFilter(["asia", "europe"]).check(ctx, CONSENSUS).passed is True
 
 
+def test_session_filter_exempts_always_open_symbols():
+    """Cripto (24/7) no debe bloquearse aunque no haya sesión forex activa."""
+    ctx = make_context(symbol="ETHUSDM", sessions=())
+    blocked = SessionFilter(["europe"]).check(ctx, CONSENSUS)
+    assert blocked.passed is False
+
+    exempt = SessionFilter(["europe"], always_open=["ETHUSDM"]).check(ctx, CONSENSUS)
+    assert exempt.passed is True
+
+
 def test_spread_filter():
     blocked = SpreadFilter().check(make_context(spread_elevated=True, spread_bps=12.5), CONSENSUS)
     assert blocked.passed is False
