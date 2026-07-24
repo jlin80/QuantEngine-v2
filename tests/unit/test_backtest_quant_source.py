@@ -8,7 +8,12 @@ se integra con el BacktestLab produciendo estadística sin errores.
 import math
 
 from app.backtesting.api import BacktestLab
-from app.backtesting.quant_source import QuantCoreDecisionSource, run_quantcore_backtest
+from app.backtesting.optimizer import ParameterSpace
+from app.backtesting.quant_source import (
+    QuantCoreDecisionSource,
+    make_quant_source_factory,
+    run_quantcore_backtest,
+)
 from app.config.settings import Settings
 
 from tests.unit.quant_helpers import make_candles
@@ -106,3 +111,32 @@ def test_run_quantcore_backtest_returns_real_and_zero_spread():
         assert key in r
     # El spread nunca mejora el resultado: el retorno real ≤ el de spread 0.
     assert r["return_pct"] <= r["zero_spread_return_pct"] + 1e-6
+
+
+def test_source_factory_applies_entry_thresholds():
+    """La fábrica inyecta los umbrales de entrada en una copia independiente."""
+    s = _settings()
+    factory = make_quant_source_factory(s, "ETHUSDM", spread_bps=5.3)
+    source = factory({"min_score": 88.0, "min_confidence": 0.9, "min_agreement": 0.6})
+    try:
+        # La copia del trial recibe los umbrales; el settings base no se toca.
+        assert source._settings.quant.consensus.min_score == 88.0
+        assert s.quant.consensus.min_score != 88.0
+    finally:
+        source.close()
+
+
+def test_walk_forward_runs_over_the_quant_source():
+    """El walk-forward optimiza in-sample y valida out-of-sample sin errores."""
+    s = _settings()
+    candles = _eth_candles(1200)
+    space = ParameterSpace().add_choices("min_score", [60.0, 70.0])
+    factory = make_quant_source_factory(s, "ETHUSDM", spread_bps=5.3)
+    lab = BacktestLab(s)
+    config = lab.make_config("ETHUSDM", timeframe="1m", label="wf-test", spread_bps=5.3)
+    report = lab.run_walk_forward(
+        candles, space, factory, config, method="grid", objective="profit_factor"
+    )
+    assert report.folds  # produjo al menos un pliegue
+    for fold in report.folds:
+        assert "min_score" in fold.best_params

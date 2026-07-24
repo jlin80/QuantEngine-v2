@@ -45,7 +45,63 @@ from app.market.services import MarketDataService, MarketStateStore
 from app.utils.time import utc_now
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from app.engine.interfaces.strategy import BaseStrategy
+
+_LOOP: asyncio.AbstractEventLoop | None = None
+_LOOP_LOCK = threading.Lock()
+
+
+def _shared_loop() -> asyncio.AbstractEventLoop:
+    """Lazy process-wide background event loop for running the async pipeline.
+
+    Compartido entre todas las instancias del source para que una optimización
+    (decenas de backtests) no cree un hilo por corrida.
+    """
+    global _LOOP
+    with _LOOP_LOCK:
+        if _LOOP is None:
+            loop = asyncio.new_event_loop()
+            threading.Thread(
+                target=loop.run_forever, name="quant-backtest-loop", daemon=True
+            ).start()
+            _LOOP = loop
+        return _LOOP
+
+
+def make_quant_source_factory(
+    base_settings: Settings, symbol: str, *, spread_bps: float
+) -> Callable[[dict[str, object]], QuantCoreDecisionSource]:
+    """Build a factory ``params -> QuantCoreDecisionSource`` for optimization.
+
+    Cada juego de parámetros construye una copia independiente de settings con
+    los umbrales de entrada sobreescritos (``min_score``/``min_confidence``/
+    ``min_agreement``), de modo que el walk-forward optimice la selectividad de
+    entrada sin que los trials se pisen. Los parámetros desconocidos se ignoran.
+
+    Args:
+        base_settings: Configuración base a clonar por trial.
+        symbol: Símbolo a simular.
+        spread_bps: Spread real del broker.
+
+    Returns:
+        Fábrica que produce un source configurado para un dict de parámetros.
+    """
+
+    def factory(params: dict[str, object]) -> QuantCoreDecisionSource:
+        trial = base_settings.model_copy(deep=True)
+        consensus = trial.quant.consensus
+        if "min_score" in params:
+            consensus.min_score = float(params["min_score"])  # type: ignore[arg-type]
+        if "min_confidence" in params:
+            consensus.min_confidence = float(params["min_confidence"])  # type: ignore[arg-type]
+        if "min_agreement" in params:
+            consensus.min_agreement = float(params["min_agreement"])  # type: ignore[arg-type]
+        trial.quant.enabled = True
+        return QuantCoreDecisionSource(trial, symbol, spread_bps=spread_bps)
+
+    return factory
 
 
 def run_quantcore_backtest(
@@ -179,18 +235,14 @@ class QuantCoreDecisionSource:
         self._fed_index = -1
         self._initialized = False
         # El motor de backtest ya corre dentro de un event loop; para ejecutar
-        # el pipeline async (también async) sin colisionar, se usa un loop
-        # propio en un hilo dedicado, vivo durante toda la corrida.
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._loop.run_forever, name="quant-backtest-loop", daemon=True
-        )
-        self._thread.start()
+        # el pipeline async sin colisionar, se usa un loop compartido en un hilo
+        # de fondo. Compartido (no uno por instancia) para que una optimización
+        # con decenas de corridas no acumule hilos.
+        self._loop = _shared_loop()
 
     def close(self) -> None:
-        """Stop the background event loop thread."""
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=5.0)
+        """Kept for API compatibility (the shared loop lives for the process)."""
+        return None
 
     # ------------------------------------------------------------------
     # Ciclo de vida
