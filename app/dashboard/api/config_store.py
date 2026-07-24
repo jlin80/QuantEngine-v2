@@ -24,8 +24,22 @@ WHITELIST: tuple[str, ...] = (
     "execution.risk.max_risk_per_trade_pct",
     "execution.risk.max_daily_loss_pct",
     "execution.risk.max_open_positions",
+    "execution.risk.max_positions_per_symbol",
     "execution.risk.max_exposure_pct",
+    "execution.risk.max_consecutive_losses",
     "execution.risk.kill_switch_drawdown_pct",
+    "execution.max_holding_minutes",
+    "execution.exit_on_regime_change",
+    "execution.regime_change_min_holding_seconds",
+    "execution.sizing.risk_per_trade_pct",
+    "execution.sizing.atr_stop_multiplier",
+    "execution.sizing.reward_risk",
+    "execution.sizing.min_stop_pct",
+    "quant.consensus.min_score",
+    "quant.consensus.min_confidence",
+    "quant.consensus.min_agreement",
+    "quant.context.max_spread_bps",
+    "quant.context.atr_pct_low",
     "paper.initial_balance",
     "paper.slippage_bps",
     "discord.enabled",
@@ -38,6 +52,20 @@ WHITELIST: tuple[str, ...] = (
     "backtesting.criteria.max_drawdown_pct",
 )
 """Dotted setting paths the dashboard is allowed to override."""
+
+# Rutas que el motor lee en vivo (cada evaluación): mutar el objeto settings las
+# aplica al instante. El resto también se muta, pero algunos subsistemas leen su
+# valor al construirse (p. ej. ``paper.initial_balance``) y sólo cambian tras un
+# reinicio; ``apply`` marca cuáles fueron en caliente para informar al operador.
+_LIVE_PREFIXES: tuple[str, ...] = (
+    "execution.risk.",
+    "execution.max_holding_minutes",
+    "execution.exit_on_regime_change",
+    "execution.regime_change_min_holding_seconds",
+    "execution.sizing.",
+    "quant.consensus.",
+    "quant.context.",
+)
 
 
 def _resolve(settings: Settings, path: str) -> Any:
@@ -56,6 +84,38 @@ def _resolve(settings: Settings, path: str) -> Any:
         if node is None:
             return None
     return node
+
+
+def _set_live(settings: Settings, path: str, value: Any) -> bool:
+    """Write ``value`` onto the live settings object at ``path``.
+
+    Los subsistemas del motor (RiskManager, DecisionEngine, filtros, sizing)
+    guardan una referencia a estos objetos de settings y leen sus atributos en
+    cada evaluación; mutar el atritubo aplica el cambio sin reiniciar.
+
+    Returns:
+        ``True`` si se pudo escribir; ``False`` si la ruta no resuelve.
+    """
+    parts = path.split(".")
+    parent: Any = settings
+    for part in parts[:-1]:
+        parent = getattr(parent, part, None)
+        if parent is None:
+            return False
+    try:
+        setattr(parent, parts[-1], value)
+    except Exception:  # pragma: no cover - pydantic validation-assignment guard
+        _log.warning("No se pudo aplicar en vivo %s=%r", path, value)
+        return False
+    return True
+
+
+def _is_live(path: str) -> bool:
+    """Whether a whitelisted path is read live by the engine (hot-applies)."""
+    return any(
+        path == prefix or path.startswith(prefix)
+        for prefix in _LIVE_PREFIXES
+    )
 
 
 class RuntimeConfigStore:
@@ -116,10 +176,14 @@ class RuntimeConfigStore:
         return result
 
     def apply(self, settings: Settings, patch: dict[str, Any]) -> dict[str, Any]:
-        """Validate and store a config patch.
+        """Validate, store and apply a config patch to the live settings.
+
+        Muta el objeto de settings vivo para que los subsistemas que lo leen en
+        cada evaluación (riesgo, decisión, filtros, sizing) tomen el cambio al
+        instante; el resto queda persistido y se aplica en el próximo arranque.
 
         Args:
-            settings: Root settings object (used for type coercion).
+            settings: Root settings object (mutado en sitio).
             patch: Mapping of whitelisted paths to new values.
 
         Returns:
@@ -134,10 +198,22 @@ class RuntimeConfigStore:
                 if key not in WHITELIST:
                     raise KeyError(key)
                 coerced = _coerce(_resolve(settings, key), value)
+                _set_live(settings, key, coerced)
                 self._overrides[key] = coerced
                 applied[key] = coerced
             self._persist()
         return applied
+
+    def reapply(self, settings: Settings) -> None:
+        """Push persisted overrides onto the live settings (call at startup).
+
+        Sin esto, un override guardado se perdería en cada reinicio hasta el
+        siguiente PATCH: aquí se reescriben sobre el settings recién cargado.
+        """
+        with self._lock:
+            for key, value in self._overrides.items():
+                if key in WHITELIST:
+                    _set_live(settings, key, value)
 
     def strategy_overrides(self) -> dict[str, dict[str, Any]]:
         """Return the per-strategy override intents.

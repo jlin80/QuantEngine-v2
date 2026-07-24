@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from app.dashboard.api.audit import audit_log
-from app.dashboard.api.config_store import config_store
+from app.dashboard.api.config_store import _is_live, config_store
 from app.dashboard.api.guard import assert_no_live_switch
 
 router = APIRouter(tags=["config"])
@@ -32,4 +32,11 @@ async def patch_config(request: Request, patch: dict[str, Any]) -> dict[str, Any
     except KeyError as exc:
         raise HTTPException(status_code=422, detail=f"Key not allowed: {exc}") from exc
     audit_log.record(action="config.patch", after=applied)
-    return {"applied": applied, "config": config_store.effective(settings)}
+    hot = sorted(k for k in applied if _is_live(k))
+    needs_restart = sorted(k for k in applied if not _is_live(k))
+    return {
+        "applied": applied,
+        "applied_live": hot,
+        "needs_restart": needs_restart,
+        "config": config_store.effective(settings),
+    }

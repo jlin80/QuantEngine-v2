@@ -214,6 +214,11 @@ def build_container(settings: Settings) -> Container:
         _build_production(container, settings, bus)
 
     # --- API del dashboard ----------------------------------------------
+    # Reaplica los overrides de config guardados desde el dashboard sobre el
+    # settings recién cargado, para que sobrevivan a los reinicios.
+    from app.dashboard.api.config_store import config_store
+
+    config_store.reapply(settings)
     api_app = create_app(settings, container)
     container.register_instance(ApiService, ApiService(api_app, settings.dashboard))
 
