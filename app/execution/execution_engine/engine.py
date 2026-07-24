@@ -124,6 +124,7 @@ class ExecutionEngine(Service):
         self._manage_task: asyncio.Task[None] | None = None
         self._kill_announced = False
         self._cb_announced = False
+        self._balance_baseline_set = False
         self._entry_vetoes: list[Callable[[], str | None]] = []
         self._log = logging.getLogger("app.execution.engine")
 
@@ -387,6 +388,7 @@ class ExecutionEngine(Service):
 
     async def manage_once(self) -> None:
         """Run one management pass over every open position."""
+        self._sync_broker_balance()
         await self._reconcile_broker_positions()
         for position in self._positions.open_positions:
             ticker = self._market.get_ticker(position.symbol)
@@ -401,6 +403,23 @@ class ExecutionEngine(Service):
             if reason is not None:
                 await self.close_position(position, reason)
         await self._refresh_risk()
+
+    def _sync_broker_balance(self) -> None:
+        """Sync the Portfolio Manager cash with the real broker balance.
+
+        Sólo aplica a brokers reales que exponen ``account_balance`` (MT5 demo);
+        el paper broker no lo tiene y esto no hace nada. Sin esto, el dashboard
+        muestra un balance/return simulado que no coincide con la cuenta real de
+        Exness (en demo las órdenes son reales, la caja simulada no).
+        """
+        account_balance = getattr(self._paper, "account_balance", None)
+        if account_balance is None:
+            return
+        balance = account_balance()
+        if balance is None:
+            return
+        self._portfolio.sync_from_broker(balance, set_baseline=not self._balance_baseline_set)
+        self._balance_baseline_set = True
 
     async def _reconcile_broker_positions(self) -> None:
         """Detect positions closed outside the bot (broker terminal/manual).

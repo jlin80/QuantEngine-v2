@@ -211,3 +211,38 @@ async def test_reconciliation_leaves_matching_positions_alone():
     await engine.manage_once()
 
     assert engine.positions.open_positions  # sigue abierta, no se tocó
+
+
+async def test_syncs_portfolio_balance_from_real_broker():
+    """En demo, el balance del Portfolio Manager debe seguir a la cuenta real."""
+    market, _ = _market()
+    engine = make_engine(market)
+
+    real_balance = {"value": 954.22}
+
+    def account_balance() -> float:
+        return real_balance["value"]
+
+    engine._paper.account_balance = account_balance  # type: ignore[attr-defined]
+
+    await engine.manage_once()
+    # Primera sync: fija baseline → return 0 sobre el saldo real, no sobre config.
+    assert engine.portfolio.balance == 954.22
+    assert engine.portfolio.initial_balance == 954.22
+    assert engine.portfolio.realized_pnl == 0.0
+
+    # Un cambio posterior de la cuenta se refleja sin re-fijar la línea base.
+    real_balance["value"] = 968.21
+    await engine.manage_once()
+    assert engine.portfolio.balance == 968.21
+    assert engine.portfolio.initial_balance == 954.22
+    assert round(engine.portfolio.realized_pnl, 2) == 13.99
+
+
+async def test_paper_broker_leaves_portfolio_balance_untouched():
+    """Sin account_balance (paper broker), no se sincroniza nada."""
+    market, _ = _market()
+    engine = make_engine(market)
+    before = engine.portfolio.balance
+    await engine.manage_once()
+    assert engine.portfolio.balance == before

@@ -71,6 +71,26 @@ class PortfolioManager:
         self._losses = losses
         self._commission_paid = commission_paid
 
+    def sync_from_broker(self, balance: float, *, set_baseline: bool = False) -> None:
+        """Adopt the real broker cash balance (demo: ejecución real).
+
+        En demo las órdenes van al broker real, así que el saldo realizado debe
+        reflejar la cuenta MT5 y no una caja simulada. La primera sincronización
+        fija además la línea base (``set_baseline``) para que el return y el
+        drawdown se midan desde el arranque del bot, no desde un valor de config.
+
+        Args:
+            balance: Balance realizado real reportado por el broker.
+            set_baseline: Si además fija el balance inicial y el pico de equity
+                (sólo la primera vez).
+        """
+        self._balance = balance
+        if set_baseline:
+            self._initial_balance = balance
+            self._peak_equity = balance
+        else:
+            self._peak_equity = max(self._peak_equity, balance)
+
     @property
     def balance(self) -> float:
         """Realized cash balance."""

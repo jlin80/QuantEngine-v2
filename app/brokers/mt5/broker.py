@@ -167,6 +167,21 @@ class MT5Broker:
         result = self._send_with_fallbacks(mt5, real_symbol, payload)
         return self._interpret(result, request, ticker, volume, mt5)
 
+    def account_balance(self) -> float | None:
+        """Balance realizado real de la cuenta MT5 (o ``None`` si no disponible).
+
+        Lo consume el Execution Engine para sincronizar el Portfolio Manager con
+        la caja real del broker: en demo las órdenes son reales, así que la
+        contabilidad interna debe reflejar la cuenta, no un saldo simulado.
+        """
+        if not self._conn.connected:
+            return None
+        info = self._conn.account_info()
+        if info is None:
+            return None
+        balance = getattr(info, "balance", None)
+        return float(balance) if balance is not None else None
+
     def open_position_tickets(self, symbol: str) -> set[int]:
         """Tickets de las posiciones realmente abiertas en MT5 para ``symbol``.
 
