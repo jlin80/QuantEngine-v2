@@ -8,7 +8,7 @@ se integra con el BacktestLab produciendo estadística sin errores.
 import math
 
 from app.backtesting.api import BacktestLab
-from app.backtesting.quant_source import QuantCoreDecisionSource
+from app.backtesting.quant_source import QuantCoreDecisionSource, run_quantcore_backtest
 from app.config.settings import Settings
 
 from tests.unit.quant_helpers import make_candles
@@ -91,3 +91,18 @@ def test_integrates_with_backtest_lab():
         assert result.statistics["total_trades"] >= 1
     finally:
         source.close()
+
+
+def test_run_quantcore_backtest_returns_real_and_zero_spread():
+    """La orquestación reporta el escenario real y el de control (spread 0)."""
+    s = _settings()
+    candles = _eth_candles(400)
+    r = run_quantcore_backtest(s, "ETHUSDM", candles, spread_bps=5.3)
+    assert r["symbol"] == "ETHUSDM"
+    assert r["bars"] == 400
+    assert r["spread_bps"] == 5.3
+    # Ambos escenarios se ejecutan y reportan métricas.
+    for key in ("trades", "profit_factor", "return_pct", "zero_spread_trades"):
+        assert key in r
+    # El spread nunca mejora el resultado: el retorno real ≤ el de spread 0.
+    assert r["return_pct"] <= r["zero_spread_return_pct"] + 1e-6

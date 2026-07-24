@@ -48,6 +48,77 @@ if TYPE_CHECKING:
     from app.engine.interfaces.strategy import BaseStrategy
 
 
+def run_quantcore_backtest(
+    settings: Settings,
+    symbol: str,
+    candles: Sequence[Candle],
+    *,
+    spread_bps: float,
+    balance: float = 1000.0,
+) -> dict[str, float | int | str]:
+    """Run the real-QuantCore backtest at real spread and at zero spread.
+
+    El backtest con spread real refleja lo que operaría el bot; el de spread 0
+    aísla si el edge (o su falta) viene de las estrategias o del costo. Devuelve
+    un dict plano listo para el ``MetricsGrid`` del dashboard.
+
+    Args:
+        settings: Configuración central (usa ``quant``/``backtesting``).
+        symbol: Símbolo a simular.
+        candles: Serie histórica 1m.
+        spread_bps: Spread real del broker.
+        balance: Balance inicial.
+
+    Returns:
+        Métricas de ambos escenarios más metadatos de la corrida.
+    """
+    # Import diferido: evita un ciclo api → quant_source → api en carga.
+    from app.backtesting.api import BacktestLab
+
+    lab = BacktestLab(settings)
+
+    def _one(spread: float) -> dict[str, float | int]:
+        source = QuantCoreDecisionSource(settings, symbol, spread_bps=spread)
+        try:
+            config = lab.make_config(
+                symbol,
+                timeframe="1m",
+                label=f"{symbol.lower()}-quantcore-{spread:g}bps",
+                spread_bps=spread,
+                initial_balance=balance,
+            )
+            result = lab.run_backtest(candles, source, config)
+        finally:
+            source.close()
+        st = result.statistics
+        return {
+            "trades": int(st.get("total_trades", 0) or 0),
+            "win_rate_pct": round((st.get("win_rate", 0.0) or 0.0) * 100.0, 1),
+            "profit_factor": round(float(st.get("profit_factor", 0.0) or 0.0), 3),
+            "expectancy_r": round(float(st.get("expectancy_r", 0.0) or 0.0), 3),
+            "return_pct": round(result.return_pct, 3),
+            "max_drawdown_pct": round(float(st.get("max_drawdown_pct", 0.0) or 0.0), 3),
+        }
+
+    real = _one(spread_bps)
+    zero = _one(0.0)
+    return {
+        "symbol": symbol.upper(),
+        "bars": len(candles),
+        "spread_bps": spread_bps,
+        "trades": real["trades"],
+        "win_rate_pct": real["win_rate_pct"],
+        "profit_factor": real["profit_factor"],
+        "expectancy_r": real["expectancy_r"],
+        "return_pct": real["return_pct"],
+        "max_drawdown_pct": real["max_drawdown_pct"],
+        "zero_spread_trades": zero["trades"],
+        "zero_spread_win_rate_pct": zero["win_rate_pct"],
+        "zero_spread_profit_factor": zero["profit_factor"],
+        "zero_spread_return_pct": zero["return_pct"],
+    }
+
+
 class QuantCoreDecisionSource:
     """DecisionSource que ejecuta el QuantCore real sobre datos históricos.
 

@@ -17,59 +17,30 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import UTC, datetime, timedelta
 
-from app.backtesting.api import BacktestLab
-from app.backtesting.quant_source import QuantCoreDecisionSource
+from app.backtesting.mt5_history import pull_candles
+from app.backtesting.quant_source import run_quantcore_backtest
 from app.config.settings import get_settings
-from app.market.models import Candle, Timeframe
+from app.market.models import Candle
 
 
 def _pull_mt5_candles(symbol: str, bars: int) -> list[Candle]:
     """Fetch ``bars`` closed 1m candles for ``symbol`` from the MT5 terminal."""
     import MetaTrader5 as mt5  # noqa: N813  # import perezoso: sólo existe en la VPS
 
-    settings = get_settings()
-    mt5cfg = settings.market  # credenciales MT5 viven en el feed/broker config
     if not mt5.initialize():
         raise RuntimeError(f"mt5.initialize() falló: {mt5.last_error()}")
     try:
-        real = symbol
-        info = mt5.symbol_info(symbol)
-        if info is None:
-            # el terminal expone XAUUSDm/ETHUSDm en otra caja
-            for cand in (symbol.lower(), symbol[:-1] + symbol[-1].lower()):
+
+        def _resolve(sym: str) -> str:
+            for cand in (sym, sym.lower(), sym[:-1] + sym[-1].lower()):
                 if mt5.symbol_info(cand) is not None:
-                    real = cand
-                    break
-        rates = mt5.copy_rates_from_pos(real, mt5.TIMEFRAME_M1, 0, bars)
-        if rates is None or len(rates) == 0:
-            raise RuntimeError(f"copy_rates_from_pos sin datos para {real}: {mt5.last_error()}")
+                    return cand
+            return sym
+
+        return pull_candles(mt5, symbol, bars, resolve=_resolve)
     finally:
         mt5.shutdown()
-
-    candles: list[Candle] = []
-    for row in rates:
-        start = datetime.fromtimestamp(int(row["time"]), tz=UTC)
-        candles.append(
-            Candle(
-                symbol=symbol.upper(),
-                provider="mt5_history",
-                timeframe=Timeframe.M1,
-                start=start,
-                end=start + timedelta(minutes=1),
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
-                close=float(row["close"]),
-                volume=float(row["tick_volume"]),
-                trades=int(row["tick_volume"]),
-                closed=True,
-                source="provider",
-            )
-        )
-    _ = mt5cfg  # reservado si en el futuro se quiere loguear la config
-    return candles
 
 
 def main() -> None:
@@ -97,30 +68,24 @@ def main() -> None:
     span = f"{candles[0].start:%Y-%m-%d %H:%M} → {candles[-1].start:%Y-%m-%d %H:%M}"
     print(f"  {len(candles)} velas: {span}")
 
-    lab = BacktestLab(settings)
-    source = QuantCoreDecisionSource(settings, args.symbol, spread_bps=args.spread_bps)
-    config = lab.make_config(
-        args.symbol,
-        timeframe="1m",
-        label=f"{args.symbol.lower()}-quantcore",
-        spread_bps=args.spread_bps,
-        initial_balance=args.balance,
+    print(f"Corriendo backtest (spread {args.spread_bps} bps + spread 0 de control)...")
+    r = run_quantcore_backtest(
+        settings, args.symbol, candles, spread_bps=args.spread_bps, balance=args.balance
     )
-    print(f"Corriendo backtest (spread {args.spread_bps} bps)...")
-    result = lab.run_backtest(candles, source, config)
-    source.close()
-
-    st = result.statistics
-    print("\n===== RESULTADO =====")
-    print(f"  Trades:          {st.get('total_trades')}")
-    print(f"  Win rate:        {(st.get('win_rate') or 0) * 100:.1f}%")
-    print(f"  Profit factor:   {st.get('profit_factor')}")
-    print(f"  Expectativa (R): {st.get('expectancy_r')}")
-    print(f"  Retorno neto:    {result.return_pct:.3f}%")
-    print(f"  Max drawdown:    {(st.get('max_drawdown_pct') or 0):.3f}%")
-    print(f"  Sharpe:          {st.get('sharpe')}")
-    print("=====================")
-    if (st.get("total_trades") or 0) < 30:
+    print("\n===== RESULTADO (spread real) =====")
+    print(f"  Trades:          {r['trades']}")
+    print(f"  Win rate:        {r['win_rate_pct']}%")
+    print(f"  Profit factor:   {r['profit_factor']}")
+    print(f"  Expectativa (R): {r['expectancy_r']}")
+    print(f"  Retorno neto:    {r['return_pct']}%")
+    print(f"  Max drawdown:    {r['max_drawdown_pct']}%")
+    print("----- control (spread 0) -----")
+    print(f"  Trades:          {r['zero_spread_trades']}")
+    print(f"  Win rate:        {r['zero_spread_win_rate_pct']}%")
+    print(f"  Profit factor:   {r['zero_spread_profit_factor']}")
+    print(f"  Retorno neto:    {r['zero_spread_return_pct']}%")
+    print("===================================")
+    if int(r["trades"]) < 30:
         print("\n⚠  Menos de 30 trades: muestra insuficiente para concluir. Sube --bars.")
 
 
