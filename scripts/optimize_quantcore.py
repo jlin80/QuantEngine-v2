@@ -51,6 +51,12 @@ def main() -> None:
     parser.add_argument("--spread-bps", type=float, default=0.6)
     parser.add_argument("--train", type=int, default=4000, help="Velas in-sample por pliegue")
     parser.add_argument("--test", type=int, default=1500, help="Velas out-of-sample por pliegue")
+    parser.add_argument(
+        "--folds",
+        type=int,
+        default=4,
+        help="Pliegues objetivo (controla el step; menos pliegues = más rápido)",
+    )
     args = parser.parse_args()
 
     logging.getLogger("app.execution").setLevel(logging.ERROR)
@@ -61,11 +67,25 @@ def main() -> None:
     candles = _pull(args.symbol, args.bars)
     print(f"  {len(candles)} velas: {candles[0].start:%Y-%m-%d} → {candles[-1].start:%Y-%m-%d}")
 
+    # BacktestLab.run_walk_forward lee train/validation/step SIEMPRE de
+    # settings.backtesting.walk_forward — nunca de argumentos. Los defaults del
+    # sistema (train=500, validation=125, step=125) están pensados para series
+    # cortas; con 20000 velas y step=125 salen ~150 pliegues, que multiplicados
+    # por la grilla de parámetros dispara el tiempo a horas/días. Se fijan aquí
+    # explícitamente para producir sólo unos pocos pliegues grandes.
+    wf = settings.backtesting.walk_forward
+    wf.train_size = args.train
+    wf.validation_size = args.test
+    span = max(1, len(candles) - args.train - args.test)
+    wf.step = max(1, span // max(1, args.folds))
+
+    # Grilla pequeña a propósito: cada combinación es un backtest completo de
+    # `train` velas por pliegue. 3×3=9 combos × pocos pliegues sí termina en
+    # minutos; la grilla de 5×4×2=40 de antes es lo que disparó el tiempo.
     space = (
         ParameterSpace()
-        .add_choices("min_score", [55.0, 60.0, 65.0, 70.0, 75.0])
-        .add_choices("min_confidence", [0.5, 0.6, 0.7, 0.8])
-        .add_choices("min_agreement", [0.5, 0.6])
+        .add_choices("min_score", [55.0, 65.0, 75.0])
+        .add_choices("min_confidence", [0.5, 0.65, 0.8])
     )
     factory = make_quant_source_factory(settings, args.symbol, spread_bps=args.spread_bps)
     lab = BacktestLab(settings)
@@ -73,8 +93,11 @@ def main() -> None:
         args.symbol, timeframe="1m", label=f"{args.symbol.lower()}-wf", spread_bps=args.spread_bps
     )
 
-    print("Corriendo walk-forward (grid, objetivo=profit_factor)...")
-    print("  Esto tarda: varias combinaciones × varios pliegues × backtest completo.")
+    approx_folds = max(1, (len(candles) - args.train - args.test) // wf.step + 1)
+    print(
+        f"Corriendo walk-forward: train={args.train} test={args.test} step={wf.step} "
+        f"(~{approx_folds} pliegues × 9 combinaciones)..."
+    )
     report = lab.run_walk_forward(
         candles, space, factory, config, method="grid", objective="profit_factor"
     )
