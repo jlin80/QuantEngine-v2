@@ -181,6 +181,17 @@ def build_container(settings: Settings) -> Container:
         )
     container.register_instance(DocumentationService, documentation)
 
+    # --- Overrides del Config Center -------------------------------------
+    # DEBE ir antes de construir los subsistemas: muchos leen su configuración
+    # al construirse y la copian a atributos propios (p. ej. el PositionManager
+    # con `trailing_enabled`). Reaplicarlos después dejaba esos overrides sin
+    # efecto **para siempre** — ni un reinicio los aplicaba: el dashboard decía
+    # "saved" y `GET /api/config` los marcaba `overridden`, pero el motor seguía
+    # con el valor del `.env`.
+    from app.dashboard.api.config_store import config_store
+
+    config_store.reapply(settings)
+
     # --- Data Engine (Fase 2) --------------------------------------------
     if settings.market.enabled:
         _build_market(container, settings, bus, cache)
@@ -214,11 +225,6 @@ def build_container(settings: Settings) -> Container:
         _build_production(container, settings, bus)
 
     # --- API del dashboard ----------------------------------------------
-    # Reaplica los overrides de config guardados desde el dashboard sobre el
-    # settings recién cargado, para que sobrevivan a los reinicios.
-    from app.dashboard.api.config_store import config_store
-
-    config_store.reapply(settings)
     api_app = create_app(settings, container)
     container.register_instance(ApiService, ApiService(api_app, settings.dashboard))
 

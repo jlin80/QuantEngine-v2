@@ -88,11 +88,38 @@ export function useStrategyWeight(): UseMutationResult<
 
 // ------------------------------------------------------------------ config
 
+/**
+ * Saves a config patch. The backend distinguishes settings applied live from
+ * those the engine only reads at startup; surfacing that is essential — without
+ * it a toggle like `trailing_enabled` just said "saved" while the running engine
+ * kept the old value, which made the whole panel look decorative.
+ */
 export function useConfigPatch(): UseMutationResult<Dict, ApiError, Record<string, unknown>> {
-  return useAction<Record<string, unknown>, Dict>({
-    run: (patch) => apiSend<Dict>("PATCH", "/api/config", patch),
-    success: "Configuration saved",
-    invalidate: ["config", "execution", "engine"],
+  const queryClient = useQueryClient();
+  return useMutation<Dict, ApiError, Record<string, unknown>>({
+    mutationFn: (patch) => apiSend<Dict>("PATCH", "/api/config", patch),
+    onSuccess: (data) => {
+      const restart = (data?.needs_restart as string[] | undefined) ?? [];
+      const live = (data?.applied_live as string[] | undefined) ?? [];
+      if (restart.length > 0) {
+        toast.warning("Saved — restart required", {
+          description:
+            `${restart.join(", ")} ` +
+            `${restart.length === 1 ? "is" : "are"} only read at startup. ` +
+            `Restart the engine to apply.` +
+            (live.length > 0 ? ` Applied live: ${live.join(", ")}.` : ""),
+          duration: 10_000,
+        });
+      } else {
+        toast.success("Configuration applied live", {
+          description: live.length > 0 ? live.join(", ") : undefined,
+        });
+      }
+      for (const key of ["config", "execution", "engine"]) {
+        queryClient.invalidateQueries({ queryKey: [key] });
+      }
+    },
+    onError: (error) => toast.error("Action failed", { description: error.detail || error.message }),
   });
 }
 
