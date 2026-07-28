@@ -99,6 +99,59 @@ class TradeRecord:
         """Whether the trade closed with a positive net PnL."""
         return self.pnl > 0
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TradeRecord":
+        """Rebuild a trade from one journal line (inverse of :meth:`to_dict`).
+
+        Vive en el modelo para que el Trade Journal pueda releerse a sí mismo
+        sin depender de la capa de producción (Fase 9), que puede estar apagada.
+
+        Args:
+            data: Una entrada JSONL del Trade Journal ya parseada.
+
+        Returns:
+            La operación reconstruida.
+
+        Raises:
+            KeyError: Si falta un campo obligatorio.
+            ValueError: Si algún campo no se puede convertir.
+        """
+
+        def opt(value: Any) -> float | None:
+            return None if value is None else float(value)
+
+        return cls(
+            trade_id=str(data["trade_id"]),
+            position_id=str(data["position_id"]),
+            symbol=str(data["symbol"]),
+            side=PositionSide(data["side"]),
+            quantity=float(data["quantity"]),
+            entry_time=datetime.fromisoformat(str(data["entry_time"])),
+            exit_time=datetime.fromisoformat(str(data["exit_time"])),
+            entry_price=float(data["entry_price"]),
+            exit_price=float(data["exit_price"]),
+            stop_loss=opt(data.get("stop_loss")),
+            take_profit=opt(data.get("take_profit")),
+            commission=float(data.get("commission", 0.0)),
+            slippage_bps=float(data.get("slippage_bps", 0.0)),
+            spread_bps=float(data.get("spread_bps", 0.0)),
+            pnl=float(data.get("pnl", 0.0)),
+            pnl_gross=float(data.get("pnl_gross", 0.0)),
+            r_multiple=float(data.get("r_multiple", 0.0)),
+            return_pct=float(data.get("return_pct", 0.0)),
+            atr=opt(data.get("atr")),
+            volatility=str(data.get("volatility", "normal")),
+            regime=str(data.get("regime", "unknown")),
+            score=float(data.get("score", 0.0)),
+            confidence=float(data.get("confidence", 0.0)),
+            exit_reason=ExitReason(data.get("exit_reason", ExitReason.MANUAL.value)),
+            entry_reasons=tuple(data.get("entry_reasons", ())),
+            exit_reasons=tuple(data.get("exit_reasons", ())),
+            decision_id=data.get("decision_id"),
+            context_snapshot=dict(data.get("context_snapshot", {})),
+            recorded_at=datetime.fromisoformat(str(data["recorded_at"])),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe dict."""
         return {

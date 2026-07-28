@@ -81,6 +81,39 @@ class TradeJournal:
             self._log.info("Journal restaurado: %d operaciones en memoria", loaded)
         return loaded
 
+    def load_from_disk(self) -> int:
+        """Reload this journal's own JSONL file into memory.
+
+        El journal escribía a disco desde la Fase 5 pero sólo se releía a través
+        del servicio de recuperación de la Fase 9 — que está apagado por
+        defecto. Resultado: en cada reinicio el histórico de Operations y las
+        métricas del Performance Engine arrancaban vacíos mientras el fichero
+        seguía creciendo. Esto lo hace autónomo de la capa de producción.
+
+        Idempotente: si ya hay operaciones en memoria no vuelve a cargar.
+
+        Returns:
+            Cuántas operaciones se cargaron.
+        """
+        if self._trades or self._path is None or not self._path.exists():
+            return 0
+        trades: list[TradeRecord] = []
+        try:
+            with self._path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        trades.append(TradeRecord.from_dict(json.loads(line)))
+                    except (ValueError, KeyError, TypeError) as exc:
+                        # Una línea corrupta no puede impedir cargar el resto.
+                        self._log.warning("Línea del journal ilegible, se omite: %r", exc)
+        except OSError as exc:
+            self._log.error("No se pudo releer el journal: %r", exc)
+            return 0
+        return self.restore(trades)
+
     def all(self) -> list[TradeRecord]:
         """Every trade held in memory (oldest first)."""
         return list(self._trades)

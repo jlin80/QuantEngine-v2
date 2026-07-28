@@ -64,3 +64,76 @@ def test_journal_records_and_queries():
     assert len(journal.for_symbol("BTCUSDT")) == 2
     assert len(journal.recent(1)) == 1
     assert journal.status()["persist"] is False
+
+
+def test_trade_record_roundtrips_through_dict():
+    """`from_dict` debe ser el inverso exacto de `to_dict`."""
+    original = _trade(12.5, 1.25, minutes=7)
+
+    restored = TradeRecord.from_dict(original.to_dict())
+
+    assert restored.trade_id == original.trade_id
+    assert restored.symbol == original.symbol
+    assert restored.side is original.side
+    assert restored.pnl == original.pnl
+    assert restored.r_multiple == original.r_multiple
+    assert restored.exit_reason is original.exit_reason
+    assert restored.entry_time == original.entry_time
+    assert restored.exit_time == original.exit_time
+
+
+def test_journal_reloads_itself_from_disk(tmp_path):
+    """El historial debe sobrevivir a un reinicio.
+
+    Antes solo se releia via el servicio de recuperacion de la Fase 9, que esta
+    apagado por defecto: cada reinicio dejaba Operations y las metricas vacias
+    aunque el fichero JSONL siguiera creciendo.
+    """
+    path = tmp_path / "journal.jsonl"
+    first = TradeJournal(path, persist=True)
+    first.record(_trade(30.0, 1.5))
+    first.record(_trade(-10.0, -1.0))
+
+    # Nuevo proceso: journal vacio apuntando al mismo fichero.
+    second = TradeJournal(path, persist=True)
+    assert second.count == 0
+
+    loaded = second.load_from_disk()
+
+    assert loaded == 2
+    assert second.count == 2
+    assert [t.pnl for t in second.all()] == [30.0, -10.0]
+    # Y el Performance Engine, que calcula sobre el journal, ya no ve la nada.
+    assert PerformanceEngine(10_000.0).compute(second.all()).total_trades == 2
+
+
+def test_journal_reload_is_idempotent(tmp_path):
+    """Cargar dos veces no duplica el historial."""
+    path = tmp_path / "journal.jsonl"
+    first = TradeJournal(path, persist=True)
+    first.record(_trade(5.0))
+
+    second = TradeJournal(path, persist=True)
+    assert second.load_from_disk() == 1
+    assert second.load_from_disk() == 0  # ya tiene datos: no recarga
+    assert second.count == 1
+
+
+def test_journal_reload_skips_corrupt_lines(tmp_path):
+    """Una linea corrupta no puede impedir cargar el resto."""
+    path = tmp_path / "journal.jsonl"
+    first = TradeJournal(path, persist=True)
+    first.record(_trade(7.0))
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("{esto no es json}\n")
+    first.record(_trade(-3.0))
+
+    second = TradeJournal(path, persist=True)
+
+    assert second.load_from_disk() == 2
+    assert [t.pnl for t in second.all()] == [7.0, -3.0]
+
+
+def test_journal_without_persistence_loads_nothing(tmp_path):
+    """Sin fichero configurado la recarga es un no-op."""
+    assert TradeJournal(None, persist=False).load_from_disk() == 0
