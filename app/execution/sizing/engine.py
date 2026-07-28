@@ -3,16 +3,29 @@
 Métodos soportados: monto fijo, porcentaje del capital, ATR, riesgo fijo,
 riesgo dinámico (ajustado por confianza) y Kelly parcial. Todos respetan un
 tope de exposición por operación (``max_position_pct``) y una cantidad mínima.
+
+Unidades: el cálculo interno razona en **unidades del subyacente** (donde el
+riesgo es ``unidades × distancia_de_stop``), pero ``quantity`` se devuelve en la
+unidad que el broker acepta — **lotes** — dividiendo por el ``contract_size`` del
+símbolo. Sin esa conversión un lote de XAUUSD (contract_size=100) se envía 100×
+más grande de lo que el motor cree.
 """
 
 from dataclasses import dataclass
 
 from app.config.settings import SizingSettings
+from app.execution.models.instrument import DEFAULT_SPEC, InstrumentSpec
 
 
 @dataclass(frozen=True, slots=True)
 class SizingResult:
-    """Cantidad calculada y su justificación."""
+    """Cantidad calculada y su justificación.
+
+    Args:
+        quantity: Volumen a enviar al broker, en **lotes** del símbolo.
+        units: Unidades del subyacente equivalentes (``quantity × contract_size``).
+        notional: Valor nocional real de la posición (``units × precio``).
+    """
 
     quantity: float
     method: str
@@ -20,11 +33,13 @@ class SizingResult:
     stop_distance: float
     notional: float
     reason: str
+    units: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         """JSON-safe dict."""
         return {
             "quantity": self.quantity,
+            "units": self.units,
             "method": self.method,
             "risk_amount": self.risk_amount,
             "stop_distance": self.stop_distance,
@@ -52,6 +67,7 @@ class PositionSizer:
         confidence: float = 1.0,
         win_rate: float | None = None,
         reward_risk: float | None = None,
+        spec: InstrumentSpec | None = None,
     ) -> SizingResult:
         """Compute the position quantity.
 
@@ -62,11 +78,13 @@ class PositionSizer:
             confidence: Confianza de la decisión (para riesgo dinámico).
             win_rate: Tasa de acierto histórica (para Kelly).
             reward_risk: Relación beneficio/riesgo (para Kelly).
+            spec: Contrato del símbolo. Sin él se asume 1 lote = 1 unidad (paper).
 
         Returns:
-            Cantidad y su justificación (0 si no es posible dimensionar).
+            Cantidad en lotes y su justificación (0 si no es posible dimensionar).
         """
         method = self._settings.method
+        spec = spec or DEFAULT_SPEC
         if price <= 0 or equity <= 0:
             return SizingResult(0.0, method, 0.0, stop_distance, 0.0, "equity/precio no válidos")
 
@@ -91,17 +109,38 @@ class PositionSizer:
         else:  # fixed_risk | atr (ambos = riesgo fijo sobre la distancia de stop)
             quantity, risk_amount, reason = self._risk_based(equity, stop_distance, confidence=1.0)
 
-        quantity = self._apply_caps(quantity, equity, price)
-        if quantity < self._settings.min_quantity:
+        units = self._apply_caps(quantity, equity, price)
+        if units < self._settings.min_quantity:
             return SizingResult(
                 0.0, method, risk_amount, stop_distance, 0.0, "bajo la cantidad mínima"
             )
+
+        # Unidades → lotes (lo que el broker acepta), redondeando hacia abajo al
+        # paso del símbolo. Si el lote mínimo no cabe en el presupuesto de riesgo
+        # se rechaza limpio: inflarlo hasta `volume_min` operaría con un riesgo
+        # muy superior al configurado (el bug histórico del oro).
+        lots = spec.quantize(units / spec.contract_size if spec.contract_size > 0 else units)
+        if not spec.fits(lots):
+            return SizingResult(
+                0.0,
+                method,
+                risk_amount,
+                stop_distance,
+                0.0,
+                (
+                    f"el lote mínimo ({spec.volume_min}) no cabe en el riesgo: "
+                    f"caben {lots:.4f} lotes de {spec.symbol or 'el símbolo'}"
+                ),
+            )
+
+        final_units = spec.units(lots)
         return SizingResult(
-            quantity=round(quantity, 8),
+            quantity=round(lots, 8),
+            units=round(final_units, 8),
             method=method,
-            risk_amount=round(quantity * stop_distance, 4),
+            risk_amount=round(final_units * stop_distance, 4),
             stop_distance=stop_distance,
-            notional=round(quantity * price, 4),
+            notional=round(final_units * price, 4),
             reason=reason,
         )
 

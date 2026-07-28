@@ -12,13 +12,16 @@ símbolo. El resto del sistema (sizing, riesgo) razona en la misma unidad.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from types import ModuleType
 from typing import Any
 
 from app.brokers.mt5.connection import MT5Connection
 from app.execution.models import (
     BrokerExecution,
+    BrokerPosition,
     Fill,
+    InstrumentSpec,
     OrderRequest,
     OrderSide,
     OrderType,
@@ -197,6 +200,44 @@ class MT5Broker:
             return set()
         return {int(p.ticket) for p in positions}
 
+    def open_broker_positions(self) -> list[BrokerPosition]:
+        """Todas las posiciones vivas en la cuenta, con su detalle.
+
+        La consume la adopción de arranque del Execution Engine: tras un reinicio
+        el Position Manager arranca vacío y, sin esto, el motor ignora lo que ya
+        está abierto (no le hace trailing ni break-even, no lo cuenta para la
+        exposición y abre duplicados saltándose ``max_positions_per_symbol``).
+        """
+        if not self._conn.connected:
+            return []
+        positions = self._conn.mt5.positions_get()
+        if not positions:
+            return []
+        buy_type = int(getattr(self._conn.mt5, "POSITION_TYPE_BUY", 0))
+        adopted: list[BrokerPosition] = []
+        for p in positions:
+            if int(getattr(p, "magic", self._magic)) != self._magic:
+                # Sólo se adoptan las posiciones de este motor; las abiertas a
+                # mano por el operador se dejan en paz.
+                continue
+            raw_time = getattr(p, "time", None)
+            opened_at = (
+                datetime.fromtimestamp(int(raw_time), tz=UTC) if raw_time else None
+            )
+            adopted.append(
+                BrokerPosition(
+                    ticket=int(p.ticket),
+                    symbol=str(p.symbol).upper(),
+                    is_long=int(getattr(p, "type", buy_type)) == buy_type,
+                    volume=float(p.volume),
+                    price_open=float(p.price_open),
+                    stop_loss=float(p.sl) or None,
+                    take_profit=float(p.tp) or None,
+                    opened_at=opened_at,
+                )
+            )
+        return adopted
+
     def _matching_position_ticket(
         self, mt5: ModuleType, symbol: str, closing_is_buy: bool
     ) -> int | None:
@@ -297,11 +338,38 @@ class MT5Broker:
         )
         return BrokerExecution(fill, RejectReason.NONE)
 
+    def instrument_spec(self, symbol: str) -> InstrumentSpec | None:
+        """Contrato real del símbolo en el terminal (o ``None`` si no existe).
+
+        Lo consume el Execution Engine para dimensionar en lotes: sin el
+        ``trade_contract_size`` el sizing trata 1 lote como 1 unidad y un símbolo
+        como XAUUSDm (contract_size=100) se envía 100× sobredimensionado.
+        """
+        if not self._conn.connected:
+            return None
+        real_symbol = self._conn.resolve_symbol(symbol)
+        info = self._conn.mt5.symbol_info(real_symbol)
+        if info is None:
+            _log.error("Símbolo desconocido en MT5: %s", real_symbol)
+            return None
+        return InstrumentSpec(
+            symbol=symbol.upper(),
+            contract_size=float(getattr(info, "trade_contract_size", 1.0) or 1.0),
+            volume_min=float(getattr(info, "volume_min", 0.01) or 0.01),
+            volume_step=float(getattr(info, "volume_step", 0.01) or 0.01),
+            volume_max=float(getattr(info, "volume_max", 0.0) or 0.0),
+        )
+
     def _normalize_volume(self, mt5: ModuleType, symbol: str, quantity: float) -> float | None:
-        """Ajusta la cantidad (lotes) a los límites y el paso del símbolo.
+        """Valida la cantidad (lotes) contra los límites y el paso del símbolo.
+
+        El sizing ya entrega lotes cuantizados al paso del símbolo; aquí sólo se
+        comprueban los límites. Una cantidad por debajo de ``volume_min`` se
+        **rechaza**: subirla al mínimo (lo que hacía antes) operaba con un riesgo
+        muy superior al configurado sin que nada lo reportara.
 
         Returns:
-            El volumen válido más cercano, o ``None`` si el símbolo no existe.
+            El volumen válido, o ``None`` si el símbolo no existe o no cabe.
         """
         info = mt5.symbol_info(symbol)
         if info is None:
@@ -310,12 +378,17 @@ class MT5Broker:
         vmin = float(getattr(info, "volume_min", 0.01) or 0.01)
         vmax = float(getattr(info, "volume_max", 0.0) or 0.0)
         step = float(getattr(info, "volume_step", 0.01) or 0.01)
-        volume = max(vmin, quantity)
-        if vmax > 0:
-            volume = min(vmax, volume)
+        if quantity < vmin - 1e-12:
+            _log.warning(
+                "volumen %.6f por debajo del mínimo (%.4f) en %s: no se envía la orden",
+                quantity,
+                vmin,
+                symbol,
+            )
+            return None
+        volume = min(vmax, quantity) if vmax > 0 else quantity
         # Cuantiza al paso del símbolo (evita rechazos por volumen inválido).
-        steps = round(volume / step)
-        volume = round(steps * step, 8)
+        volume = round(round(volume / step) * step, 8)
         return max(vmin, volume)
 
     def _filling_modes(self, mt5: ModuleType, symbol: str) -> list[int]:

@@ -5,7 +5,7 @@ import random
 from app.config.settings import SizingSettings
 from app.execution.commission import CommissionEngine
 from app.execution.latency import LatencyEngine
-from app.execution.models import OrderRequest, OrderSide
+from app.execution.models import InstrumentSpec, OrderRequest, OrderSide
 from app.execution.paper_engine import PaperBroker
 from app.execution.sizing import PositionSizer
 from app.execution.slippage import SlippageContext, SlippageEngine
@@ -102,3 +102,63 @@ def test_paper_sell_executes_below_bid():
     req = OrderRequest(symbol="BTCUSDT", side=OrderSide.SELL, quantity=1.0)
     fill = broker.execute(req, ticker).fill
     assert fill is not None and fill.price <= ticker.bid
+
+
+def test_sizing_returns_lots_not_units_with_contract_size():
+    """El bug histórico del oro: XAUUSD tiene contract_size=100, así que
+    ``quantity`` (lotes) debe ser 100× menor que las unidades (onzas)."""
+    sizer = PositionSizer(
+        SizingSettings(method="fixed_risk", risk_per_trade_pct=1.0, max_position_pct=1000.0)
+    )
+    spec = InstrumentSpec(
+        symbol="XAUUSD", contract_size=100.0, volume_min=0.01, volume_step=0.01
+    )
+    result = sizer.calculate(
+        equity=100_000.0, price=4_000.0, stop_distance=4.0, spec=spec
+    )
+
+    # 1% de 100.000 = 1.000 arriesgados / 4 = 250 onzas = 2.5 lotes.
+    assert result.units == 250.0
+    assert result.quantity == 2.5
+    assert result.notional == 250.0 * 4_000.0
+    assert result.risk_amount == 1_000.0
+
+
+def test_sizing_rejects_when_min_lot_exceeds_risk_budget():
+    """Con equity pequeño, el lote mínimo del oro arriesga mucho más que el
+    presupuesto: hay que rechazar limpio, no inflar hasta ``volume_min``."""
+    sizer = PositionSizer(
+        SizingSettings(method="fixed_risk", risk_per_trade_pct=0.5, max_position_pct=1000.0)
+    )
+    spec = InstrumentSpec(
+        symbol="XAUUSD", contract_size=100.0, volume_min=0.01, volume_step=0.01
+    )
+    result = sizer.calculate(equity=164.0, price=4_089.0, stop_distance=6.13, spec=spec)
+
+    assert result.quantity == 0.0
+    assert "lote mínimo" in result.reason
+
+
+def test_sizing_without_spec_keeps_paper_behaviour():
+    """Sin spec (paper broker) el resultado es idéntico al de siempre."""
+    sizer = PositionSizer(
+        SizingSettings(method="fixed_risk", risk_per_trade_pct=1.0, max_position_pct=100.0)
+    )
+    result = sizer.calculate(equity=10_000.0, price=100.0, stop_distance=2.0)
+
+    assert result.quantity == 50.0
+    assert result.units == 50.0
+    assert result.notional == 5_000.0
+
+
+def test_sizing_quantizes_lots_downwards():
+    """Se redondea hacia abajo al paso: nunca más riesgo del solicitado."""
+    sizer = PositionSizer(
+        SizingSettings(method="fixed_risk", risk_per_trade_pct=1.0, max_position_pct=1000.0)
+    )
+    spec = InstrumentSpec(symbol="ETHUSD", contract_size=1.0, volume_min=0.1, volume_step=0.01)
+    result = sizer.calculate(equity=10_000.0, price=2_000.0, stop_distance=57.0, spec=spec)
+
+    # 100 / 57 = 1.7543... unidades = lotes -> 1.75 tras cuantizar hacia abajo.
+    assert result.quantity == 1.75
+    assert result.risk_amount <= 100.0

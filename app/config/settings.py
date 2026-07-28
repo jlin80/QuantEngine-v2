@@ -190,6 +190,11 @@ class MLValidationSettings(BaseModel):
     """
 
     min_auc: float = 0.55
+    # AUC mínimo de la VALIDACIÓN CRUZADA, evaluado aparte del holdout. La puerta
+    # usaba `max(holdout, cv)`, así que un modelo sobreajustado con holdout 0.663
+    # y cv 0.463 (peor que el azar) se aprobaba ignorando la señal de la CV. La
+    # CV es la estimación más honesta: si la suspende, el modelo no pasa.
+    min_cv_auc: float = 0.52
     min_accuracy: float = 0.55
     min_samples: int = 40
     require_beat_previous: bool = True
@@ -716,6 +721,13 @@ class SizingSettings(BaseModel):
     # dispersos) sale artificialmente bajo — sin esto el stop se dispara
     # casi al entrar por simple ruido/spread, no por movimiento real.
     min_stop_pct: float = 0.15
+    # Piso adicional: el stop nunca puede estar a menos de N veces el spread.
+    # `min_stop_pct` es global, pero el spread varía mucho entre símbolos (XAU
+    # ~0.56 bps, USTEC ~1.05, ETH ~3.03): con un 0.15% fijo el stop de ETH queda
+    # a sólo 5× el spread y lo barre el ruido, mientras que en oro son 27×.
+    # Con 8×, oro y USTEC no cambian (su piso porcentual ya es mayor) y sólo se
+    # ensancha donde hacía falta.
+    min_stop_spread_multiple: float = 8.0
     reward_risk: float = 1.5  # objetivo = riesgo × esta relación
     kelly_fraction: float = 0.25  # fracción parcial de Kelly
     max_position_pct: float = 20.0  # tope de notional como % del equity
@@ -766,12 +778,31 @@ class ExecutionSettings(BaseModel):
     break_even_r: float = 1.0  # mover stop a BE tras +1R (0 desactiva)
     trailing_enabled: bool = True
     trailing_atr_multiple: float = 2.0
+    # El trailing sólo arranca tras +N R. Sin este gate, con ATR bajo (velas
+    # desde ticks) `highest_price` arranca en la entrada y `entry - ATR×2` cae
+    # MÁS CERCA que el stop inicial: el trailing aprieta el stop nada más abrir,
+    # antes de que el precio se mueva, y liquida la posición por ruido.
+    trailing_activate_r: float = 1.0
+    # Nº de comprobaciones consecutivas con régimen adverso antes de cerrar.
+    # El régimen 1m parpadea entre etiquetas; exigir confirmación evita cerrar
+    # por un cambio de una sola lectura.
+    regime_exit_confirmations: int = 2
+    # Comparar FAMILIAS de régimen (continuación / reversión a la media /
+    # adverso) en vez de las 8 etiquetas sueltas. Pasar de "breakout" a
+    # "trending" estando largo no es motivo para salir: es la misma tesis.
+    regime_exit_family_only: bool = True
     max_holding_minutes: float = 240.0  # salida por tiempo (0 desactiva)
     exit_on_regime_change: bool = True
     # Tiempo mínimo antes de que un cambio de régimen pueda cerrar: sin esto,
     # el régimen "parpadea" entre etiquetas vela a vela (más en cripto, velas
     # 1m ruidosas) y corta la posición casi al entrar, antes de que se mueva.
     regime_change_min_holding_seconds: float = 180.0
+    # Toggle de operativa por símbolo: {"XAUUSDM": false} deja de abrir posiciones
+    # en ese símbolo sin sacarlo del feed de datos (sigue alimentando estrategias,
+    # backtests y ML). Lo no listado se opera. Las claves se comparan en MAYÚSCULAS.
+    # Pensado para símbolos cuyo lote mínimo no cabe en el equity actual (el oro
+    # necesita ~20k con el tope de exposición al 20%).
+    symbols_enabled: dict[str, bool] = Field(default_factory=dict)
     report_interval_seconds: float = 3600.0  # resumen periódico a Discord
     journal_path: Path = _PROJECT_ROOT / "data" / "execution" / "journal.jsonl"
     persist_journal: bool = True
@@ -1178,6 +1209,17 @@ class ResearchSettings(BaseModel):
     """
 
     enabled: bool = False
+    # Ciclo autónomo de generación: sin esto el laboratorio existía pero **nada
+    # lo disparaba** (experiments=0 indefinidamente), porque sólo se registraba
+    # el notificador en el scheduler y nunca el laboratorio en sí.
+    auto_cycle: bool = False
+    cycle_interval_seconds: float = 86_400.0  # una vez al día
+    cycle_symbols: list[str] = Field(
+        default_factory=list,
+        description="Símbolos del ciclo autónomo; vacío = los del Data Engine.",
+    )
+    cycle_timeframe: str = "1m"
+    cycle_candles: int = 1_000  # historial por símbolo que alimenta el ciclo
     state_dir: Path = _PROJECT_ROOT / "data" / "research"
     experiments_dir: Path = _PROJECT_ROOT / "data" / "research" / "experiments"
     knowledge_dir: Path = _PROJECT_ROOT / "data" / "research" / "knowledge"

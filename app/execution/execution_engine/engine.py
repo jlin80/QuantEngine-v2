@@ -29,6 +29,7 @@ from app.execution.journal import TradeJournal
 from app.execution.models import (
     ExitReason,
     Fill,
+    InstrumentSpec,
     Order,
     OrderRequest,
     OrderSide,
@@ -54,6 +55,29 @@ _SESSION_HOURS: dict[str, tuple[int, int]] = {
     "europe": (7, 16),
     "america": (13, 22),
 }
+
+# Familias de régimen. El detector expone 8 etiquetas que en 1m parpadean entre
+# sí; agruparlas por la TESIS que representan evita cerrar posiciones por un
+# cambio de matiz ("breakout"→"trending" es la misma idea direccional).
+_REGIME_FAMILIES: dict[str, str] = {
+    "trending": "continuation",
+    "breakout": "continuation",
+    "expansion": "continuation",
+    "ranging": "mean_reversion",
+    "compression": "mean_reversion",
+    "low_volatility": "mean_reversion",
+    "reversal": "adverse",
+    "high_volatility": "adverse",
+}
+
+
+def _regime_family(regime: str) -> str:
+    """Familia de tesis a la que pertenece un régimen.
+
+    Lo desconocido se mapea a su propia etiqueta para no agrupar por accidente
+    un régimen nuevo con una familia que no le corresponde.
+    """
+    return _REGIME_FAMILIES.get(regime, regime)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +149,7 @@ class ExecutionEngine(Service):
         self._kill_announced = False
         self._cb_announced = False
         self._balance_baseline_set = False
+        self._spec_cache: dict[str, InstrumentSpec] = {}
         self._entry_vetoes: list[Callable[[], str | None]] = []
         self._log = logging.getLogger("app.execution.engine")
 
@@ -201,10 +226,70 @@ class ExecutionEngine(Service):
 
     async def _on_start(self) -> None:
         """Subscribe to decisions and launch the management loop."""
+        # El historial vive en disco; sin releerlo, Operations y el Performance
+        # Engine (que calcula sobre `journal.all()`) arrancan vacíos en cada
+        # reinicio aunque el fichero siga creciendo.
+        restored = self._journal.load_from_disk()
+        if restored:
+            self._log.info("Journal restaurado desde disco: %d operaciones", restored)
+        self._sync_broker_balance()
+        await self._adopt_broker_positions()
         if self._bus is not None:
             self._subscription = self._bus.subscribe(self._on_event, DecisionGenerated)
         interval = max(0.2, self._settings.manage_interval_seconds)
         self._manage_task = asyncio.create_task(self._manage_loop(interval), name="exec-manage")
+
+    async def _adopt_broker_positions(self) -> None:
+        """Hacerse cargo de las posiciones que ya estaban vivas en el broker.
+
+        Sólo aplica a brokers reales que exponen ``open_broker_positions`` (MT5);
+        con el paper broker no hace nada. Sin esto, tras un reinicio el motor
+        arranca con el Position Manager vacío mientras la cuenta tiene posiciones
+        abiertas: no les hace trailing ni break-even, no las cuenta para la
+        exposición y vuelve a abrir en el mismo símbolo saltándose
+        ``max_positions_per_symbol``.
+        """
+        positions_of = getattr(self._paper, "open_broker_positions", None)
+        if positions_of is None:
+            return
+        known = {
+            str(p.metadata.get("broker_ref"))
+            for p in self._positions.open_positions
+            if p.metadata.get("broker_ref")
+        }
+        for live in positions_of():
+            if str(live.ticket) in known:
+                continue
+            position = self._positions.adopt(
+                symbol=live.symbol,
+                side=PositionSide.LONG if live.is_long else PositionSide.SHORT,
+                quantity=live.volume,
+                entry_price=live.price_open,
+                stop_loss=live.stop_loss,
+                take_profit=live.take_profit,
+                broker_ref=str(live.ticket),
+                opened_at=live.opened_at,
+            )
+            self._log.warning(
+                "Posición adoptada al arrancar: %s %s %s @ %s (ticket %s)",
+                position.symbol,
+                position.side.value,
+                position.quantity,
+                position.entry_price,
+                live.ticket,
+            )
+            await self._publish(
+                ev.PositionOpened(
+                    source="execution_engine",
+                    position_id=position.position_id,
+                    symbol=position.symbol,
+                    side=position.side.value,
+                    quantity=position.quantity,
+                    entry_price=position.entry_price,
+                    stop_loss=position.stop_loss,
+                    take_profit=position.take_profit,
+                )
+            )
 
     async def _on_stop(self) -> None:
         """Unsubscribe and cancel the management loop."""
@@ -248,6 +333,12 @@ class ExecutionEngine(Service):
             return None
         symbol = decision.symbol.upper()
         side = OrderSide.BUY if decision.action == "open_long" else OrderSide.SELL
+        # Toggle por símbolo: sólo bloquea la APERTURA. Las posiciones ya abiertas
+        # se siguen gestionando y cerrando con normalidad, y el símbolo continúa
+        # alimentando estrategias, evaluación y ML.
+        if not self._settings.symbols_enabled.get(symbol, True):
+            self._log.debug("Símbolo %s desactivado para operar (toggle)", symbol)
+            return None
         # Vetos externos (Safe Mode en Fase 9). Se evalúan antes que nada: si el
         # sistema está degradado no tiene sentido ni mirar el mercado.
         veto = self._entry_veto()
@@ -286,12 +377,15 @@ class ExecutionEngine(Service):
             confidence=decision.confidence,
             win_rate=win_rate,
             reward_risk=reward_risk,
+            spec=self._instrument_spec(symbol),
         )
         if sizing.quantity <= 0:
             await self._reject(symbol, side, RejectReason.INVALID_QUANTITY, "sizing", sizing.reason)
             return None
 
-        notional = sizing.quantity * reference
+        # Exposición real: el notional lo calcula el sizer con el contract_size
+        # del símbolo, no `quantity × precio` (que en XAU sería 100× menor).
+        notional = sizing.notional
         check = self._risk.evaluate_entry(
             RiskQuery(
                 symbol=symbol,
@@ -403,6 +497,28 @@ class ExecutionEngine(Service):
             if reason is not None:
                 await self.close_position(position, reason)
         await self._refresh_risk()
+
+    def _instrument_spec(self, symbol: str) -> InstrumentSpec | None:
+        """Contrato del símbolo según el broker, cacheado por símbolo.
+
+        Sólo lo exponen los brokers reales (MT5); con el paper broker devuelve
+        ``None`` y el sizer asume 1 lote = 1 unidad, que es como el paper engine
+        ya se comportaba.
+        """
+        if symbol in self._spec_cache:
+            return self._spec_cache[symbol]
+        spec_of = getattr(self._paper, "instrument_spec", None)
+        spec: InstrumentSpec | None = None if spec_of is None else spec_of(symbol)
+        if spec is not None:
+            self._spec_cache[symbol] = spec
+            self._log.info(
+                "Contrato %s: contract_size=%s volume_min=%s step=%s",
+                symbol,
+                spec.contract_size,
+                spec.volume_min,
+                spec.volume_step,
+            )
+        return spec
 
     def _sync_broker_balance(self) -> None:
         """Sync the Portfolio Manager cash with the real broker balance.
@@ -528,17 +644,59 @@ class ExecutionEngine(Service):
         max_minutes = self._settings.max_holding_minutes
         if max_minutes > 0 and position.holding_seconds() / 60.0 >= max_minutes:
             return ExitReason.TIME_EXIT
-        regime_exit = (
-            self._settings.exit_on_regime_change
-            and self._context is not None
-            and position.regime not in ("", "unknown")
-            and position.holding_seconds() >= self._settings.regime_change_min_holding_seconds
-        )
-        if regime_exit:
-            view = await self._market_view(position.symbol)
-            if view.regime not in ("unknown", position.regime):
-                return ExitReason.REGIME_CHANGE
+        if await self._regime_turned_against(position):
+            return ExitReason.REGIME_CHANGE
         return self._positions.check_exit(position)
+
+    async def _regime_turned_against(self, position: Position) -> bool:
+        """Whether the regime has genuinely turned against the position.
+
+        Dos guardas sobre el comportamiento anterior, que cerraba ante *cualquier*
+        diferencia de etiqueta y provocaba que el 80% de las salidas fueran por
+        régimen sin llegar nunca al stop ni al objetivo:
+
+        1. Se comparan **familias** (continuación / reversión a la media /
+           adverso), no las 8 etiquetas: pasar de ``breakout`` a ``trending``
+           estando largo es la misma tesis, no un motivo para salir.
+        2. Se exigen ``regime_exit_confirmations`` lecturas adversas
+           **consecutivas**: el régimen en 1m parpadea y una sola lectura no
+           basta. El contador se reinicia en cuanto vuelve a ser favorable.
+        """
+        if not self._settings.exit_on_regime_change or self._context is None:
+            return False
+        if position.regime in ("", "unknown"):
+            return False
+        if position.holding_seconds() < self._settings.regime_change_min_holding_seconds:
+            return False
+
+        view = await self._market_view(position.symbol)
+        position.metadata["exit_regime"] = view.regime
+        if view.regime == "unknown":
+            return False
+
+        if self._settings.regime_exit_family_only:
+            changed = _regime_family(view.regime) != _regime_family(position.regime)
+        else:
+            changed = view.regime != position.regime
+
+        if not changed:
+            position.metadata["regime_adverse_streak"] = 0
+            return False
+
+        streak = int(position.metadata.get("regime_adverse_streak", 0)) + 1
+        position.metadata["regime_adverse_streak"] = streak
+        needed = max(1, self._settings.regime_exit_confirmations)
+        if streak < needed:
+            self._log.debug(
+                "%s: régimen %s→%s (%s/%s confirmaciones)",
+                position.symbol,
+                position.regime,
+                view.regime,
+                streak,
+                needed,
+            )
+            return False
+        return True
 
     async def close_position(
         self, position: Position, reason: ExitReason, *, exit_reasons: tuple[str, ...] = ()
@@ -708,15 +866,26 @@ class ExecutionEngine(Service):
         return atr_indicator(candles, period)
 
     def _stop_distance(self, view: _MarketView, reference: float) -> float:
-        """Stop distance: ATR × multiple, con piso de % del precio.
+        """Stop distance: ATR × multiple, con piso porcentual y piso por spread.
 
         Sin el piso, un ATR subestimado (velas construidas desde ticks
         dispersos) puede dar una distancia menor que el propio spread: el
         stop se dispara por ruido/spread al entrar, no por movimiento real.
+
+        El piso porcentual por sí solo no basta porque es **global** y el spread
+        varía mucho entre símbolos: un 0.15% deja el stop de ETH (spread ~3 bps)
+        a sólo 5× el spread mientras que en oro (~0.56 bps) son 27×. De ahí el
+        segundo piso, proporcional al spread real del momento.
         """
-        floor = reference * (self._settings.sizing.min_stop_pct / 100.0)
+        sizing = self._settings.sizing
+        floor = reference * (sizing.min_stop_pct / 100.0)
+        if view.spread_bps and view.spread_bps > 0:
+            spread_floor = (
+                reference * (view.spread_bps / 10_000.0) * sizing.min_stop_spread_multiple
+            )
+            floor = max(floor, spread_floor)
         if view.atr and view.atr > 0:
-            return max(view.atr * self._settings.sizing.atr_stop_multiplier, floor)
+            return max(view.atr * sizing.atr_stop_multiplier, floor)
         return max(reference * 0.005, floor)
 
     def _stops(self, side: OrderSide, reference: float, distance: float) -> tuple[float, float]:
@@ -793,6 +962,18 @@ class ExecutionEngine(Service):
             entry_reasons=position.entry_reasons,
             exit_reasons=position.exit_reasons,
             decision_id=position.decision_id,
+            # Contexto de SALIDA: sin esto no se puede auditar por qué se cerró
+            # (el journal sólo guardaba el régimen de entrada, así que era
+            # imposible medir si las salidas por régimen estaban justificadas).
+            # Lo consume además la segmentación de `strategy_intelligence`.
+            context_snapshot={
+                "exit_regime": position.metadata.get("exit_regime", "unknown"),
+                "entry_regime": position.regime,
+                "regime_adverse_streak": position.metadata.get("regime_adverse_streak", 0),
+                "break_even_active": position.break_even_active,
+                "trailing_active": position.trailing_active,
+                "holding_seconds": round(position.holding_seconds(), 1),
+            },
         )
 
     # ------------------------------------------------------------------

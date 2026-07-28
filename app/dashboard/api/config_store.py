@@ -28,9 +28,16 @@ WHITELIST: tuple[str, ...] = (
     "execution.risk.max_exposure_pct",
     "execution.risk.max_consecutive_losses",
     "execution.risk.kill_switch_drawdown_pct",
+    "execution.symbols_enabled",
     "execution.max_holding_minutes",
     "execution.exit_on_regime_change",
     "execution.regime_change_min_holding_seconds",
+    "execution.regime_exit_confirmations",
+    "execution.regime_exit_family_only",
+    "execution.break_even_r",
+    "execution.trailing_enabled",
+    "execution.trailing_atr_multiple",
+    "execution.trailing_activate_r",
     "execution.sizing.risk_per_trade_pct",
     "execution.sizing.atr_stop_multiplier",
     "execution.sizing.reward_risk",
@@ -59,9 +66,15 @@ WHITELIST: tuple[str, ...] = (
 # reinicio; ``apply`` marca cuáles fueron en caliente para informar al operador.
 _LIVE_PREFIXES: tuple[str, ...] = (
     "execution.risk.",
+    "execution.symbols_enabled",
     "execution.max_holding_minutes",
     "execution.exit_on_regime_change",
     "execution.regime_change_min_holding_seconds",
+    # El engine las lee en cada ciclo de gestión → aplican en caliente. Las de
+    # trailing/break-even NO: el PositionManager las lee al construirse, así que
+    # quedan fuera y `apply` avisará de que necesitan reinicio.
+    "execution.regime_exit_confirmations",
+    "execution.regime_exit_family_only",
     "execution.sizing.",
     "quant.consensus.",
     "quant.context.",
