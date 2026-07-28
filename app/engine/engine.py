@@ -19,7 +19,9 @@ from app.execution.execution_engine import ExecutionEngine
 from app.execution.notifications import ExecutionNotifier
 from app.market.collector import TickCollector
 from app.market.feed import MarketFeed
+from app.market.models import Timeframe
 from app.market.scheduler import register_market_jobs
+from app.market.services import MarketDataService
 from app.market.storage import MarketDataWriter
 from app.ml.api import MLEngine
 from app.ml.notifications import MLNotifier
@@ -31,6 +33,7 @@ from app.production.api import ProductionAPI
 from app.production.kill_switch import KillSwitchController
 from app.production.recovery import RecoveryService
 from app.production.safe_mode import SafeModeController, SafeModeObservation
+from app.research.api import ResearchLab
 from app.research.notifications import ResearchNotifier
 from app.scheduler.scheduler import AsyncScheduler
 
@@ -243,6 +246,24 @@ class QuantEngine:
                 "ml_meta_evaluation", ml_meta_evaluation, interval_seconds=meta_interval
             )
 
+        # Quant Research Lab (Fase 10): ciclo autónomo de generación. El
+        # laboratorio existía pero nada lo disparaba — sólo se registraba su
+        # notificador —, así que `experiments` se quedaba en 0 para siempre.
+        # El ciclo **descubre y valida candidatas sobre copias**: no opera, no
+        # promueve y no habilita live; la promoción sigue exigiendo aprobación
+        # humana. Está detrás de `auto_cycle` porque los backtests compiten por
+        # CPU con el motor que está operando.
+        if self._container.contains(ResearchLab) and self._settings.research.auto_cycle:
+            research = self._container.resolve(ResearchLab)
+            research_interval = max(3_600.0, self._settings.research.cycle_interval_seconds)
+
+            async def research_cycle() -> None:
+                await self._run_research_cycle(research)
+
+            scheduler.add_job(
+                "research_cycle", research_cycle, interval_seconds=research_interval
+            )
+
         # Producción (Fase 9): vigilancia de safe mode, corte programado del
         # kill switch, snapshot de estado y re-evaluación del Live Gate. Ningún
         # job puede habilitar live: el gate sólo *evalúa*, y la aprobación del
@@ -369,6 +390,51 @@ class QuantEngine:
                 self._container.resolve(MarketFeed),
                 self._container.resolve(TickCollector),
                 self._container.resolve(CacheService),
+            )
+
+    async def _run_research_cycle(self, research: ResearchLab) -> None:
+        """Run one autonomous generation cycle per configured symbol.
+
+        Trabaja **sobre copias**: genera genomas, los valida en el cluster de
+        simulación contra histórico y registra las que califican. Nunca envía
+        órdenes ni promueve nada — la promoción exige aprobación humana.
+
+        Un símbolo sin histórico suficiente se salta con un aviso; un fallo en
+        uno no puede impedir que se procesen los demás.
+        """
+        settings = self._settings.research
+        symbols = settings.cycle_symbols or list(self._settings.market.symbols)
+        if not symbols:
+            self._log.warning("Ciclo de research sin símbolos configurados; se omite")
+            return
+        market = self._container.resolve(MarketDataService)
+        timeframe = Timeframe(settings.cycle_timeframe)
+        for raw_symbol in symbols:
+            symbol = raw_symbol.upper()
+            candles = market.get_candles(symbol, timeframe, limit=settings.cycle_candles)
+            if len(candles) < 100:
+                self._log.info(
+                    "Research: %s sin histórico suficiente (%d velas); se omite",
+                    symbol,
+                    len(candles),
+                )
+                continue
+            try:
+                summary = await research.run_generation_cycle(
+                    symbol,
+                    timeframe.value,
+                    candles,
+                    research.make_config(symbol),
+                )
+            except Exception:
+                # El laboratorio nunca puede tumbar el motor que está operando.
+                self._log.exception("Ciclo de research falló en %s", symbol)
+                continue
+            self._log.info(
+                "Research %s: %d generadas, %d calificadas",
+                symbol,
+                summary.get("generated", 0),
+                summary.get("qualified", 0),
             )
 
     async def _observe_vitals(self) -> SafeModeObservation:
