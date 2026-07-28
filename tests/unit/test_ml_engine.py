@@ -174,3 +174,44 @@ async def test_meta_evaluation_and_drift_check_run():
     await bus.stop()
     assert "weights" in meta
     assert drift["status"] == "ok"
+
+
+def test_gate_rejects_an_overfitted_model():
+    """Holdout bueno + validacion cruzada peor que el azar = sobreajuste.
+
+    Es el caso real que se colo en produccion: holdout 0.663, cv 0.463, y la
+    puerta lo aprobo con "supera los minimos (AUC 0.663)" porque usaba
+    `max(holdout, cv)` y descartaba la CV justo cuando contradecia.
+    """
+    engine = _engine()
+    result = engine.train_model()
+    overfitted = make_training_result(result.model, auc=0.663, accuracy=0.62, cv_auc=0.463)
+
+    approved, reasons = engine.evaluate_model(overfitted)
+
+    assert approved is False
+    assert any("validacion cruzada" in r or "validación cruzada" in r for r in reasons)
+
+
+def test_gate_accepts_when_cross_validation_also_holds_up():
+    """Un modelo con holdout y CV consistentes si pasa."""
+    engine = _engine()
+    result = engine.train_model()
+    solid = make_training_result(result.model, auc=0.68, accuracy=0.65, cv_auc=0.61)
+
+    approved, reasons = engine.evaluate_model(solid)
+
+    assert approved is True
+    assert any("supera los" in r for r in reasons)
+
+
+def test_gate_no_longer_lets_cv_rescue_a_weak_holdout():
+    """Antes `max(holdout, cv)` permitia que una CV alta tapase un holdout malo."""
+    engine = _engine()
+    result = engine.train_model()
+    weak = make_training_result(result.model, auc=0.50, accuracy=0.62, cv_auc=0.72)
+
+    approved, reasons = engine.evaluate_model(weak)
+
+    assert approved is False
+    assert any("AUC 0.500" in r for r in reasons)

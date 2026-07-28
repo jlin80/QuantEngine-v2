@@ -164,11 +164,25 @@ def make_metrics(auc: float, *, accuracy: float = 0.70, samples: int = 80) -> Cl
 
 
 def make_training_result(
-    model: Model, *, auc: float, accuracy: float = 0.70, samples: int = 80
+    model: Model,
+    *,
+    auc: float,
+    accuracy: float = 0.70,
+    samples: int = 80,
+    cv_auc: float | None = None,
 ) -> TrainingResult:
-    """Assemble a :class:`TrainingResult` with controlled metrics for gate tests."""
+    """Assemble a :class:`TrainingResult` with controlled metrics for gate tests.
+
+    ``cv_auc`` permite disociar la validación cruzada del holdout para probar la
+    puerta anti-sobreajuste; por defecto coinciden.
+    """
     holdout = make_metrics(auc, accuracy=accuracy, samples=samples)
-    cv = CrossValidationResult(folds=3, mean_auc=auc, mean_accuracy=accuracy, mean_f1=accuracy)
+    cv = CrossValidationResult(
+        folds=3,
+        mean_auc=auc if cv_auc is None else cv_auc,
+        mean_accuracy=accuracy,
+        mean_f1=accuracy,
+    )
     return TrainingResult(
         model=model,
         model_type=model.model_type.value,

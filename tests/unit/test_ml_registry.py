@@ -107,8 +107,10 @@ def test_metadata_persists_and_reloads(tmp_path):
     assert reloaded.count() == 2
     assert (active := reloaded.active_record()) is not None and active.id == second.id
     assert reloaded.status()["can_rollback"] is True
-    # El objeto vivo no se rehidrata (sólo metadatos): se degrada con elegancia.
-    assert reloaded.active_model() is None
+    # El objeto ENTRENADO también se rehidrata: sin esto `active_model()` era
+    # None tras cada reinicio y el ML dejaba de asesorar en silencio.
+    assert reloaded.active_model() is not None
+    assert reloaded.active_model().is_fitted
 
 
 def test_status_reports_counts_by_state():
@@ -130,3 +132,54 @@ def test_build_model_covers_every_native_type():
     ):
         model = build_model(kind, MLModelSettings(), seed=7)
         assert model.model_type is kind
+
+
+@pytest.mark.parametrize(
+    "kind", ["logistic_regression", "decision_tree", "random_forest", "extra_trees"]
+)
+def test_trained_models_survive_a_restart(tmp_path, kind):
+    """Todos los tipos nativos deben rehidratarse prediciendo IGUAL que antes."""
+    directory = tmp_path / "registry"
+    registry = ModelRegistry(directory)
+    record = _register(registry, kind)
+    registry.activate(record.id)
+    rows = [[0.5, 0.4], [0.95, 0.9], [0.05, 0.02]]
+    before = [registry.active_model().predict_proba(rows)]
+
+    reloaded = ModelRegistry(directory)
+    model = reloaded.active_model()
+
+    assert model is not None, f"{kind} no sobrevivió al reinicio"
+    assert model.model_type.value == kind
+    assert model.is_fitted
+    assert [model.predict_proba(rows)] == before  # predicción idéntica
+
+
+def test_inference_reports_an_active_model_after_restart(tmp_path):
+    """El sintoma que se veia en /api/ml/status: registry.active poblado pero
+    inference.has_active_model=False."""
+    from app.ml.inference.service import InferenceService
+
+    directory = tmp_path / "registry"
+    registry = ModelRegistry(directory)
+    registry.activate(_register(registry, "extra_trees").id)
+
+    reloaded = ModelRegistry(directory)
+    status = InferenceService(reloaded).status()
+
+    assert status["has_active_model"] is True
+    assert status["active_model"] is not None
+
+
+def test_unserialisable_model_does_not_break_persistence(tmp_path):
+    """Un backend sin `to_dict` se avisa, no revienta el registro."""
+    directory = tmp_path / "registry"
+    registry = ModelRegistry(directory)
+    record = _register(registry)
+    registry.activate(record.id)
+    # Sustituye el objeto por uno sin `to_dict`.
+    registry._models[record.id] = object()  # type: ignore[assignment]
+
+    registry._persist()  # no debe lanzar
+
+    assert ModelRegistry(directory).count() == 1

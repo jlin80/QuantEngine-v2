@@ -15,6 +15,7 @@ from typing import Any
 
 from app.core.exceptions import ModelRegistryError
 from app.ml.interfaces.model import Model
+from app.ml.models.factory import model_from_dict
 from app.ml.registry.records import ModelRecord, ModelState
 from app.utils.time import utc_now
 
@@ -233,6 +234,62 @@ class ModelRegistry:
                     handle.write(json.dumps(self._audit[-1], ensure_ascii=False) + "\n")
         except OSError as exc:  # el disco nunca debe tumbar el registro
             self._log.error("No se pudo persistir el registro de modelos: %r", exc)
+        self._persist_models()
+
+    def _persist_models(self) -> None:
+        """Write each trained model object next to its record.
+
+        Sin esto sólo sobrevivía la **ficha** del modelo: tras un reinicio
+        ``active_record()`` devolvía el registro pero ``active_model()`` devolvía
+        ``None``, así que ``has_active_model`` era ``False`` y el ML degradaba a
+        "sin modelo" en silencio — dejaba de asesorar hasta el siguiente
+        reentrenamiento nocturno.
+        """
+        if self._dir is None:
+            return
+        models_dir = self._dir / "models"
+        for model_id, model in self._models.items():
+            path = models_dir / f"{model_id}.json"
+            if path.exists():
+                continue  # nunca se sobrescribe una versión ya persistida
+            to_dict = getattr(model, "to_dict", None)
+            if to_dict is None:
+                # Backends externos (XGBoost/redes) no serializan a JSON: se
+                # deja constancia en vez de fallar en silencio.
+                self._log.warning(
+                    "El modelo %s (%s) no es serializable: no sobrevivirá a un reinicio",
+                    model_id,
+                    model.model_type.value,
+                )
+                continue
+            try:
+                models_dir.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps(to_dict(), ensure_ascii=False), encoding="utf-8"
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                self._log.error("No se pudo persistir el modelo %s: %r", model_id, exc)
+
+    def _rehydrate_models(self) -> None:
+        """Rebuild trained model objects from disk after a restart."""
+        if self._dir is None:
+            return
+        models_dir = self._dir / "models"
+        if not models_dir.exists():
+            return
+        for model_id in self._order:
+            path = models_dir / f"{model_id}.json"
+            if not path.exists():
+                continue
+            try:
+                model = model_from_dict(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, ValueError, KeyError) as exc:
+                # Un modelo ilegible no puede impedir cargar el resto.
+                self._log.error("No se pudo rehidratar el modelo %s: %r", model_id, exc)
+                continue
+            self._models[model_id] = model
+        if self._models:
+            self._log.info("Modelos rehidratados desde disco: %d", len(self._models))
 
     def _load(self) -> None:
         """Load the metadata snapshot from disk (models are not rehydrated)."""
@@ -252,3 +309,4 @@ class ModelRegistry:
             self._order.append(record.id)
         self._active_id = data.get("active_id")
         self._activation_stack = deque(data.get("activation_stack", []), maxlen=50)
+        self._rehydrate_models()

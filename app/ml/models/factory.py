@@ -8,6 +8,8 @@ conjuntos (voting/stacking) se construyen en ``app.ml.ensemble`` porque
 requieren sub-modelos.
 """
 
+from typing import Any
+
 from app.config.settings import MLModelSettings
 from app.core.exceptions import MLError
 from app.ml.interfaces.model import Model, ModelType
@@ -78,3 +80,42 @@ def build_model(model_type: ModelType | str, settings: MLModelSettings, *, seed:
         f"El tipo '{kind.value}' es un conjunto; constrúyelo con app.ml.ensemble.",
         context={"model_type": kind.value},
     )
+
+
+_DESERIALIZERS: dict[ModelType, Any] = {
+    ModelType.LOGISTIC_REGRESSION: LogisticRegressionModel,
+    ModelType.DECISION_TREE: DecisionTreeModel,
+    ModelType.RANDOM_FOREST: RandomForestModel,
+    ModelType.EXTRA_TREES: ExtraTreesModel,
+}
+"""Tipos nativos que saben reconstruirse desde `to_dict()`."""
+
+
+def model_from_dict(data: dict[str, Any]) -> Model:
+    """Rebuild a **trained** model from its serialised form.
+
+    Lo consume el Model Registry para rehidratar los modelos tras un reinicio:
+    antes sólo persistía la ficha y el objeto entrenado se perdía, así que el ML
+    dejaba de asesorar en silencio hasta el siguiente reentrenamiento.
+
+    Args:
+        data: Salida de ``Model.to_dict()``.
+
+    Returns:
+        El modelo entrenado, listo para predecir.
+
+    Raises:
+        MLError: Si el tipo es desconocido o no serializable (backends pesados).
+    """
+    raw = str(data.get("type", ""))
+    try:
+        model_type = ModelType(raw)
+    except ValueError as exc:
+        raise MLError(f"Tipo de modelo desconocido al deserializar: {raw!r}") from exc
+    cls = _DESERIALIZERS.get(model_type)
+    if cls is None:
+        raise MLError(
+            f"El modelo {model_type.value} no admite deserialización "
+            "(sólo los tipos nativos en Python puro la implementan)"
+        )
+    return cls.from_dict(data)  # type: ignore[no-any-return]

@@ -101,6 +101,35 @@ class _ForestModel(Model):
             "seed": self._seed,
         }
 
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe serialisation of the trained ensemble (all its trees)."""
+        return {
+            "type": self.model_type.value,
+            "params": self.params(),
+            "trees": [tree.to_dict() for tree in self._trees],
+            "n_features": self._n_features,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "_ForestModel":
+        """Rebuild a trained ensemble from :meth:`to_dict` output.
+
+        Se instancia la subclase concreta (``RandomForestModel`` /
+        ``ExtraTreesModel``), que ya fija ``bootstrap`` y ``splitter``.
+        """
+        params = data.get("params", {})
+        model = cls(  # type: ignore[call-arg]
+            n_estimators=int(params.get("n_estimators", 60)),
+            max_depth=int(params.get("max_depth", 6)),
+            min_samples_split=int(params.get("min_samples_split", 6)),
+            max_features=float(params.get("max_features", 0.7)),
+            seed=int(params.get("seed", 7)),
+        )
+        model._trees = [DecisionTreeModel.from_dict(t) for t in data.get("trees", [])]
+        model._n_features = int(data.get("n_features", 0))
+        model._fitted = True
+        return model
+
     def _ensure_fitted(self) -> None:
         """Raise if a prediction is requested before training."""
         if not self._fitted:

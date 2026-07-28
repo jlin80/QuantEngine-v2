@@ -42,6 +42,35 @@ class _TreeNode:
         """Whether the node is a leaf."""
         return self.left is None or self.right is None
 
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe serialisation of the subtree rooted here."""
+        if self.is_leaf:
+            return {"v": self.value}
+        left = self.left
+        right = self.right
+        if left is None or right is None:  # pragma: no cover - is_leaf ya lo cubre
+            return {"v": self.value}
+        return {
+            "v": self.value,
+            "f": self.feature,
+            "t": self.threshold,
+            "l": left.to_dict(),
+            "r": right.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "_TreeNode":
+        """Rebuild a subtree from :meth:`to_dict` output."""
+        if "l" not in data or "r" not in data:
+            return cls(value=float(data["v"]))
+        return cls(
+            value=float(data["v"]),
+            feature=int(data["f"]),
+            threshold=float(data["t"]),
+            left=cls.from_dict(data["l"]),
+            right=cls.from_dict(data["r"]),
+        )
+
 
 class DecisionTreeModel(Model):
     """CART decision tree for binary classification.
@@ -202,6 +231,38 @@ class DecisionTreeModel(Model):
             "splitter": self._splitter,
             "seed": self._seed,
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe serialisation of the trained tree.
+
+        No incluye el dataset (``_x``/``_y``): son andamiaje del entrenamiento y
+        el árbol ya no los necesita para predecir.
+        """
+        return {
+            "type": self.model_type.value,
+            "params": self.params(),
+            "root": self._root.to_dict() if self._root is not None else None,
+            "importances": list(self._importances),
+            "n_features": self._n_features,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DecisionTreeModel":
+        """Rebuild a trained tree from :meth:`to_dict` output."""
+        params = data.get("params", {})
+        model = cls(
+            max_depth=int(params.get("max_depth", 6)),
+            min_samples_split=int(params.get("min_samples_split", 6)),
+            max_features=float(params.get("max_features", 1.0)),
+            splitter=str(params.get("splitter", "best")),
+            seed=int(params.get("seed", 7)),
+        )
+        root = data.get("root")
+        model._root = None if root is None else _TreeNode.from_dict(root)
+        model._importances = [float(v) for v in data.get("importances", [])]
+        model._n_features = int(data.get("n_features", len(model._importances)))
+        model._fitted = True
+        return model
 
     def _ensure_fitted(self) -> None:
         """Raise if a prediction is requested before training."""

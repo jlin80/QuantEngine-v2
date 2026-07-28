@@ -175,7 +175,12 @@ class MLEngine:
         modelo que no supera los mínimos se rechaza con motivos explícitos.
         """
         v = self._ml.validation
-        auc = max(result.holdout.auc, result.cross_validation.mean_auc)
+        # El AUC de referencia es el del HOLDOUT. Antes se usaba
+        # `max(holdout, cv)`, que descartaba la validación cruzada justo cuando
+        # contradecía al holdout: un modelo con holdout 0.663 y cv 0.463 (peor
+        # que el azar) se aprobaba con "supera los mínimos (AUC 0.663)".
+        auc = result.holdout.auc
+        cv_auc = result.cross_validation.mean_auc
         reasons: list[str] = []
         approved = True
         if result.dataset_summary.get("samples", 0) < v.min_samples:
@@ -184,6 +189,14 @@ class MLEngine:
         if auc < v.min_auc:
             approved = False
             reasons.append(f"AUC {auc:.3f} < mínimo {v.min_auc}")
+        # Puerta anti-sobreajuste: la CV se evalúa por separado, nunca se
+        # compensa con un holdout optimista.
+        if cv_auc < v.min_cv_auc:
+            approved = False
+            reasons.append(
+                f"AUC de validación cruzada {cv_auc:.3f} < mínimo {v.min_cv_auc} "
+                "(sobreajuste: el holdout no basta)"
+            )
         if result.holdout.accuracy < v.min_accuracy:
             approved = False
             reasons.append(f"accuracy {result.holdout.accuracy:.3f} < mínimo {v.min_accuracy}")
@@ -195,7 +208,7 @@ class MLEngine:
                     approved = False
                     reasons.append(f"no bate al modelo activo (AUC {auc:.3f} vs {previous:.3f})")
         if approved and not reasons:
-            reasons.append(f"supera los mínimos (AUC {auc:.3f})")
+            reasons.append(f"supera los mínimos (AUC {auc:.3f}, CV {cv_auc:.3f})")
         return approved, reasons
 
     def register_model(

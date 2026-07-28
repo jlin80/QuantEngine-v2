@@ -11,7 +11,7 @@ from app.ml.models.external import (
     NeuralNetModel,
     XGBoostModel,
 )
-from app.ml.models.factory import build_model
+from app.ml.models.factory import build_model, model_from_dict
 from app.ml.models.forest import ExtraTreesModel, RandomForestModel
 from app.ml.models.logistic_regression import LogisticRegressionModel
 from app.ml.models.preprocessing import StandardScaler
@@ -28,4 +28,5 @@ __all__ = [
     "StandardScaler",
     "XGBoostModel",
     "build_model",
+    "model_from_dict",
 ]
