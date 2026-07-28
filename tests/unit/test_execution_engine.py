@@ -473,3 +473,61 @@ async def test_atr_still_wins_when_wider_than_both_floors():
     stop = engine._stop_distance(_view(spread_bps=3.03, atr=20.0), price)
 
     assert stop == pytest.approx(20.0 * 1.5)  # atr_stop_multiplier por defecto
+
+
+async def test_external_close_at_stop_is_labelled_stop_loss():
+    """El broker ejecuta el SL que dejo el bot: no es una salida 'manual'.
+
+    Registrarlas todas como MANUAL hacia que las estadisticas dijeran
+    "0 stop losses" mientras el broker ejecutaba decenas (50 en un dia).
+    """
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await engine.process_decision(_decision())
+    assert position is not None
+    assert position.stop_loss is not None
+
+    reason, detail = engine._infer_external_exit(position, position.stop_loss)
+
+    assert reason is ExitReason.STOP_LOSS
+    assert "stop" in detail
+
+
+async def test_external_close_at_target_is_labelled_take_profit():
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await engine.process_decision(_decision())
+    assert position is not None
+    assert position.take_profit is not None
+
+    reason, _ = engine._infer_external_exit(position, position.take_profit)
+
+    assert reason is ExitReason.TAKE_PROFIT
+
+
+async def test_external_close_far_from_levels_stays_manual():
+    """Lejos del stop y del objetivo si es un cierre a mano del operador."""
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await engine.process_decision(_decision())
+    assert position is not None
+
+    midpoint = (position.entry_price + (position.take_profit or 0)) / 2
+    reason, detail = engine._infer_external_exit(position, midpoint)
+
+    assert reason is ExitReason.MANUAL
+    assert "fuera del bot" in detail
+
+
+async def test_external_close_tolerates_slippage_on_the_stop():
+    """El fill real casi nunca cae en el precio exacto: hay spread y gaps."""
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await engine.process_decision(_decision())
+    assert position is not None
+    assert position.stop_loss is not None and position.initial_stop is not None
+
+    risk = abs(position.entry_price - position.initial_stop)
+    slipped = position.stop_loss - risk * 0.1  # dentro del 20% de tolerancia
+
+    assert engine._infer_external_exit(position, slipped)[0] is ExitReason.STOP_LOSS

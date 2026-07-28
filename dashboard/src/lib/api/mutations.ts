@@ -222,3 +222,29 @@ export function useOperationalReport(): UseMutationResult<Dict, ApiError, string
     invalidate: [],
   });
 }
+
+// ------------------------------------------------------------------ engine
+
+/**
+ * Requests an orderly engine restart. The backend refuses (409) while any
+ * position is open, so surface its message rather than a generic failure.
+ */
+export function useEngineRestart(): UseMutationResult<
+  Dict,
+  ApiError,
+  { confirm: true; reason?: string }
+> {
+  return useMutation<Dict, ApiError, { confirm: true; reason?: string }>({
+    mutationFn: (body) => apiSend<Dict>("POST", "/api/system/restart", body),
+    onSuccess: () =>
+      toast.success("Engine restarting", {
+        description: "The watchdog will bring it back in a few seconds.",
+        duration: 8_000,
+      }),
+    onError: (error) =>
+      toast.error(
+        error.status === 409 ? "Close open positions first" : "Restart failed",
+        { description: error.detail || error.message, duration: 10_000 },
+      ),
+  });
+}

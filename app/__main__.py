@@ -19,6 +19,11 @@ async def _run() -> None:
 
     container = build_container(settings)
     engine = QuantEngine(settings, container)
+    # El motor se registra en su propio contenedor para que la API pueda pedir
+    # un reinicio ordenado (POST /api/system/restart) sin necesitar permisos
+    # sobre el planificador de tareas de Windows: basta con detenerse, y el
+    # watchdog `run_v2.ps1` lo relanza en <=10 s.
+    container.register_instance(QuantEngine, engine)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

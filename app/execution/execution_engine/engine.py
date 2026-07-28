@@ -561,15 +561,54 @@ class ExecutionEngine(Service):
                 continue
             await self._settle_external_close(position)
 
+    def _infer_external_exit(
+        self, position: Position, exit_price: float
+    ) -> tuple[ExitReason, str]:
+        """Deduce por qué el broker cerró una posición fuera del bot.
+
+        Compara el precio de salida con el stop y el objetivo que el bot dejó
+        puestos en el broker, con una tolerancia proporcional al riesgo de la
+        operación (el fill real rara vez cae en el precio exacto: hay spread,
+        slippage y gaps). Si no se parece a ninguno, se mantiene ``MANUAL``:
+        probablemente lo cerró el operador a mano.
+
+        Args:
+            position: Posición que ya no existe en el broker.
+            exit_price: Último precio conocido, usado como precio de salida.
+
+        Returns:
+            El motivo deducido y su explicación para el journal.
+        """
+        # Tolerancia: 20% del riesgo inicial, con un mínimo por si no hay stop.
+        risk = abs(position.entry_price - position.initial_stop) if position.initial_stop else 0.0
+        tolerance = max(risk * 0.20, exit_price * 0.0005)
+
+        stop = position.stop_loss
+        target = position.take_profit
+        if stop is not None and abs(exit_price - stop) <= tolerance:
+            kind = "break-even" if position.break_even_active else "stop"
+            return ExitReason.STOP_LOSS, f"{kind} ejecutado por el broker ({exit_price:.5f})"
+        if target is not None and abs(exit_price - target) <= tolerance:
+            return ExitReason.TAKE_PROFIT, f"objetivo ejecutado por el broker ({exit_price:.5f})"
+        return ExitReason.MANUAL, "cerrada fuera del bot (terminal/broker)"
+
     async def _settle_external_close(self, position: Position) -> None:
         """Settle internally a position that no longer exists in the broker.
 
         No hay fill real que traducir (el cierre ya ocurrió fuera del bot), así
         que se liquida al último precio de mercado conocido con comisión 0 —
         es una aproximación honesta, no un cierre simulado con costes.
+
+        El motivo se **deduce del precio de salida**: en la inmensa mayoría de
+        los casos el cierre externo es el SL o el TP que el propio bot dejó
+        puestos en el broker. Registrarlos todos como ``MANUAL`` hacía que las
+        estadísticas dijeran "0 stop losses" mientras el broker ejecutaba
+        decenas: el motivo real quedaba invisible en el journal y en el
+        Performance Engine.
         """
         ticker = self._market.get_ticker(position.symbol)
         exit_price = ticker.mid if ticker is not None else position.mark_price
+        reason, detail = self._infer_external_exit(position, exit_price)
         close_side = OrderSide.SELL if position.is_long else OrderSide.BUY
         fill = Fill(
             request_id=f"external-close-{position.position_id}",
@@ -585,8 +624,8 @@ class ExecutionEngine(Service):
             position,
             exit_price=fill.price,
             close_commission=0.0,
-            reason=ExitReason.MANUAL,
-            exit_reasons=("cerrada fuera del bot (terminal/broker)",),
+            reason=reason,
+            exit_reasons=(detail,),
         )
         self._portfolio.on_trade_closed(gross_pnl=gross_pnl, close_commission=0.0)
         self._risk.on_trade_closed(position.realized_pnl)
@@ -601,7 +640,7 @@ class ExecutionEngine(Service):
                 exit_price=fill.price,
                 pnl=round(position.realized_pnl, 6),
                 r_multiple=round(position.r_multiple(fill.price), 4),
-                exit_reason=ExitReason.MANUAL.value,
+                exit_reason=reason.value,
                 holding_seconds=position.holding_seconds(),
             )
         )

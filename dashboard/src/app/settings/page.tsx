@@ -1,6 +1,7 @@
 import { PageHeader } from "@/components/common/page-header";
 import { ConfigForm } from "@/components/settings/config-form";
 import { DiscordCard, NotionCard } from "@/components/settings/integrations";
+import { RestartEngineCard } from "@/components/settings/restart-engine";
 
 export default function SettingsPage() {
   return (
@@ -14,6 +15,7 @@ export default function SettingsPage() {
         <DiscordCard />
         <NotionCard />
       </div>
+      <RestartEngineCard />
     </div>
   );
 }
