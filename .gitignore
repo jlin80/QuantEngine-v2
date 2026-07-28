@@ -25,9 +25,12 @@ coverage.xml
 htmlcov/
 
 # --- Logs y datos en runtime ---
-logs/
+# Anclados a la raíz: sin la barra inicial, `logs/` y `data/` matchean CUALQUIER
+# carpeta con ese nombre a cualquier profundidad y se tragan código fuente
+# legítimo (p. ej. dashboard/src/app/logs/, la pantalla de Logs del dashboard).
+/logs/
 *.log
-data/
+/data/
 *.sqlite
 *.db
 
