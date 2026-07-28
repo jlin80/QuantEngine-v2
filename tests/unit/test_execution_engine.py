@@ -3,6 +3,7 @@
 import asyncio
 from datetime import timedelta
 
+import pytest
 from app.core.events.base import Event
 from app.core.events.bus import EventBus
 from app.engine.events import DecisionGenerated
@@ -56,6 +57,23 @@ async def test_rejected_decision_does_nothing():
     engine = make_engine(market)
     assert await engine.process_decision(_decision(accepted=False)) is None
     assert not engine.positions.open_positions
+
+
+async def test_symbol_toggle_blocks_entry():
+    """Un símbolo con el toggle en false no abre posiciones."""
+    market, _ = _market()
+    engine = make_engine(market, make_execution_settings(symbols_enabled={"BTCUSDT": False}))
+
+    assert await engine.process_decision(_decision()) is None
+    assert not engine.positions.open_positions
+
+
+async def test_symbol_toggle_defaults_to_enabled():
+    """Lo no listado en el toggle se sigue operando con normalidad."""
+    market, _ = _market()
+    engine = make_engine(market, make_execution_settings(symbols_enabled={"XAUUSDM": False}))
+
+    assert await engine.process_decision(_decision()) is not None
 
 
 async def test_spread_filter_blocks_entry():
@@ -154,7 +172,77 @@ async def test_regime_change_exit_respects_min_holding_seconds():
     assert await engine._exit_reason(position) is None  # recién abierta
 
     position.opened_at = position.opened_at - timedelta(seconds=200)
+    # Ya pasó el mínimo, pero se exigen 2 confirmaciones consecutivas.
+    assert await engine._exit_reason(position) is None
     assert await engine._exit_reason(position) is ExitReason.REGIME_CHANGE
+
+
+def _regime_view(regime: str):
+    async def fake_view(symbol: str) -> _MarketView:
+        return _MarketView(
+            atr=None,
+            atr_pct=None,
+            spread_bps=None,
+            regime=regime,
+            volatility="normal",
+            volume=None,
+            last_price=None,
+            session="america",
+        )
+
+    return fake_view
+
+
+async def _aged_position(engine, entry_regime: str):
+    position = await engine.process_decision(_decision())
+    assert position is not None
+    position.regime = entry_regime
+    position.opened_at = position.opened_at - timedelta(seconds=600)
+    engine._context = object()  # type: ignore[assignment]
+    return position
+
+
+async def test_regime_exit_ignores_changes_inside_the_same_family():
+    """`breakout`→`trending` es la misma tesis direccional: no debe cerrar.
+
+    Era la causa del churn: el 80% de las salidas eran por régimen sin llegar
+    nunca al stop ni al objetivo, porque cualquier cambio de etiqueta valía.
+    """
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await _aged_position(engine, "breakout")
+    engine._market_view = _regime_view("trending")  # type: ignore[method-assign]
+
+    for _ in range(5):
+        assert await engine._exit_reason(position) is None
+
+
+async def test_regime_exit_fires_when_family_changes_and_is_confirmed():
+    """`trending`→`reversal` sí cambia de familia: cierra tras confirmarse."""
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await _aged_position(engine, "trending")
+    engine._market_view = _regime_view("reversal")  # type: ignore[method-assign]
+
+    assert await engine._exit_reason(position) is None  # 1/2
+    assert await engine._exit_reason(position) is ExitReason.REGIME_CHANGE  # 2/2
+
+
+async def test_regime_adverse_streak_resets_when_regime_returns():
+    """Una lectura adversa aislada no debe acumularse con otra posterior."""
+    market, _ = _market()
+    engine = make_engine(market)
+    position = await _aged_position(engine, "trending")
+
+    engine._market_view = _regime_view("reversal")  # type: ignore[method-assign]
+    assert await engine._exit_reason(position) is None  # racha = 1
+
+    engine._market_view = _regime_view("breakout")  # type: ignore[method-assign]
+    assert await engine._exit_reason(position) is None  # misma familia: reinicia
+    assert position.metadata["regime_adverse_streak"] == 0
+
+    engine._market_view = _regime_view("reversal")  # type: ignore[method-assign]
+    assert await engine._exit_reason(position) is None  # vuelve a empezar en 1
 
 
 async def test_reconciliation_settles_position_closed_outside_the_bot():
@@ -246,3 +334,142 @@ async def test_paper_broker_leaves_portfolio_balance_untouched():
     before = engine.portfolio.balance
     await engine.manage_once()
     assert engine.portfolio.balance == before
+
+
+class _BrokerWithLivePositions:
+    """Paper broker + las capacidades opcionales de un broker real (MT5)."""
+
+    def __init__(self, inner, live):
+        self._inner = inner
+        self._live = live
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def open_broker_positions(self):
+        return list(self._live)
+
+
+async def test_adopts_broker_positions_on_start():
+    """Tras un reinicio, lo que ya esta vivo en el broker debe adoptarse."""
+    from app.execution.models import BrokerPosition, PositionSide
+
+    market, _ = _market()
+    engine = make_engine(market)
+    engine._paper = _BrokerWithLivePositions(
+        engine._paper,
+        [
+            BrokerPosition(
+                ticket=584945506, symbol="USTECM", is_long=True, volume=0.01,
+                price_open=28073.69, stop_loss=28031.58, take_profit=28136.86,
+            )
+        ],
+    )
+
+    await engine._adopt_broker_positions()
+
+    open_positions = engine.positions.open_positions
+    assert len(open_positions) == 1
+    adopted = open_positions[0]
+    assert adopted.symbol == "USTECM"
+    assert adopted.side is PositionSide.LONG
+    assert adopted.quantity == 0.01
+    assert adopted.stop_loss == 28031.58
+    assert adopted.initial_stop == 28031.58  # base para medir R
+    assert adopted.metadata["broker_ref"] == "584945506"
+    assert adopted.metadata["adopted"] is True
+
+
+async def test_adoption_is_idempotent():
+    """Adoptar dos veces no duplica: el ticket ya rastreado se ignora."""
+    from app.execution.models import BrokerPosition
+
+    market, _ = _market()
+    engine = make_engine(market)
+    live = [
+        BrokerPosition(
+            ticket=999, symbol="ETHUSDM", is_long=False, volume=0.27,
+            price_open=1946.24, stop_loss=1949.21, take_profit=1941.91,
+        )
+    ]
+    engine._paper = _BrokerWithLivePositions(engine._paper, live)
+
+    await engine._adopt_broker_positions()
+    await engine._adopt_broker_positions()
+
+    assert len(engine.positions.open_positions) == 1
+
+
+async def test_paper_broker_has_nothing_to_adopt():
+    """Con el paper broker (sin la capacidad) la adopcion no hace nada."""
+    market, _ = _market()
+    engine = make_engine(market)
+
+    await engine._adopt_broker_positions()
+
+    assert not engine.positions.open_positions
+
+
+def _view(spread_bps: float | None, atr: float | None = 0.5) -> _MarketView:
+    """ATR pequeño por defecto: así mandan los PISOS, que es lo que se prueba."""
+    return _MarketView(
+        atr=atr,
+        atr_pct=None,
+        spread_bps=spread_bps,
+        regime="ranging",
+        volatility="normal",
+        volume=None,
+        last_price=None,
+        session="america",
+    )
+
+
+async def test_stop_floor_widens_for_wide_spread_symbols():
+    """ETH (spread ~3 bps) necesita un stop mas ancho que el 0.15% global.
+
+    Con 0.15% el stop quedaba a solo 5x el spread y lo barria el ruido: las
+    operaciones que morian antes de 180s perdian -$14.23 mientras las que
+    sobrevivian ganaban +$2.75.
+    """
+    market, _ = _market()
+    engine = make_engine(market)
+
+    price = 1880.0
+    pct_floor = price * 0.15 / 100  # 2.82
+    stop = engine._stop_distance(_view(spread_bps=3.03), price)
+
+    # 3.03 bps x 8 = 24.24 bps = 0.242% -> 4.556, mas ancho que el 0.15%.
+    assert stop > pct_floor
+    assert stop == pytest.approx(price * (3.03 / 10_000) * 8.0, rel=1e-6)
+
+
+async def test_stop_floor_unchanged_for_tight_spread_symbols():
+    """Oro (0.56 bps) y USTEC (1.05 bps) ya tenian margen: no deben cambiar."""
+    market, _ = _market()
+    engine = make_engine(market)
+
+    for price, spread in ((4080.0, 0.56), (28060.0, 1.05)):
+        pct_floor = price * 0.15 / 100
+        assert engine._stop_distance(_view(spread_bps=spread), price) == pytest.approx(pct_floor)
+
+
+async def test_stop_floor_ignores_missing_spread():
+    """Sin spread conocido se cae al piso porcentual, sin romperse."""
+    market, _ = _market()
+    engine = make_engine(market)
+
+    price = 1880.0
+    assert engine._stop_distance(_view(spread_bps=None), price) == pytest.approx(
+        price * 0.15 / 100
+    )
+
+
+async def test_atr_still_wins_when_wider_than_both_floors():
+    """El ATR sigue mandando si es mas ancho que los dos pisos."""
+    market, _ = _market()
+    engine = make_engine(market)
+
+    price = 1880.0
+    stop = engine._stop_distance(_view(spread_bps=3.03, atr=20.0), price)
+
+    assert stop == pytest.approx(20.0 * 1.5)  # atr_stop_multiplier por defecto

@@ -66,6 +66,7 @@ def build_execution_stack(
         break_even_r=settings.break_even_r,
         trailing_enabled=settings.trailing_enabled,
         trailing_atr_multiple=settings.trailing_atr_multiple,
+        trailing_activate_r=settings.trailing_activate_r,
     )
     portfolio = PortfolioManager(
         settings.initial_balance,

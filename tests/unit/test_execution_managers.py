@@ -107,3 +107,58 @@ def test_order_manager_lifecycle_and_oco():
     c = om.create(OrderRequest(symbol="ETHUSD", side=OrderSide.BUY, quantity=1.0))
     om.reject(c, RejectReason.RISK_BLOCKED)
     assert om.status()["rejected"] == 1
+
+
+def test_trailing_does_not_tighten_the_initial_stop_on_open():
+    """El bug del churn: con ATR bajo frente al piso de stop, el trailing
+    apretaba el stop nada mas abrir y liquidaba la posicion por ruido.
+
+    Reproduce el caso real del oro: stop inicial a 6.12 (piso del 0.15%) y
+    ATR x2 = 1.40, mucho mas cerca. Sin el gate, `entry - 1.40` "mejoraba"
+    el stop y lo movia de 6.12 a 1.40 de distancia sin que el precio se
+    hubiera movido.
+    """
+    pm = PositionManager(break_even_r=1.0, trailing_enabled=True, trailing_atr_multiple=2.0)
+    pos = pm.open(_fill(price=4080.0, qty=0.01), stop_loss=4073.88, take_profit=4089.18, atr=0.7)
+
+    pm.update_mark(pos, 4080.0)  # precio sin moverse
+    updates = pm.manage(pos, atr=0.7)
+
+    assert updates == []
+    assert pos.stop_loss == 4073.88  # intacto
+    assert not pos.trailing_active
+
+
+def test_trailing_starts_only_after_activate_r():
+    """El trailing arranca al alcanzar +1R, no antes."""
+    pm = PositionManager(
+        break_even_r=0.0, trailing_enabled=True,
+        trailing_atr_multiple=2.0, trailing_activate_r=1.0,
+    )
+    pos = pm.open(_fill(price=100.0, qty=1.0), stop_loss=98.0, take_profit=110.0, atr=0.5)
+
+    pm.update_mark(pos, 101.0)  # +0.5R: todavia no
+    assert pm.manage(pos, atr=0.5) == []
+    assert pos.stop_loss == 98.0
+
+    pm.update_mark(pos, 102.0)  # +1R: ya si
+    pm.manage(pos, atr=0.5)
+    assert pos.trailing_active
+    assert pos.stop_loss > 98.0
+
+
+def test_trailing_never_locks_a_loss_once_active():
+    """Una vez activo, el trailing solo puede mejorar el stop."""
+    pm = PositionManager(
+        break_even_r=0.0, trailing_enabled=True,
+        trailing_atr_multiple=2.0, trailing_activate_r=1.0,
+    )
+    pos = pm.open(_fill(price=100.0, qty=1.0), stop_loss=98.0, take_profit=110.0, atr=0.5)
+    pm.update_mark(pos, 104.0)
+    pm.manage(pos, atr=0.5)
+    best = pos.stop_loss
+
+    pm.update_mark(pos, 103.0)  # retrocede: el stop no debe empeorar
+    pm.manage(pos, atr=0.5)
+
+    assert pos.stop_loss == best

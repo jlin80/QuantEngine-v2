@@ -514,6 +514,7 @@ def _build_execution(container: Container, settings: Settings, bus: EventBus) ->
         break_even_r=execution.break_even_r,
         trailing_enabled=execution.trailing_enabled,
         trailing_atr_multiple=execution.trailing_atr_multiple,
+        trailing_activate_r=execution.trailing_activate_r,
     )
     portfolio = PortfolioManager(
         initial_balance,

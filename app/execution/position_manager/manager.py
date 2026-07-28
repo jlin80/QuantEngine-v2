@@ -7,6 +7,7 @@ No ejecuta órdenes: decide *qué* debe pasar; el Execution Engine ejecuta.
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 
 from app.execution.models import (
     ExitReason,
@@ -43,10 +44,12 @@ class PositionManager:
         break_even_r: float = 1.0,
         trailing_enabled: bool = True,
         trailing_atr_multiple: float = 2.0,
+        trailing_activate_r: float = 1.0,
     ) -> None:
         self._break_even_r = break_even_r
         self._trailing_enabled = trailing_enabled
         self._trailing_atr_multiple = trailing_atr_multiple
+        self._trailing_activate_r = trailing_activate_r
         self._open: dict[str, Position] = {}
         self._closed: list[Position] = []
 
@@ -171,6 +174,55 @@ class PositionManager:
         self._open[position.position_id] = position
         return position
 
+    def adopt(
+        self,
+        *,
+        symbol: str,
+        side: PositionSide,
+        quantity: float,
+        entry_price: float,
+        stop_loss: float | None,
+        take_profit: float | None,
+        broker_ref: str,
+        opened_at: datetime | None = None,
+    ) -> Position:
+        """Registra una posición ya abierta en el broker, sin fill propio.
+
+        La usa la adopción de arranque: tras un reinicio el motor debe hacerse
+        cargo de lo que ya está vivo en la cuenta en vez de ignorarlo. El stop
+        adoptado se toma como ``initial_stop`` (base para medir R), que es lo
+        único que se puede afirmar sin conocer la decisión original.
+
+        Args:
+            symbol: Símbolo.
+            side: LONG o SHORT.
+            quantity: Cantidad viva.
+            entry_price: Precio de apertura según el broker.
+            stop_loss: Stop puesto en el broker.
+            take_profit: Objetivo puesto en el broker.
+            broker_ref: Ticket del broker (clave de la reconciliación).
+            opened_at: Apertura real; por defecto, ahora.
+
+        Returns:
+            La posición adoptada y registrada.
+        """
+        position = Position(
+            symbol=symbol.upper(),
+            side=side,
+            quantity=quantity,
+            initial_quantity=quantity,
+            entry_price=entry_price,
+            initial_stop=stop_loss,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            opened_at=opened_at or utc_now(),
+            mark_price=entry_price,
+            entry_reasons=("adoptada al arrancar (ya abierta en el broker)",),
+            metadata={"broker_ref": broker_ref, "adopted": True},
+        )
+        self._open[position.position_id] = position
+        return position
+
     # ------------------------------------------------------------------
     # Gestión dinámica
     # ------------------------------------------------------------------
@@ -212,8 +264,20 @@ class PositionManager:
         return StopUpdate(kind="break_even", previous=previous, current=position.entry_price)
 
     def _apply_trailing(self, position: Position, atr: float | None) -> StopUpdate | None:
-        """Trail the stop by ``trailing_atr_multiple × ATR`` in the favour direction."""
+        """Trail the stop by ``trailing_atr_multiple × ATR`` in the favour direction.
+
+        El trailing **sólo protege beneficio**: no arranca hasta que la posición
+        alcanza ``trailing_activate_r``. Sin ese gate, ``highest_price`` arranca
+        en la entrada y, cuando el ATR es bajo frente al piso de stop
+        (``min_stop_pct``), ``entry - ATR×múltiplo`` queda **más cerca** que el
+        stop inicial: el trailing apretaba el stop nada más abrir y liquidaba la
+        posición por ruido, nunca por movimiento adverso real.
+        """
         if not self._trailing_enabled or atr is None or atr <= 0:
+            return None
+        if position.risk_per_unit <= 0:
+            return None
+        if position.r_multiple() < self._trailing_activate_r:
             return None
         distance = atr * self._trailing_atr_multiple
         if position.is_long:
