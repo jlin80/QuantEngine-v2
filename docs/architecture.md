@@ -2129,3 +2129,63 @@ objetivo que esta fuera de alcance, y mas tiempo para tocar el stop.
 efecto (bajando los pisos, con la contrapartida de que el ruido del spread
 barreria el stop) o se elimina para que la configuracion no prometa una
 adaptatividad que no existe. No se resuelve aqui porque no cambia el resultado.
+
+## Hallazgo: la expectativa por estrategia no se replica entre simbolos (2026-08-04)
+
+**Pregunta.** El edge se habia medido siempre sobre el portfolio agregado ("el
+motor da -0.078R"), lo que no distingue *todas pierden un poco* de *unas pocas
+pierden mucho y tapan a las que ganan*. La primera situacion obliga a rehacer el
+enfoque; la segunda, solo a podar el catalogo.
+
+**Metodo.** `scripts/strategy_edge.py` corre **cada estrategia sola** (las otras
+19 desactivadas) a traves del QuantCore real —mismos filtros, sizing y Execution
+Engine que en vivo— sobre 10.000 velas 1m reales de Binance (~7 dias), para BTC
+y ETH por separado. Con una sola estrategia el consenso es unanime por
+construccion, asi que lo que se mide es la senal de esa estrategia.
+
+**Resultado.** De 14 estrategias con >=10 operaciones en ambos simbolos:
+
+| | BTC | ETH |
+| --- | --- | --- |
+| Con expectativa positiva | 2 | 3 |
+| **Positivas en AMBOS** | **0** | |
+| Cambian de signo entre simbolos | 5 | |
+| Negativas en ambos | 9 | |
+
+**Correlacion de la expectativa entre BTC y ETH: r = +0.084.** Es decir,
+practicamente cero: saber como le fue a una estrategia en BTC no dice **nada**
+sobre como le ira en ETH.
+
+Los casos extremos lo ilustran mejor que el promedio: `mss` da **+0.106R en ETH
+y -0.812R en BTC**; `vwap_breakout` es la mejor de BTC (+0.211R) y negativa en
+ETH (-0.053R). No es que unas estrategias funcionen y otras no: **el ranking en
+si es ruido**.
+
+**Consecuencias, y son las que importan:**
+
+1. **Podar el catalogo no funcionaria.** Seleccionar las "ganadoras" medidas en
+   un simbolo daria las perdedoras del otro. No hay nada estable que conservar.
+2. **La ponderacion dinamica del Meta Strategy Manager esta ajustando ruido.**
+   Reponderar por rendimiento reciente asume que ese rendimiento persiste; con
+   r=0.084 entre dos activos altamente correlacionados en el mismo timeframe,
+   esa premisa no se sostiene. El MSM no esta mejorando el consenso: le esta
+   metiendo varianza.
+3. **Entrenar el ML sobre esto seria ajustar ruido con mas parametros.** Es la
+   respuesta a "si el bot aprende de las estrategias perdedoras, mejorara": no,
+   porque no hay una senal estable que aprender.
+4. **Tercera confirmacion independiente del Bloque 9:** `cvd`,
+   `delta_confirmation` y `orderbook_imbalance` produjeron **0 operaciones** en
+   ambos simbolos, igual que en produccion. Sin libro ni operaciones no disparan.
+
+**Matiz que no invalida lo anterior pero conviene registrar:** varias filas
+tienen expectativa en R positiva y **retorno en dinero negativo** (p. ej.
+`vwap_breakout` +0.211R con -0.01 %). La R positiva no se convierte en dinero,
+lo que apunta a que el sizing y los costes se comen el margen — coherente con
+que el problema tampoco sea la calibracion de niveles.
+
+**Limites de esta medicion.** 7 dias, 2 simbolos, un unico periodo de mercado, y
+sobre spot de Binance (no el CFD que opera). Las muestras por estrategia son de
+10-72 operaciones. Nada de esto prueba que las estrategias sean irreparables;
+prueba que **con los datos disponibles no hay evidencia de edge en ninguna, ni
+de un ranking estable entre ellas**. La forma correcta de refutarlo es un
+walk-forward con mas historia y mas simbolos, que el laboratorio ya soporta.

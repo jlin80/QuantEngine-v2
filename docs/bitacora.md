@@ -1334,3 +1334,53 @@ no solo en el de desarrollo. `mypy --python-version 3.12` y `ruff
 
 Sigue pendiente decidir si el desarrollo se hace por defecto sobre 3.12 (lo
 recomendable) o si se sube produccion.
+
+## 2026-08-04 — El edge por estrategia no se replica entre simbolos
+
+**Categoria:** hallazgo · **Tags:** `edge` `estrategias` `backtesting` `ruido` `msm`
+
+**Pregunta que faltaba responder.** Todo el analisis previo medio el portfolio
+agregado. Eso no distingue *todas pierden un poco* de *unas tapan a las que
+ganan* — situaciones que llevan a decisiones opuestas.
+
+**Metodo.** `scripts/strategy_edge.py`: cada estrategia SOLA (las otras 19
+desactivadas) por el QuantCore real, sobre 10.000 velas 1m reales de Binance
+(~7 dias), BTC y ETH por separado. 80 backtests.
+
+**Resultado.** De 14 estrategias con >=10 operaciones en ambos simbolos:
+**cero positivas en ambos**. Cinco cambian de signo. **Correlacion de la
+expectativa entre BTC y ETH: r = +0.084.**
+
+Los extremos lo dicen mejor que el promedio: `mss` da **+0.106R en ETH y
+-0.812R en BTC**. `vwap_breakout` es la mejor de BTC (+0.211R) y negativa en ETH.
+
+**La respuesta a la pregunta es la peor de las tres posibles:** no es que todas
+pierdan un poco, ni que unas tapen a otras. Es que **el ranking entre ellas es
+ruido**. No hay nada estable que podar ni que conservar.
+
+**Lo que esto invalida, y hay que decirlo:**
+
+- **Podar el catalogo no funcionaria**: elegir las ganadoras de un simbolo da
+  las perdedoras del otro.
+- **La ponderacion dinamica del MSM esta ajustando ruido.** Reponderar por
+  rendimiento reciente presupone que persiste; con r=0.084 entre dos activos
+  correlacionados en el mismo timeframe, no persiste. El MSM no esta mejorando
+  el consenso: le mete varianza. Esto cuestiona el Bloque 3 — que hizo bien en
+  arreglar el cableado, pero el gobierno que ahora si se aplica se apoya en una
+  senal que no es estable.
+- **Entrenar el ML sobre esto seria ajustar ruido con mas parametros.**
+
+**Tercera confirmacion independiente del Bloque 9:** `cvd`,
+`delta_confirmation` y `orderbook_imbalance` dieron **0 operaciones** en ambos
+simbolos, igual que en produccion.
+
+**Matiz registrado:** varias filas tienen expectativa en R positiva y retorno en
+dinero negativo (`vwap_breakout` +0.211R con -0.01 %). La R positiva no llega a
+convertirse en dinero.
+
+**Limites, explicitos.** 7 dias, 2 simbolos, un periodo, spot de Binance y no el
+CFD que opera; muestras de 10-72 operaciones por estrategia. Esto **no** prueba
+que las estrategias sean irreparables: prueba que con los datos disponibles no
+hay evidencia de edge en ninguna ni de un ranking estable. Refutarlo requiere un
+walk-forward con mas historia y mas simbolos — que el laboratorio ya soporta y
+es el siguiente paso natural.
