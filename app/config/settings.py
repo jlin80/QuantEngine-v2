@@ -759,6 +759,47 @@ class HealthSettings(BaseModel):
     max_clock_skew_seconds: float = 5.0
 
 
+class PipelineWatchSettings(BaseModel):
+    """Vigilancia del pipeline: detecta que el motor dejó de operar en silencio.
+
+    Nace de un incidente real: un reloj simulado filtrado dejó al validador
+    descartando el **100% de los ticks** durante 4 días. El motor no estaba
+    caído —respondía a la API, los servicios estaban "running", el watchdog no
+    veía nada raro— simplemente había dejado de ver el mercado. Ninguna métrica
+    existente lo reflejaba.
+
+    Estas dos alarmas no vigilan *aquella* causa (de eso ya se encarga
+    ``health.max_clock_skew_seconds``), sino el **efecto**: da igual qué lo
+    provoque, si el motor se queda ciego o mudo hay que enterarse el primer día.
+
+    - **Ciego**: entran datos pero se descartan casi todos.
+    - **Mudo**: entran datos limpios y aun así no sale ninguna señal.
+
+    Se mide por *deltas entre muestras*, no sobre contadores acumulados: un
+    acumulado diluye el presente y, tras un incidente largo, seguiría en rojo
+    mucho después de haberse recuperado.
+    """
+
+    enabled: bool = True
+    check_interval_seconds: float = 300.0
+    # --- Alarma "ciego" ---
+    # Ticks revisados mínimos en la ventana para que el ratio signifique algo.
+    min_samples: int = 50
+    # Fracción de descarte que se considera ceguera. No se pone en 1.0: un 95%
+    # sostenido ya es un motor que no opera, y esperar al 100% exacto es esperar
+    # a que el caso sea perfecto.
+    blind_discard_ratio: float = 0.95
+    # --- Alarma "mudo" ---
+    # Ticks limpios mínimos para afirmar que el mercado está vivo. Sin esto, un
+    # mercado cerrado (sin datos y sin señales) dispararía la alarma cada noche
+    # y acabaría ignorada.
+    min_clean_samples: int = 200
+    # Ventanas consecutivas con datos limpios y cero señales antes de avisar.
+    # Con el intervalo por defecto son 30 minutos: por encima del hueco normal
+    # entre señales, por debajo de "me he pasado la sesión sin operar".
+    silent_windows: int = 6
+
+
 class WatchdogSettings(BaseModel):
     """Watchdog de módulos."""
 
@@ -1558,6 +1599,7 @@ class Settings(BaseSettings):
     backtesting: BacktestingSettings = Field(default_factory=BacktestingSettings)
     health: HealthSettings = Field(default_factory=HealthSettings)
     watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)
+    pipeline_watch: PipelineWatchSettings = Field(default_factory=PipelineWatchSettings)
     production: ProductionSettings = Field(default_factory=ProductionSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     research: ResearchSettings = Field(default_factory=ResearchSettings)

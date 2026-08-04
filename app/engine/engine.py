@@ -27,6 +27,7 @@ from app.market.storage import MarketDataWriter
 from app.ml.api import MLEngine
 from app.ml.notifications import MLNotifier
 from app.monitoring.health import HealthMonitor
+from app.monitoring.pipeline_watch import PipelineWatchdog
 from app.monitoring.watchdog import Watchdog
 from app.notifications.models import NotificationLevel
 from app.notifications.service import NotificationService
@@ -115,6 +116,11 @@ class QuantEngine:
         # configuración: no opera, no toca código y no puede habilitar live.
         if container.contains(MetaGovernanceApplier):
             self._services.append(container.resolve(MetaGovernanceApplier))
+        # Vigilancia del pipeline: avisa si el motor se queda ciego (descarta
+        # los datos) o mudo (no emite señales). Va después del Strategy Engine
+        # porque muestrea sus contadores.
+        if container.contains(PipelineWatchdog):
+            self._services.append(container.resolve(PipelineWatchdog))
         # Quant Research Lab (Fase 10): sólo el notificador es un servicio (se
         # suscribe al bus). El ResearchLab es una fachada sin ciclo de vida; sus
         # ciclos (generación/validación/shadow) los dispara el scheduler o el

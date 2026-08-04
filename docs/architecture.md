@@ -1573,3 +1573,31 @@ solo retorna cuando llega el `websocket.disconnect`: es la unica señal fiable.
 **Consecuencias.** La limpieza de la suscripcion deja de depender de que el envio
 falle — que es justo lo que no ocurria. Escribir sobre un socket muerto ya no
 puede convertirse en un bucle infinito silencioso.
+
+## ADR-093 · Vigilar el efecto (ciego / mudo), no solo las causas conocidas
+
+**Contexto.** El motor estuvo 4 dias sin operar por un reloj simulado filtrado, y
+**ninguna comprobacion de salud lo detecto**: el proceso respondia, los servicios
+estaban `running` y el watchdog de componentes no veia nada. Se añadio
+`clock_skew_seconds` para esa causa concreta, pero la leccion es mas amplia: la
+salud se medía por *señales de vida del proceso*, no por *si el motor estaba
+haciendo su trabajo*.
+
+**Decision.** Dos alarmas sobre el **efecto observable**, independientes de la
+causa: **ciego** (se descarta >=95% de los datos entrantes) y **mudo** (entran
+datos limpios y no sale ninguna señal durante N ventanas). Cualquier fallo que
+deje al motor sin operar en silencio cae en una de las dos.
+
+**Por que por deltas y no por acumulados.** Un ratio acumulado diluye el presente
+y, tras un incidente largo, seguiria marcando rojo mucho despues de haberse
+recuperado — precisamente cuando hace falta saber que ya esta bien.
+
+**Por que "mudo" exige datos limpios en vez de un calendario de sesiones.** El
+flujo de datos es evidencia directa de que el mercado esta vivo; un calendario
+hay que mantenerlo, se equivoca en festivos y en horarios especiales, y una
+alarma que salta cada noche con el mercado cerrado se acaba ignorando.
+
+**Consecuencias.** El sistema deja de depender de que alguien mire el dashboard
+para enterarse de que no esta operando. El coste es una fuente mas de alertas, y
+por eso ambas llevan latch y aviso de recuperacion: la utilidad de una alarma es
+inversamente proporcional a cuantas veces se repite sin novedad.

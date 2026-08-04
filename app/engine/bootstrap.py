@@ -66,6 +66,7 @@ from app.ml.api import MLEngine
 from app.ml.notifications import MLNotifier
 from app.ml.services import VirtualStrategyStats
 from app.monitoring.health import HealthMonitor
+from app.monitoring.pipeline_watch import PipelineWatchdog
 from app.monitoring.watchdog import Watchdog
 from app.notifications.channels.discord import DiscordWebhookChannel
 from app.notifications.channels.discord_router import build_routed_discord
@@ -322,6 +323,7 @@ def _build_market(
         duplicate_window=quality.duplicate_window,
         out_of_order_grace=quality.out_of_order_grace_seconds,
     )
+    container.register_instance(DataValidator, validator)
     timeframes = []
     for name in market.timeframes:
         try:
@@ -457,6 +459,25 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
         scheduler,
     )
     container.register_instance(StrategyEngine, strategy_engine)
+
+    # Vigilancia del pipeline: el motor puede dejar de operar sin caerse —ciego
+    # (descarta los datos) o mudo (no emite señales)— y ninguna comprobación de
+    # salud convencional lo nota. Lee contadores ya existentes; no toca el
+    # camino caliente de los datos.
+    if settings.pipeline_watch.enabled and container.contains(DataValidator):
+        data_validator = container.resolve(DataValidator)
+        container.register_instance(
+            PipelineWatchdog,
+            PipelineWatchdog(
+                settings.pipeline_watch,
+                bus,
+                stats_provider=lambda: data_validator.stats,
+                signal_count_provider=lambda: sum(
+                    s.signals_produced for s in strategy_engine.stats()
+                ),
+                notifications=container.resolve(NotificationService),
+            ),
+        )
 
     container.register_instance(
         QuantCore,

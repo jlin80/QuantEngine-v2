@@ -852,3 +852,44 @@ El motor estuvo 4 dias sin operar y **nada aviso**. El `clock_skew` cubre esta
 causa concreta, pero no la clase de fallo: convendria una alarma sobre la **tasa
 de descarte del validador** (100% sostenido = ciego) y sobre **ausencia de
 señales** en ventana de mercado abierto. Pendiente, no hecho.
+
+## 2026-08-04 — Alarmas de pipeline: motor ciego y motor mudo
+
+**Categoria:** feature · **Tags:** `monitorizacion` `alarmas` `postmortem`
+
+Cierre de la deuda que dejo el incidente del reloj congelado. El problema de
+fondo no era el reloj: era que **el motor estuvo 4 dias sin operar y nada aviso**.
+El proceso respondia a la API, todos los servicios figuraban `running` y el
+watchdog de componentes no tenia nada que decir. El motor no estaba caido: habia
+dejado de ver el mercado, que no se parece a un fallo en ninguna metrica.
+
+`health.max_clock_skew_seconds` cubre *aquella causa*. Estas dos alarmas cubren
+el **efecto**, venga de donde venga (un reloj, un proveedor que cambia el formato
+de timestamp, un simbolo mal mapeado, un despliegue a medias):
+
+- **Ciego** (`MarketDataBlind`): entran datos y se descarta >= 95% en la ventana.
+- **Mudo** (`SignalDrought`): entran datos **limpios** y no sale ni una señal
+  durante N ventanas consecutivas (30 min por defecto).
+
+**Decisiones de diseño.**
+- Se mide por **deltas entre muestras**, no sobre contadores acumulados: un
+  acumulado diluye el presente y, tras un incidente largo, seguiria en rojo
+  mucho despues de haberse recuperado.
+- La alarma de "mudo" **exige datos limpios fluyendo**, y por eso no necesita un
+  calendario de sesiones: con el mercado cerrado no hay ticks, no se cumple la
+  condicion y no avisa. Un calendario habria que mantenerlo y se equivocaria en
+  festivos; el flujo de datos es evidencia directa de que el mercado esta vivo.
+- **Latch en ambas**, con aviso de recuperacion. Una alarma que se repite cada 5
+  minutos se acaba silenciando, y una alarma silenciada es peor que ninguna.
+- La primera pasada solo fija linea base: comparar contra cero al arrancar daria
+  un falso positivo garantizado en cada reinicio.
+- Estar ciego **no** dispara tambien "mudo" (sin datos limpios esa alarma no
+  aplica): confundirlas despistaria el diagnostico.
+- Lee contadores que ya existian (`DataValidator.stats`, `StrategyStats
+  .signals_produced`); no toca el camino caliente de los datos.
+
+**Cableado.** `PipelineWatchdog` en el composition root y en la lista de
+servicios; avisa por Discord y publica en el bus. `settings.pipeline_watch`.
+
+**Tests.** 13 nuevos, incluido el escenario exacto del incidente (100% de
+descarte) y el del mercado cerrado, que no debe avisar. Suite: **879 en verde**.
