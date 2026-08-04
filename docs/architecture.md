@@ -2010,3 +2010,38 @@ anadir una familia de estrategias nueva a un motor con expectativa negativa
 el orden equivocado. Lo que si conviene ya, y es gratis: desactivar las tres
 estrategias de order flow mientras la fuente sea MT5 — una estrategia inerte que
 figura como activa es deuda de honestidad.
+
+## Deriva entre el entorno de desarrollo y produccion (medido 2026-08-04)
+
+El pendiente heredado decia *"`requirements.txt` pinea `redis>=5.0,<6.0` pero el
+venv tiene 8.0.0"*, sugiriendo que el pin estaba obsoleto. **Comprobado contra
+`qevps`: es al reves.**
+
+| | `qevps` (produccion) | Entorno de desarrollo |
+| --- | --- | --- |
+| `redis-py` | **5.3.1** (respeta el pin) | 8.0.0 |
+| Python | **3.12.10** | 3.14.6 |
+
+El pin no esta desalineado: **el entorno de desarrollo se desvio del pin.**
+Subir el techo a 8.x habria cambiado el cliente de Redis en produccion en el
+proximo despliegue, sin que nadie lo hubiera probado alli. Se deja en `<6.0` con
+el motivo escrito en el propio `requirements.txt`, para que no se "arregle"
+hacia arriba por inercia.
+
+**La deriva de Python es la mas seria de las dos**, y no estaba anotada en
+ningun sitio. El proyecto declara `requires-python = ">=3.12"` y `black`/`ruff`
+apuntan a `py312`, que es lo que corre en produccion; desarrollar y validar
+sobre 3.14 significa que **la suite verde local no prueba el interprete que
+opera**. Entre 3.12 y 3.14 hay cambios de comportamiento en `asyncio` y en
+`typing` que este proyecto usa intensivamente.
+
+Nota de contexto: la deuda del Bloque 1 (los 3 errores de mypy causados por
+`types-redis`) se diagnostico asumiendo redis 8.0 — cierto en el entorno de
+desarrollo, no en produccion. La conclusion (desinstalar los stubs obsoletos)
+sigue siendo correcta, porque el override de `app.cache.redis_backend` en
+`pyproject.toml` es justamente el que cubre 5.x.
+
+**Pendiente, no resuelto aqui:** alinear el entorno de desarrollo a Python 3.12
+y redis 5.3.1, o decidir conscientemente subir produccion. No lo hago por mi
+cuenta: cambiar el interprete o los paquetes de la maquina del operador excede
+lo que pide el pendiente.
