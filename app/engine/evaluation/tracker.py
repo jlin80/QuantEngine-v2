@@ -23,6 +23,7 @@ from typing import Any
 
 from app.config.settings import QuantEvaluationSettings
 from app.core.lifecycle import Service
+from app.engine.evaluation.outcomes import VirtualOutcome, VirtualOutcomeStore
 from app.engine.models import Direction, SignalRecord
 from app.market.models import Timeframe
 from app.market.services import MarketDataService
@@ -126,12 +127,22 @@ class PerformanceTracker(Service):
     Args:
         settings: Configuración de la evaluación continua.
         market: API de datos (velas para resolver TP/SL).
+        outcomes: Store append-only del resultado por señal. Opcional: sin él
+            el tracker se comporta exactamente como antes del Bloque 8 (sólo
+            agregado por estrategia), que es lo que necesitan los tests que no
+            miran el join.
     """
 
-    def __init__(self, settings: QuantEvaluationSettings, market: MarketDataService) -> None:
+    def __init__(
+        self,
+        settings: QuantEvaluationSettings,
+        market: MarketDataService,
+        outcomes: VirtualOutcomeStore | None = None,
+    ) -> None:
         super().__init__("performance_tracker")
         self._settings = settings
         self._market = market
+        self._outcomes = outcomes
         self._timeframe = Timeframe(settings.timeframe)
         self._open: dict[str, _VirtualTrade] = {}
         self._stats: dict[str, StrategyPerformance] = {}
@@ -267,8 +278,25 @@ class PerformanceTracker(Service):
         closed_at: datetime,
         false_signal: bool,
     ) -> None:
-        """Close a virtual trade and update its strategy's stats."""
+        """Close a virtual trade, persist its row and update the aggregate."""
         self._open.pop(trade.signal_id, None)
+        if self._outcomes is not None:
+            self._outcomes.record(
+                VirtualOutcome(
+                    signal_id=trade.signal_id,
+                    strategy=trade.strategy,
+                    symbol=trade.symbol,
+                    direction=trade.direction.value,
+                    entry=trade.entry,
+                    stop=trade.stop,
+                    target=trade.target,
+                    r_multiple=round(r_value, 4),
+                    outcome=outcome,
+                    false_signal=false_signal,
+                    opened_at=trade.opened_at,
+                    closed_at=closed_at,
+                )
+            )
         perf = self._perf(trade.strategy)
         perf.evaluated += 1
         if outcome == "win":
@@ -323,6 +351,7 @@ class PerformanceTracker(Service):
         return {
             "enabled": self._settings.enabled,
             "open_virtual_trades": len(self._open),
+            "outcomes": None if self._outcomes is None else self._outcomes.status(),
             "strategies": {name: perf.to_dict() for name, perf in sorted(self._stats.items())},
         }
 
@@ -350,6 +379,11 @@ class PerformanceTracker(Service):
                 if now - self._last_snapshot >= self._settings.snapshot_interval_seconds:
                     self._last_snapshot = now
                     self.snapshot_to_disk()
+                    # El lote parcial se vuelca con la misma cadencia: sin esto
+                    # una tanda por debajo de `flush_size` podría quedarse en
+                    # memoria indefinidamente en un mercado tranquilo.
+                    if self._outcomes is not None:
+                        self._outcomes.flush()
             except Exception:  # el evaluador jamás debe morir
                 self._log.exception("Continuous evaluation pass failed")
 
@@ -365,3 +399,5 @@ class PerformanceTracker(Service):
             self._task = None
         if self._settings.enabled:
             self.snapshot_to_disk()
+        if self._outcomes is not None:
+            self._outcomes.flush()

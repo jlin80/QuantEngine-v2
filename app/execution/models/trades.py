@@ -59,6 +59,11 @@ class TradeRecord:
         entry_reasons: Razones de entrada.
         exit_reasons: Razones de salida.
         decision_id: Decisión de origen.
+        signal_ids: Señales que originaron la decisión. Es la clave que permite
+            unir esta operación, fila a fila, con el resultado virtual que el
+            evaluador continuo (Fase 4) calcula por señal — es decir, separar
+            "la señal tenía edge" de "la ejecución lo capturó". Vacías en el
+            journal anterior al Bloque 8 y en posiciones adoptadas del broker.
         context_snapshot: Captura de contexto (estructura preparada).
     """
 
@@ -91,6 +96,7 @@ class TradeRecord:
     entry_reasons: tuple[str, ...] = ()
     exit_reasons: tuple[str, ...] = ()
     decision_id: str | None = None
+    signal_ids: tuple[str, ...] = ()
     context_snapshot: dict[str, Any] = field(default_factory=dict)
     recorded_at: datetime = field(default_factory=utc_now)
 
@@ -155,6 +161,9 @@ class TradeRecord:
             entry_reasons=tuple(data.get("entry_reasons", ())),
             exit_reasons=tuple(data.get("exit_reasons", ())),
             decision_id=data.get("decision_id"),
+            # `.get` con default vacío: el journal anterior al Bloque 8 no
+            # tiene la clave y debe seguir releyéndose sin migración.
+            signal_ids=tuple(str(s) for s in data.get("signal_ids", ())),
             context_snapshot=dict(data.get("context_snapshot", {})),
             recorded_at=datetime.fromisoformat(str(data["recorded_at"])),
         )
@@ -193,6 +202,7 @@ class TradeRecord:
             "entry_reasons": list(self.entry_reasons),
             "exit_reasons": list(self.exit_reasons),
             "decision_id": self.decision_id,
+            "signal_ids": list(self.signal_ids),
             "context_snapshot": self.context_snapshot,
             "recorded_at": _iso(self.recorded_at),
         }

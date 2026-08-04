@@ -41,6 +41,50 @@ versionado [SemVer](https://semver.org/lang/es/).
   redis-py) y un `noqa: BLE001` inútil en `app/market/feed/feed.py`.
 
 ### Added
+- **Informe de order flow nativo (Bloque 9)** en `docs/orderflow_nativo.md`. La
+  auditoría corrige el diagnóstico previo: con MT5 el order flow no está
+  *aproximado*, está **ausente** (el proveedor no expone `ORDERBOOK` y nunca
+  emite `Trade`), lo que el journal confirma — cero operaciones de `delta`,
+  `cvd` y `order_book_imbalance` en 1209. Incluye la desincronización CFD↔spot
+  medida (~10 bps de offset estable). Recomendación: no es prioritario migrar.
+  Sin cambios de código de producción.
+- **Hitos de capital derivados de una fórmula (Bloque 13).** `docs/architecture.md`
+  pasa de afirmar los umbrales (~$1k / ~$2-5k / ~$20k) a derivarlos de
+  `nocional_lote_mínimo / (tope/100)`, con tabla por símbolo y checklist
+  accionable por hito. 11 tests derivan los hitos desde `InstrumentSpec`, así que
+  un cambio de bróker, `contract_size` o precio hace divergir la tabla y salta.
+  Sin ningún cambio operativo aplicado.
+- **Criterios de graduación a live, formalizados y medibles (Bloque 12).**
+  `app/production/live/graduation.py` + `scripts/graduation_gap.py`: siete
+  criterios con umbrales razonados (muestra, expectativa, profit factor,
+  drawdown, días en paper, cobertura de regímenes y salidas forzadas). Cierra el
+  riesgo declarado desde la Fase 5 de que esos criterios no estuvieran escritos
+  en ningún sitio. **No habilita nada**: hay un test que verifica que, con los
+  siete criterios cumplidos, `resolved_mode()` sigue en `paper` y `allow_live`
+  en `False` (ADR-097).
+- **Rollback automático del ciclo autónomo de research (Bloque 10).** Si el motor
+  operativo se degrada —CPU sostenida, latencia del bucle de gestión por encima
+  de 2× su referencia, desviación del reloj, o alarma de ciego/mudo— `auto_cycle`
+  se apaga solo, con aviso por Discord. Sólo apaga el laboratorio y **no se rearma
+  solo**. Requirió instrumentar la latencia del bucle de gestión de posiciones
+  (`ExecutionEngine.manage_latency`), que no se medía. Plan de activación gradual
+  en tres fases en `docs/research.md`; `auto_cycle` sigue en `false` (ADR-096).
+- **Guard de arranque fail-fast (Bloque 11).** `QuantEngine.start()` aborta si el
+  proceso trae un reloj simulado, instrumentación de test cargada o un event loop
+  de backtesting ya activo. Sólo se aplica en `paper`/`production`: en
+  `development`/`testing` informa y no bloquea, porque un guard que estorba se
+  acaba desactivando. Auditoría completa del estado compartido del proceso en
+  `docs/architecture.md` (ADR-095).
+- **Trazabilidad señal→ejecución de extremo a extremo (Bloque 8).** Los
+  `signal_id` de la decisión viajan por el Event Bus hasta el `TradeRecord`
+  (`DecisionGenerated` → `OrderRequest` → `Position` → `TradeRecord`), y el
+  evaluador continuo persiste el resultado virtual **por señal** en un store
+  append-only (`VirtualOutcomeStore`). Con ambos, el ML une el Trade Journal
+  fila a fila con el evaluador (`app/ml/datasets/join.py`) en vez de aproximar
+  la calidad de señal por el motivo de salida — aproximación que descartaba
+  justo las operaciones cortadas por régimen o por tiempo, que eran las que
+  había que medir. Los casos sin match se cuentan en
+  `metadata["join_breakdown"]`, no se ocultan (ADR-094).
 - **Falsación automática del cambio de holding** (`app/execution/falsification.py`):
   mide en su ventana si `take_profit` sube del 0 %, `regime_change` baja del 80 %
   y la duración mediana alcanza la esperada **por estrategia**; publica el

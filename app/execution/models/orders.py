@@ -48,6 +48,9 @@ class OrderRequest:
         take_profit: Objetivo de la posición resultante.
         reduce_only: Si solo puede reducir/cerrar posición.
         decision_id: Decisión que la originó (trazabilidad).
+        signal_ids: Señales que el consenso consideró en esa decisión. Se
+            arrastran para poder unir la operación resultante con el resultado
+            virtual que el evaluador continuo calcula por señal.
         reason: Motivo de la orden (explicabilidad).
         metadata: Datos adicionales JSON-safe.
     """
@@ -64,6 +67,7 @@ class OrderRequest:
     take_profit: float | None = None
     reduce_only: bool = False
     decision_id: str | None = None
+    signal_ids: tuple[str, ...] = ()
     reason: str = ""
     created_at: datetime = field(default_factory=utc_now)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -83,6 +87,7 @@ class OrderRequest:
             "take_profit": self.take_profit,
             "reduce_only": self.reduce_only,
             "decision_id": self.decision_id,
+            "signal_ids": list(self.signal_ids),
             "reason": self.reason,
             "created_at": _iso(self.created_at),
             "metadata": self.metadata,

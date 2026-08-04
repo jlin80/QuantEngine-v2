@@ -149,7 +149,24 @@ def _research_failed(event: ev.ResearchFailed) -> Notification:
     )
 
 
+def _cycle_rolled_back(event: ev.ResearchCycleRolledBack) -> Notification:
+    return _note(
+        "🛑 Ciclo de research desactivado automáticamente",
+        (
+            "El ciclo autónomo se apagó solo porque el motor operativo se estaba "
+            "degradando. **No se rearma solo**: volver a activarlo es una decisión "
+            "tuya, tras revisar la causa."
+        ),
+        NotificationLevel.WARNING,
+        {
+            "Disparadores": " · ".join(event.triggers) or "—",
+            "Detalle": event.detail[:512] or "—",
+        },
+    )
+
+
 _BUILDERS: dict[type[Event], Callable[[Any], Notification]] = {
+    ev.ResearchCycleRolledBack: _cycle_rolled_back,
     ev.ExperimentCreated: _experiment_created,
     ev.ExperimentArchived: _experiment_archived,
     ev.StrategyGenerated: _strategy_generated,

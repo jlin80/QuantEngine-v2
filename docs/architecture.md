@@ -1601,3 +1601,412 @@ alarma que salta cada noche con el mercado cerrado se acaba ignorando.
 para enterarse de que no esta operando. El coste es una fuente mas de alertas, y
 por eso ambas llevan latch y aviso de recuperacion: la utilidad de una alarma es
 inversamente proporcional a cuantas veces se repite sin novedad.
+
+## ADR-094 · El `signal_id` viaja como campo del evento, no como acoplamiento
+
+**Contexto.** El Bloque 4 dejó declarada su limitacion mas importante: el ML
+aproximaba la calidad de la senal filtrando el Trade Journal **por motivo de
+salida**, porque no habia forma de comparar senal a senal contra el resultado
+que calcula el evaluador continuo. Faltaban dos piezas: el evaluador agregaba
+por estrategia y descartaba el resultado individual, y el `TradeRecord` llevaba
+`decision_id` pero no los `signal_id` que lo originaron.
+
+La consecuencia no era academica. La aproximacion **descarta justo las
+operaciones que la ejecucion corto** (regimen, tiempo, kill switch), que son
+precisamente las que separan "la senal no tenia edge" de "lo tenia y la
+ejecucion no lo capturo" — la pregunta que abrio toda esta linea de trabajo el
+2026-07-29.
+
+**Decision.** Dos cambios, ninguno de ellos un acoplamiento nuevo:
+
+1. `Decision.signals_considered` (que ya existia) se publica en
+   `DecisionGenerated.signal_ids` y se arrastra por `OrderRequest` → `Position`
+   → `TradeRecord`. Es **el mismo patron exacto** que el Bloque 1 uso para
+   `strategy`/`strategy_category`: un campo del evento, no una llamada entre
+   modulos. La ejecucion sigue sin conocer el Decision Engine ni los plugins.
+2. El evaluador continuo persiste el resultado **por senal** en un store
+   append-only (`VirtualOutcomeStore`), en paralelo al agregado por estrategia
+   que ya publicaba. Se anade una salida; no se sustituye ninguna.
+
+El join vive en la capa de datasets del ML (`app/ml/datasets/join.py`) y declara
+su propio `SignalOutcome`, adaptado en el composition root — misma regla que
+`VirtualStrategyStats` en ADR-087: el ML no depende de `app.engine.evaluation`.
+
+**Los casos sin match se cuentan, no se esconden.** Son tres y no significan lo
+mismo: `unmatched_legacy` (journal anterior al bloque y posiciones adoptadas del
+broker — cae al camino antiguo, porque hoy es casi todo el historial),
+`unmatched_unresolved` (senal sin niveles o virtual aun abierta — fuera de la
+etiqueta de senal, dentro de las de ejecucion) y `signal_without_trade` (senal
+filtrada o vetada por riesgo — no es fila del dataset, pero es la evidencia mas
+limpia que existe sobre esa senal). Van a `metadata["join_breakdown"]`, con el
+mismo estandar de procedencia auditable que el `era_breakdown` del Bloque 4.
+
+**Alternativa descartada.** Reconstruir el vinculo a posteriori cruzando
+`decision_id` con el historial de decisiones persistido: es posible, pero exige
+que la DB este viva y disponible en el momento del entrenamiento, y no cubre las
+decisiones purgadas. Un campo en el registro es mas barato y no depende de nada.
+
+**Consecuencias.** El saneamiento por era se aplica **despues** del join: el
+join cambia como se etiqueta una operacion, no cuales son medibles. La
+aproximacion por motivo de salida sobrevive como fallback y seguira siendo el
+camino mayoritario hasta que el journal post-bloque acumule muestra — el propio
+`labelled_from_join` lo hace visible en vez de dejarlo implicito.
+
+Efecto colateral cerrado de paso: el snapshot de recuperacion no persistia
+`strategy`/`strategy_category` (hueco del Bloque 1). Una posicion restaurada
+tras un reinicio perdia su atribucion, caia al holding **global** en vez del
+suyo por estrategia, y su operacion llegaba al journal sin nada que unir.
+
+## Riesgos de aislamiento de procesos (Bloque 11)
+
+El incidente del reloj (ADR-091) no fue un bug aislado: fue el sintoma de que el
+backtesting, el research y el motor en vivo comparten **proceso, event loop y
+espacio de modulos**. Esta seccion audita que otro estado compartido podria
+producir la misma clase de fallo.
+
+### Auditoria de estado compartido
+
+| Sitio | Patron | Veredicto |
+| --- | --- | --- |
+| `app/utils/time.py` | proveedor de reloj | **Cerrado** (ADR-091): `ContextVar`, alcance = la tarea del backtest. |
+| `app/backtesting/quant_source.py` `_LOOP` | event loop en hilo daemon, global de modulo, creado por el backtesting | **Riesgo real, distinto del reloj.** No corrompe estado del motor —el motor en vivo nunca usa ese loop—, pero es un hilo que se crea y **nunca se cierra**: sobrevive al backtest que lo creo y a cualquier numero de corridas posteriores. Su presencia es evidencia de que un backtest corrio en el proceso, y por eso el guard de arranque la usa como senal. |
+| `app/logging/recent.py` `_buffer` | singleton de modulo con `global` | **Aceptable.** Se instala una vez y es de solo-anadir; un backtest no puede corromperlo, como mucho mete ruido en el buffer de errores. Mismo patron, consecuencia distinta. |
+| `app/engine/signal_engine/engine.py` `_BACKGROUND` | `set` de tareas a nivel de modulo | **Aceptable.** Es un anclaje contra la recoleccion de basura de tareas (`add_done_callback(discard)`), no estado de negocio. Un `SignalEngine` de backtest comparte el `set` con el del motor, pero las tareas son independientes. |
+| `app/brokers/mt5/connection.py` | `MetaTrader5` es singleton **de proceso** | **Riesgo inherente, no del codigo.** Lo impone la libreria: un backtest y el motor en vivo comparten forzosamente el mismo terminal. No se puede aislar sin separar procesos — es el argumento mas fuerte a favor del punto siguiente. |
+
+**Lo que se comprobo y NO era un problema.** `QuantCoreDecisionSource` ejecuta su
+pipeline en el hilo del `_LOOP` via `run_coroutine_threadsafe`, lo que hacia
+sospechar que el reloj simulado no llegaria hasta alli (y que los backtests
+estarian usando hora de pared en silencio). Se verifico empiricamente: sí llega
+— `call_soon_threadsafe` copia el contexto del hilo llamante. Queda escrito para
+no repetir la sospecha.
+
+**Lo que esta auditoria no puede cubrir.** Los monkeypatch de un test no se
+pueden enumerar en tiempo de ejecucion. Por eso el guard no busca parches
+concretos, sino el **entorno que los produce** (`pytest` cargado,
+`PYTEST_CURRENT_TEST` definida): detectar la causa es posible, el efecto no.
+
+### Guard de arranque (implementado)
+
+`app/engine/startup_guard.py`, invocado al principio de `QuantEngine.start()`.
+Tres comprobaciones: desviacion del reloj, instrumentacion de test cargada, y
+event loop de backtesting ya activo. Ver ADR-095.
+
+### Aislamiento por procesos (propuesta, NO implementada)
+
+Tres opciones, de menor a mayor coste:
+
+1. **Guard de arranque** — hecho. No aisla nada; solo impide operar contaminado.
+2. **Backtest/research en proceso hijo** (`multiprocessing`, frontera = Event
+   Bus o cola). Elimina de raiz el reloj compartido, el `_LOOP`, los modulos
+   compartidos y la contencion del terminal MT5. Coste: serializar los datos de
+   entrada del backtest y el resultado; el `BacktestLab` hoy recibe objetos
+   vivos (`MarketDataService`, `DecisionSource`), asi que no es un cambio
+   trivial. **Es la opcion recomendada** si se va a activar `auto_cycle`.
+3. **Contenedores separados** — el aislamiento mas fuerte, pero arrastra la
+   decision de plataforma de abajo.
+
+### Linux + Docker Compose vs Windows + Tarea Programada
+
+La pregunta del bloque es si migrar `qevps` habria cortado el incidente. **No:
+el incidente fue estado compartido dentro de un unico proceso Python, y eso
+ocurre igual en Linux, en Docker y en Windows.** Docker aisla procesos entre
+contenedores, no dentro de uno.
+
+Dicho eso, la comparacion en si:
+
+| | Windows + Tarea Programada (hoy) | Linux + Docker Compose |
+| --- | --- | --- |
+| MT5 | Nativo. **Unica plataforma soportada por la libreria.** | Requiere Wine, o cambiar de broker. |
+| Aislamiento | Un proceso para todo. | Un contenedor por servicio, limites de CPU/memoria reales. |
+| Reproducibilidad | Depende del estado de la maquina (el `w32time` parado del 04/08 lo ilustra). | Imagen versionada. |
+| Coste de migracion | — | Alto, y **dominado por MT5**, no por el resto. |
+
+**Recomendacion: no migrar ahora.** La dependencia de MT5 con Windows convierte
+la migracion en un cambio de broker encubierto, que es una decision de capital y
+no una decision tecnica. El beneficio que se buscaba —aislar backtest del motor—
+se consigue mas barato con la opcion 2 (proceso hijo), que no toca la
+plataforma. Reevaluar si algun dia se deja de depender de MT5.
+
+## ADR-095 · El motor no arranca con instrumentacion de test o backtest activa
+
+**Contexto.** El motor estuvo 4 dias operando con el reloj de un backtest
+instalado. ADR-091 impide esa fuga concreta y ADR-093 vigila el efecto (ciego /
+mudo), pero faltaba comprobar el estado del proceso **en el momento de
+arrancar**: las dos anteriores actuan durante la operacion, no antes de ella.
+
+**Decision.** Un guard fail-fast al principio de `QuantEngine.start()`, con tres
+comprobaciones: desviacion del reloj efectivo frente al de pared, presencia de
+instrumentacion de test (`pytest` en `sys.modules`, `PYTEST_CURRENT_TEST`), y un
+event loop de backtesting ya activo en el proceso.
+
+**Por que abortar y no degradar.** Un warning habria devuelto exactamente el
+modo de fallo del incidente: operar mal, en silencio, mientras todo figura
+`running`. Un motor que no arranca se detecta en el primer minuto; uno ciego
+tardo cuatro dias. La asimetria de coste es el argumento entero.
+
+**Por que solo en `paper` y `production`.** En `development` y `testing` la
+instrumentacion de test es lo esperado — de hecho la propia suite arranca el
+motor. Abortar alli convertiria al guard en un estorbo, y un guard que estorba
+se acaba desactivando: es asi como se pierden las salvaguardas. En esos entornos
+informa y no bloquea, y hay un test que fija ambas mitades del contrato.
+
+**Lo que el guard NO hace.** No aisla nada ni sustituye a separar procesos
+(propuesta arriba, sin implementar). Detecta que el proceso viene sucio; no
+impide que se ensucie. Tampoco puede enumerar monkeypatch: detecta el entorno
+que los produce, no los parches.
+
+**Consecuencias.** Hay un test explicito de que un arranque limpio **no** se
+bloquea, tan importante como los de deteccion: el fallo esperable de un guard
+como este es el falso positivo que obliga a desactivarlo.
+
+## ADR-096 · El ciclo autonomo se apaga solo si degrada al motor, y no se rearma
+
+**Contexto.** El Bloque 6 puso techo al ciclo autonomo del Research Lab
+(ventana, topes, timeout, vetos de CPU y posiciones abiertas), pero todo eso
+decide **si el ciclo puede arrancar**. Nada decidia si, una vez corriendo, habia
+que **apagarlo**. La diferencia importa: el peor caso del presupuesto es
+posponer un ciclo; el peor caso de no vigilar el efecto es haber estado
+degradando la operativa sin que nadie lo notase — que es literalmente la
+leccion del incidente del reloj.
+
+**Decision.** Un vigilante (`app/research/rollback.py`) evaluado antes de cada
+ciclo. Cuatro disparadores: CPU sostenida, latencia del bucle de gestion de
+posiciones, desviacion del reloj y alarmas de pipeline (ciego/mudo). Al
+disparar, `auto_cycle` pasa a `false`, se publica `ResearchCycleRolledBack` y
+Discord avisa.
+
+**CPU sostenida, no un pico.** Un pico de CPU durante un ciclo de research es
+*exactamente lo esperado*: disparar con el primero apagaria la vigilancia en el
+primer ciclo que hiciera su trabajo. Se exigen 3 muestras consecutivas, y una
+racha rota vuelve a cero.
+
+**La latencia se juzga contra su propia referencia, no contra un absoluto.** Lo
+que delata la competencia por CPU es la **degradacion relativa**: un bucle
+establemente lento no es culpa del research, uno que se duplica si — aunque siga
+siendo rapido en terminos absolutos. Para medirlo hubo que instrumentar el bucle
+de gestion (`ExecutionEngine.manage_latency`), que hasta ahora **no se media**:
+no habia forma de saber si algo le estaba robando CPU al unico bucle que no
+puede llegar tarde.
+
+**Con muestra escasa no se juzga.** Menos de 30 pasadas, o sin linea base, no
+dispara. Comparar contra una referencia que no existe es como se fabrican los
+falsos positivos que acaban con la vigilancia desactivada.
+
+**Asimetria deliberada: solo apaga el laboratorio.** Nunca toca la operativa, no
+cierra posiciones y no puede habilitar live. Ante la duda, el que se sacrifica
+es el research — cuesta un ciclo de generacion, no dinero.
+
+**No se rearma solo.** Reactivar es una decision humana. Un rollback reversible
+automaticamente convertiria un problema persistente en un ciclo de
+encendido/apagado, mas dificil de diagnosticar que el fallo original.
+
+**El apagado es en memoria, no toca el `.env`.** El job lee `auto_cycle` en cada
+disparo, asi que basta para que no vuelva a entrar; persistirlo seria que el
+codigo se reescriba la configuracion del operador.
+
+**Consecuencias.** El plan de activacion gradual (tres fases, en
+`docs/research.md`) y estos umbrales son la misma cosa: hay un test que exige
+que los numeros documentados sean los configurados, porque un plan que diverge
+del codigo no vale nada. `auto_cycle` sigue en `false`, con su test.
+
+## ADR-097 · Criterios de graduacion a live: escritos, medidos, y sin poder activar nada
+
+**Contexto.** Desde la Fase 5 existe la regla *"solo se habilita live tras
+cumplir criterios estadisticos"*, y desde la Fase 5 esta anotado como riesgo
+conocido que **esos criterios no estaban escritos en ningun sitio**. Una regla
+sin umbrales no es un control: no se puede incumplir porque no se puede evaluar.
+
+**Decision.** Siete criterios en `app/production/live/graduation.py`, con el
+razonamiento de cada umbral en su propio docstring, y una herramienta
+(`scripts/graduation_gap.py`) que los mide contra un Trade Journal real.
+
+| Criterio | Umbral | Por que |
+| --- | --- | --- |
+| Muestra | >= 400 operaciones | Con 100 y expectativa de +0.1R el error estandar tapa el resultado: no se distingue edge de suerte. |
+| Expectativa | >= +0.10R | Positiva **con margen**: exigir >0 aprobaria un sistema que empata, y en real empatar es perder (el paper no cobra swaps ni sufre requotes). |
+| Profit factor | >= 1.30 | Por debajo de ~1.2 el resultado lo domina el ruido. |
+| Drawdown maximo | <= 15 % | Sobre equity pico. |
+| Dias en paper | >= 60 | El calendario importa **aparte** de la muestra: 400 operaciones en tres dias miden un unico momento de mercado con mucho detalle. |
+| Cobertura de regimenes | >= 3, con >= 30 operaciones cada uno | Cinco operaciones en `trending` no son cobertura de `trending`. |
+| Salidas forzadas | <= 50 % | **Criterio anadido por los datos, no por el enunciado.** Ver abajo. |
+
+**El criterio que no estaba pedido y es el mas importante.** Si el motor cierra
+la mayoria de sus posiciones por regimen, tiempo o kill switch, sus estrategias
+**casi nunca llegan a poner a prueba su propia tesis**. Un sistema asi puede
+tener expectativa positiva y no haber demostrado nada sobre sus senales: lo que
+se graduaria a real seria la ejecucion, no la estrategia. En el journal medido
+esto esta al 75.6 % — es el hallazgo que justifica el criterio.
+
+**Cumplirlos no activa nada.** El modulo no importa el `LiveGate`, no toca
+`allow_live` y no tiene ningun camino hacia `resolved_mode()`. Hay un test que
+construye un historial que cumple **los siete** criterios y comprueba que
+despues `resolved_mode()` sigue devolviendo `paper` y `allow_live` sigue en
+`False`. El informe lo dice ademas por escrito en su propio `to_dict()`: un
+informe que parece una aprobacion acabaria usandose como tal.
+
+**Consecuencias.** El gap medido (abajo, y en la bitacora) dice que el sistema
+no esta cerca — y no en una direccion que el tiempo arregle solo. Ese es el
+valor del ADR: convierte "todavia no" en un numero.
+
+## Hitos de capital: la formula, la tabla y el checklist (Bloque 13)
+
+La seccion "Sizing y limites de exposicion frente al crecimiento del capital"
+(arriba) ya explicaba **por que** los topes envejecen mal: expresan una
+restriccion de granularidad del broker, no apetito de riesgo. Lo que le faltaba
+—y es lo que pide este bloque— es la **formula** detras de cada hito. Sin ella
+los umbrales son numeros afirmados, y hay que reinvestigarlos cada vez que
+cambie el broker, el simbolo o el precio.
+
+### La formula
+
+El tope de exposicion no puede bajar de lo que ocupa **una sola posicion del
+lote minimo**:
+
+```
+nocional_lote_minimo = volume_min x contract_size x precio
+
+max_exposure_pct minimo viable = nocional_lote_minimo / equity x 100
+
+equity necesario para un tope dado = nocional_lote_minimo / (tope / 100)
+```
+
+Todo el envejecimiento de estos limites sale de ahi: el numerador lo fija el
+broker y el mercado, el denominador crece con la cuenta. **El tope no deja de
+ser necesario poco a poco: deja de serlo en un punto concreto y calculable.**
+
+### Nocional del lote minimo, por simbolo (demo Exness)
+
+| Simbolo | `contract_size` | Lote min. | Nocional lote min. |
+| --- | --- | --- | --- |
+| ETHUSDm | 1 | 0.1 | ~$195 |
+| USTECm | 1 | 0.01 | ~$281 |
+| BTCUSDm | 1 | 0.01 | ~$650 |
+| XAUUSDm | **100** | 0.01 (= 1 oz) | ~$4.083 |
+
+XAUUSDm tiene `contract_size=100`: su lote minimo es **6 veces** el de BTC y 21
+veces el de ETH. Por eso esta con el toggle en OFF, y no por una decision de
+riesgo.
+
+### Qué exposicion ocupa una sola posicion, segun el equity
+
+| Simbolo | @$200 | @$1.000 | @$5.000 | @$20.000 |
+| --- | --- | --- | --- | --- |
+| ETHUSDm | 97 % | 19 % | 4 % | 1 % |
+| USTECm | 140 % | 28 % | 6 % | 1 % |
+| BTCUSDm | 325 % | 65 % | 13 % | 3 % |
+| XAUUSDm | 2.041 % | 408 % | 82 % | **20 %** |
+
+Esta tabla **deriva** los hitos que antes estaban afirmados. El "~$20k para el
+oro" no era una intuicion: es exactamente $4.083 / 0.20 = **$20.414**.
+
+### Equity necesario para operar bajo un tope convencional
+
+| Tope | ETHUSDm | USTECm | BTCUSDm | XAUUSDm |
+| --- | --- | --- | --- | --- |
+| 300 % | $65 | $94 | $217 | $1.361 |
+| 100 % | $195 | $281 | $650 | $4.083 |
+| 20 % | $974 | $1.403 | $3.248 | $20.414 |
+
+### Checklist: que revisar cuando suba el capital
+
+Los cuatro parametros se calibraron juntos y se revisan juntos. Al alcanzar cada
+hito, recalcular con la formula de arriba (los precios cambian; la formula no):
+
+**~$1.000**
+- [ ] `max_exposure_pct`: con ETH y USTEC ya por debajo del 30 %, los 2000 % son
+      holgura pura. Bajar hacia 300-400 %.
+- [ ] `max_symbol_exposure_pct` (hoy 400 %): empieza a poder ser un control real
+      y no un estorbo.
+- [ ] Comprobar si el lote minimo de cada simbolo cabe con topes normales
+      (formula: `nocional_lote_minimo / equity`).
+- [ ] El oro **sigue fuera** (408 % de exposicion por posicion).
+
+**~$2.000-5.000**
+- [ ] `max_exposure_pct` hacia valores convencionales (100-300 %).
+- [ ] `max_correlation_exposure_pct` (hoy 800 %): con equity pequeno casi nunca
+      se activaba, asi que **nunca se ha probado de verdad**. Revisar que el
+      grupo de correlacion cripto (BTC+ETH) este bien definido antes de que el
+      limite empiece a morder.
+- [ ] BTC deja de estar "al filo" del 0,5 % de riesgo por operacion.
+- [ ] Reevaluar el oro a partir de ~$4.083 (100 % por posicion) — todavia alto.
+
+**~$20.000**
+- [ ] El oro cabe con un tope del 20 %: reactivar `XAUUSDM` en
+      `execution.symbols_enabled` **es una decision, no un automatismo**.
+- [ ] Los topes deberian estar dominados por criterio de riesgo, no por
+      granularidad del broker. Es el momento de fijarlos por apetito real.
+- [ ] `risk_per_trade_pct` (0,5 %): calibrado con la misma logica de
+      granularidad, revisar con el mismo criterio.
+- [ ] `max_position_pct` (hoy 400 %) baja a un valor convencional.
+
+Los cuatro estan en la whitelist del Config Center (aplican en caliente), pero
+**nada avisa automaticamente**: es una revision manual ligada a hitos, y por eso
+esta escrita aqui.
+
+### Universo de simbolos: que ganaria un exchange nativo
+
+Hoy el universo operable son **4 simbolos**, y no por eleccion: Exness demo
+deshabilita las altcoins (`trade_mode=0` en SOL/ADA/DOGE/LTC/XRP/BNB), descarta
+`BTCUSDTm` y `USTEC_x100m` por falta de cotizacion, y `ETHBTCm` por
+`contract_size=100`. De los 4 que quedan, uno (oro) esta apagado por tamano de
+contrato. **Operativa real: 3 simbolos, dos de ellos altamente correlacionados
+(BTC y ETH).**
+
+Que cambiaria con el feed/ejecucion nativa de Binance o Bybit (enlaza con el
+Bloque 9):
+
+- **Diversificacion real.** Decenas de pares con liquidez suficiente, y
+  altcoins con regimenes que no son el de BTC. Hoy `max_correlation_exposure_pct`
+  es casi decorativo porque **el universo entero esta correlacionado**.
+- **Granularidad mucho mejor.** El lote minimo de un exchange spot es de
+  ordenes de magnitud menor que el de un CFD: el problema de este bloque entero
+  —topes dictados por granularidad— practicamente desaparece.
+- **El oro no aplica**: no hay XAU en un exchange cripto. Seguiria necesitando
+  el bróker CFD, o quedarse fuera.
+
+**No es una recomendacion de cambiar de bróker** — eso es una decision de
+capital, y ademas seria prematura mientras la expectativa siga siendo negativa
+(ADR-097). Es el dato para cuando esa decision se plantee: el techo de
+diversificacion actual **no es del motor, es del bróker**.
+
+## Riesgo conocido: el order flow no esta aproximado, esta ausente (Bloque 9)
+
+Los riesgos de Fase 4 y Fase 10 describian el order flow como "aproximado" y las
+heuristicas de spoofing/iceberg como "experimentales". **La auditoria del Bloque
+9 corrige ese diagnostico a peor**, y conviene que quede escrito con precision:
+
+- `app/market/providers/mt5.py:39` — las capacidades del proveedor MT5 son
+  `{TICKER, TRADES, CANDLES}`: **no incluye `ORDERBOOK`**. Y aunque `TRADES`
+  figura, el bucle de polling solo emite `Ticker`, nunca `Trade`. Resultado:
+  `get_recent_trades()` devuelve vacio para todo simbolo de MT5.
+- Por tanto `imbalance`, `book_pressure`, `spoofing_score`, `iceberg_score` y
+  `consumption` son `None`/`0` en produccion, y `delta`/`CVD`/`aggression`/
+  `absorption`/`exhaustion` se calculan sobre una lista vacia. No es una
+  aproximacion de baja calidad: **es la ausencia del dato**.
+- El `volume` de las velas MT5 es `tick_volume` (numero de cambios de precio),
+  y el campo `trades` reutiliza ese mismo numero. No es volumen negociado.
+
+**Confirmacion empirica.** En 1209 operaciones reales de produccion no hay **ni
+una** atribuida a `delta`, `cvd` u `order_book_imbalance`. Las tres estrategias
+puras de order flow nunca han disparado. Las que si operan son SMC estructural
+(`fair_value_gap`, `bos`, `mss`, `choch`, `order_block`), que se calcula sobre
+OHLC y **no depende del libro** — de ahi que esas si funcionen.
+
+Diagnostico afinado: **SMC estructural esta bien servido por MT5; el order flow
+no esta servido en absoluto.**
+
+**Desincronizacion CFD ↔ spot, medida** (294 operaciones de BTC y 464 de ETH
+contra Binance): el CFD cotiza sistematicamente ~10 bps por debajo del spot,
+con desviacion mediana ~10 bps y p95 de 18-20 bps. Que la mediana coincida con
+el sesgo medio indica **offset estable, no ruido**. Irrelevante para senales de
+order flow (son diferenciales); **relevante para niveles y ejecucion**, que
+deben seguir usando siempre el precio del broker.
+
+**Recomendacion (informe completo en `docs/orderflow_nativo.md`): no es
+prioritario migrar la fuente.** No porque el dato aproximado baste, sino porque
+anadir una familia de estrategias nueva a un motor con expectativa negativa
+(ADR-097) y con el 75% de las salidas decididas por la ejecucion es optimizar en
+el orden equivocado. Lo que si conviene ya, y es gratis: desactivar las tres
+estrategias de order flow mientras la fuente sea MT5 — una estrategia inerte que
+figura como activa es deuda de honestidad.

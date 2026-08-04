@@ -115,38 +115,66 @@ Se entrenan (y se leen) por separado:
 | Etiqueta | Qué mide | Qué operaciones usa |
 | --- | --- | --- |
 | `win` / `rr_positive` / `not_stopped` | **Calidad de ejecución**: qué hizo el motor con la señal, con costes y salidas incluidos. | Todas las de eras admisibles. |
-| `signal_quality` | **Calidad de la señal en sí**: ¿la tesis era buena? | Sólo aquellas cuyo cierre **resolvió la tesis**: objetivo, stop, trailing o break-even. |
+| `signal_quality` | **Calidad de la señal en sí**: ¿la tesis era buena? | El **join real** con el evaluador continuo; para el historial sin `signal_ids`, sólo aquellas cuyo cierre resolvió la tesis. |
 
-`signal_quality` **descarta** las operaciones que cerró la ejecución (cambio de
-régimen, tiempo, kill switch, manual). Esa operación nunca llegó a poner a
-prueba su propia tesis, así que etiquetarla como "señal mala" es exactamente el
-error que todo esto pretende evitar. Cada dataset declara qué mide en
-`metadata["label_measures"]` (`signal` | `execution`), porque confundirlas es el
-fallo, no un detalle.
+Cada dataset declara qué mide en `metadata["label_measures"]`
+(`signal` | `execution`), porque confundirlas es el fallo, no un detalle.
 
 Juntas responden dos preguntas que no son la misma: **"¿esta estrategia tiene
 edge?"** (señal) y **"¿la ejecución está capturando ese edge?"** (ejecución).
 
-### Limitación conocida (pendiente)
+### Cómo se mide la calidad de señal (Bloque 8)
 
-La fuente de verdad ideal para la calidad de señal es el **evaluador continuo**
-(Fase 4), que resuelve cada señal contra velas futuras con TP/SL/timeout puros,
-sin ejecución de por medio. Hoy no se puede unir fila a fila con el Trade
-Journal: el evaluador guarda estadística agregada por estrategia, no el
-resultado virtual de cada señal, y el `TradeRecord` lleva `decision_id` pero no
-los `signal_id` que la originaron.
+La fuente de verdad para la calidad de señal es el **evaluador continuo**
+(Fase 4): resuelve cada señal contra velas futuras con TP/SL/timeout puros, sin
+ejecución de por medio. Desde el Bloque 8 se puede unir **fila a fila** con el
+Trade Journal, porque se cerraron los dos huecos que lo impedían:
 
-Por eso `signal_quality` se aproxima **desde el propio journal**, filtrando por
-motivo de salida. Es una aproximación honesta y sin lookahead, pero sigue
-midiendo operaciones ejecutadas (con sus costes y su slippage).
+1. El evaluador persiste el resultado virtual **por señal** en un fichero
+   append-only (`VirtualOutcomeStore`, `data/performance/virtual_outcomes.jsonl`),
+   no sólo el agregado por estrategia.
+2. Los `signal_id` de la decisión viajan por el Event Bus hasta el
+   `TradeRecord`: `StrategySignal` → `Decision.signals_considered` →
+   `DecisionGenerated.signal_ids` → `OrderRequest` → `Position` → `TradeRecord`.
 
-Cerrar el hueco requiere dos cosas, ninguna hecha todavía:
+El join vive en `app/ml/datasets/join.py`. Para cada operación adjunta el
+resultado virtual de las señales que la originaron; con varias señales toma la
+**media** de sus R (la decisión es multi-estrategia por diseño, y quedarse con
+una sola sería atribuir a una lo que votaron varias).
 
-1. Persistir el resultado virtual por `signal_id` en el `PerformanceTracker`.
-2. Propagar los `signal_id` de la decisión hasta el `TradeRecord`.
+#### Por qué esto reemplaza a la aproximación anterior
 
-Mientras tanto, el evaluador continuo **sí** alimenta al Meta Strategy Manager
-de forma agregada por estrategia (ver ADR-087).
+Antes, `signal_quality` se aproximaba filtrando el journal **por motivo de
+salida**: sólo contaban las operaciones cuyo cierre resolvió la tesis. Es
+honesta y no tiene lookahead, pero tenía un punto ciego estructural — **descarta
+justo las operaciones que la ejecución cortó** (cambio de régimen, tiempo, kill
+switch, manual). Y ese era el caso que había que medir: una señal con edge que
+la ejecución no dejó desarrollarse es indistinguible, bajo esa aproximación, de
+una señal que nunca existió.
+
+El evaluador sí las resuelve, contra precio posterior a la señal e
+independientemente de lo que la ejecución hiciera después. Por eso el join
+**añade** filas que antes se perdían, en vez de reetiquetar las que ya había.
+
+#### Los casos sin match, contados y no escondidos
+
+`dataset.metadata["join_breakdown"]` desglosa los tres:
+
+| Caso | Qué significa | Qué se hace con él |
+| --- | --- | --- |
+| `unmatched_legacy` | La operación no lleva `signal_ids`: journal anterior al Bloque 8, o posición adoptada del broker al arrancar. | Cae al camino antiguo (aproximación por motivo de salida). Hoy es la mayor parte del historial: descartarlo dejaría al ML sin datos. |
+| `unmatched_unresolved` | Lleva `signal_ids` pero el evaluador no tiene resolución: señal sin niveles, u operación virtual todavía abierta. | Fuera de la etiqueta de señal; **dentro** de las de ejecución, que sí ocurrió y es medible. |
+| `signal_without_trade` | Señal resuelta que nunca produjo operación: no pasó los filtros, o el riesgo la vetó. | No es fila del dataset de ejecución, pero se cuenta aparte (con desglose por estrategia): es la evidencia más limpia que existe sobre esa señal. |
+
+`metadata["labelled_from_join"]` dice cuántas etiquetas vinieron de evidencia
+directa y cuántas de la aproximación heredada. Un dataset que no lo distinga no
+permite saber cuánto vale su etiqueta de señal.
+
+El saneamiento por era del Bloque 4 se aplica **después** del join: el join
+cambia cómo se etiqueta una operación, no cuáles son medibles.
+
+El evaluador continuo sigue alimentando además al Meta Strategy Manager de forma
+agregada por estrategia (ADR-087); son salidas distintas del mismo dato.
 
 > ⚠️ **Aviso sobre el histórico:** el evaluador continuo tenía un sesgo de
 > medición corregido el 2026-08-03 (ADR-084): resolvía las señales contra la

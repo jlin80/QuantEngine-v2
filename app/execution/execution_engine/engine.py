@@ -13,6 +13,7 @@ desacoplada. **Nunca envía órdenes a un broker real.**
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -157,6 +158,9 @@ class ExecutionEngine(Service):
         self._falsifier = falsifier
         self._subscription: Subscription | None = None
         self._manage_task: asyncio.Task[None] | None = None
+        self._manage_passes = 0
+        self._manage_last_seconds: float | None = None
+        self._manage_ema_seconds: float | None = None
         self._kill_announced = False
         self._cb_announced = False
         self._balance_baseline_set = False
@@ -409,10 +413,40 @@ class ExecutionEngine(Service):
         """Periodically manage open positions until cancelled."""
         while True:
             await asyncio.sleep(interval)
+            started = time.perf_counter()
             try:
                 await self.manage_once()
             except Exception:
                 self._log.exception("Error en el bucle de gestión de posiciones")
+            finally:
+                # Este bucle es el único del sistema que no puede llegar tarde.
+                # Hasta ahora no se medía: no había forma de saber si algo (un
+                # ciclo de research, un backtest) le estaba robando CPU. La EMA
+                # da la línea base contra la que comparar el presente.
+                self._record_manage_latency(time.perf_counter() - started)
+
+    def _record_manage_latency(self, seconds: float) -> None:
+        """Track last/EMA duration of a management pass."""
+        self._manage_last_seconds = seconds
+        self._manage_passes += 1
+        if self._manage_ema_seconds is None:
+            self._manage_ema_seconds = seconds
+        else:
+            alpha = 0.2
+            self._manage_ema_seconds = alpha * seconds + (1.0 - alpha) * self._manage_ema_seconds
+
+    @property
+    def manage_latency(self) -> dict[str, float | int | None]:
+        """Latencia del bucle de gestión de posiciones (última y EMA).
+
+        La consume la vigilancia de rollback del Research Lab: si el ciclo
+        autónomo empieza a competir por CPU, este bucle es donde se nota.
+        """
+        return {
+            "passes": self._manage_passes,
+            "last_seconds": self._manage_last_seconds,
+            "ema_seconds": self._manage_ema_seconds,
+        }
 
     async def _on_event(self, event: Event) -> None:
         """Bus adapter: route accepted decisions into the entry flow."""
@@ -519,6 +553,7 @@ class ExecutionEngine(Service):
             stop_loss=stop_loss,
             take_profit=take_profit,
             decision_id=decision.decision_id,
+            signal_ids=decision.signal_ids,
             reason=decision.summary,
         )
         order = self._orders.create(request)
@@ -556,6 +591,7 @@ class ExecutionEngine(Service):
             stop_loss=stop_loss,
             take_profit=take_profit,
             decision_id=decision.decision_id,
+            signal_ids=decision.signal_ids,
             regime=view.regime,
             strategy=decision.strategy,
             strategy_category=decision.strategy_category,
@@ -1123,6 +1159,7 @@ class ExecutionEngine(Service):
             entry_reasons=position.entry_reasons,
             exit_reasons=position.exit_reasons,
             decision_id=position.decision_id,
+            signal_ids=position.signal_ids,
             # Contexto de SALIDA: sin esto no se puede auditar por qué se cerró
             # (el journal sólo guardaba el régimen de entrada, así que era
             # imposible medir si las salidas por régimen estaban justificadas).

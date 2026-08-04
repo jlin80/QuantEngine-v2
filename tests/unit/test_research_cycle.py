@@ -11,6 +11,7 @@ from app.config.settings import Settings
 from app.core.container import Container
 from app.engine.engine import QuantEngine
 from app.market.models import Timeframe
+from app.research.rollback import ResearchRollbackMonitor
 
 from tests.unit.quant_helpers import make_candles
 
@@ -57,6 +58,12 @@ def _engine(market, symbols, *, candles_needed=100):
     engine._settings = settings
     engine._container = container
     engine._log = logging.getLogger("test")
+    # El motor se construye con `__new__` (sin `__init__`), asi que la vigilancia
+    # de rollback hay que ponerla a mano. Se deja desactivada: estas pruebas
+    # cubren el presupuesto y el ciclo, no el rollback (que tiene las suyas).
+    engine._research_rollback = ResearchRollbackMonitor(settings=settings.research.rollback)
+    engine._manage_latency_baseline = None
+    settings.research.rollback.enabled = False
     return engine
 
 

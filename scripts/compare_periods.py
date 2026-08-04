@@ -165,8 +165,10 @@ def main() -> None:
         raise SystemExit("Indica --cut o --last-hours.")
 
     scope = f" [{args.symbol.upper()}]" if args.symbol else ""
-    print(f"Journal{scope}: {len(rows)} operaciones  "
-          f"({rows[0]['_ts']:%Y-%m-%d %H:%M}  ->  {rows[-1]['_ts']:%Y-%m-%d %H:%M})")
+    print(
+        f"Journal{scope}: {len(rows)} operaciones  "
+        f"({rows[0]['_ts']:%Y-%m-%d %H:%M}  ->  {rows[-1]['_ts']:%Y-%m-%d %H:%M})"
+    )
     print(f"Corte: {cut:%Y-%m-%d %H:%M}")
 
     before = measure([r for r in rows if r["_ts"] < cut])

@@ -2,17 +2,20 @@
 
 import asyncio
 import logging
+from typing import Any
 
 from app import __version__
 from app.cache.service import CacheService
 from app.config.settings import Settings
 from app.core.container import Container
+from app.core.events.base import Event
 from app.core.events.bus import EventBus
 from app.core.events.events import SystemStarted, SystemStopping
 from app.core.lifecycle import Service
 from app.dashboard.api.service import ApiService
 from app.engine.evaluation import PerformanceTracker
 from app.engine.meta_governance import MetaGovernanceApplier
+from app.engine.startup_guard import verify_clean_startup
 from app.engine.state_manager import HistoryWriter
 from app.engine.strategy_engine import StrategyEngine
 from app.execution.api import ExecutionCore
@@ -26,6 +29,7 @@ from app.market.services import MarketDataService
 from app.market.storage import MarketDataWriter
 from app.ml.api import MLEngine
 from app.ml.notifications import MLNotifier
+from app.monitoring.events import MarketDataBlind, MarketDataRecovered, SignalDrought
 from app.monitoring.health import HealthMonitor
 from app.monitoring.pipeline_watch import PipelineWatchdog
 from app.monitoring.watchdog import Watchdog
@@ -37,7 +41,9 @@ from app.production.recovery import RecoveryService
 from app.production.safe_mode import SafeModeController, SafeModeObservation
 from app.research.api import ResearchLab
 from app.research.budget import evaluate_budget
+from app.research.events import ResearchCycleRolledBack
 from app.research.notifications import ResearchNotifier
+from app.research.rollback import ResearchRollbackMonitor
 from app.scheduler.scheduler import AsyncScheduler
 
 
@@ -54,6 +60,11 @@ class QuantEngine:
         self._container = container
         self._stop_event = asyncio.Event()
         self._log = logging.getLogger("app.engine")
+        # Vigilancia de rollback del ciclo autónomo de research. Se construye
+        # siempre (es barato y sin estado externo); sólo actúa si el ciclo está
+        # activo, que por defecto no lo está.
+        self._research_rollback = ResearchRollbackMonitor(settings=settings.research.rollback)
+        self._manage_latency_baseline: float | None = None
         # Orden de arranque: el bus primero (todos publican en él),
         # la API al final (expone lo ya construido). Apagado en orden inverso.
         self._services: list[Service] = [
@@ -135,10 +146,20 @@ class QuantEngine:
         return self._container
 
     async def start(self) -> None:
-        """Start every service in order and announce readiness."""
+        """Start every service in order and announce readiness.
+
+        Raises:
+            ContaminatedStartupError: Si el proceso arranca con instrumentación
+                de test o backtest activa en `paper`/`production`.
+        """
         self._log.info(
             "Starting Quant Engine v%s [%s]", __version__, self._settings.environment.value
         )
+        # Antes de levantar nada: el proceso no puede traer un reloj simulado ni
+        # instrumentación de test. Arrancar y operar con estado contaminado es
+        # lo que costó 4 días de ceguera silenciosa (ADR-091/095).
+        verify_clean_startup(self._settings)
+        self._watch_pipeline_alarms()
         for service in self._services:
             await service.start()
 
@@ -480,9 +501,15 @@ class QuantEngine:
         llegar tarde.
         """
         settings = self._settings.research
+        cpu_pct = self._current_cpu_pct()
+        # Antes del presupuesto: si el motor operativo se está degradando, el
+        # ciclo no se pospone — se **apaga**. Posponer dejaría el problema vivo
+        # para el disparo siguiente, y de madrugada nadie lo estaría mirando.
+        if await self._research_rollback_fired(cpu_pct):
+            return
         decision = evaluate_budget(
             settings.budget,
-            cpu_pct=self._current_cpu_pct(),
+            cpu_pct=cpu_pct,
             open_positions=self._open_position_count(),
         )
         if not decision.allowed:
@@ -547,6 +574,79 @@ class QuantEngine:
                 summary.get("generated", 0),
                 summary.get("qualified", 0),
             )
+
+    def _watch_pipeline_alarms(self) -> None:
+        """Feed the ciego/mudo alarms into the research rollback monitor.
+
+        El motor ciego o mudo es la degradación más grave que hay. No hace falta
+        demostrar que la causó el research: con el motor sin operar, apagar el
+        laboratorio no cuesta nada y puede ser justo lo que hacía falta.
+        """
+        bus = self._container.resolve(EventBus)
+        monitor = self._research_rollback
+
+        async def on_pipeline_event(event: Event) -> None:
+            if isinstance(event, MarketDataBlind):
+                monitor.on_pipeline_alarm("market_data_blind")
+            elif isinstance(event, MarketDataRecovered):
+                monitor.on_pipeline_recovered("market_data_blind")
+            elif isinstance(event, SignalDrought):
+                monitor.on_pipeline_alarm("signal_drought")
+
+        for event_type in (MarketDataBlind, MarketDataRecovered, SignalDrought):
+            bus.subscribe(on_pipeline_event, event_type)
+
+    async def _research_rollback_fired(self, cpu_pct: float | None) -> bool:
+        """Disable ``auto_cycle`` if the operating engine is degrading.
+
+        Args:
+            cpu_pct: Lectura de CPU ya obtenida (``None`` = sensor mudo).
+
+        Returns:
+            Si se desactivó el ciclo en esta pasada.
+        """
+        monitor = self._research_rollback
+        if monitor is None or not self._settings.research.rollback.enabled:
+            return False
+
+        latency = self._manage_latency()
+        triggers = monitor.evaluate(
+            cpu_pct=cpu_pct,
+            manage_ema_seconds=latency["ema_seconds"],
+            baseline_latency_seconds=self._manage_latency_baseline,
+            manage_passes=latency["passes"],
+        )
+        if not triggers:
+            # Sin degradación, la referencia se refresca: la línea base es lo
+            # que el bucle tarda cuando el sistema está sano, no un valor fijo.
+            ema = latency["ema_seconds"]
+            if (
+                ema is not None
+                and latency["passes"] >= self._settings.research.rollback.min_manage_passes
+            ):
+                self._manage_latency_baseline = ema
+            return False
+
+        # El toggle en memoria basta: el job lee `auto_cycle` en cada disparo y
+        # el scheduler ya no volverá a entrar aquí. Persistirlo en `.env` sería
+        # que el código se modifique a sí mismo la configuración del operador.
+        self._settings.research.auto_cycle = False
+        detail = "; ".join(f"{t.name}: {t.detail}" for t in triggers)
+        self._log.critical("Ciclo de research desactivado automáticamente — %s", detail)
+        await self._container.resolve(EventBus).publish(
+            ResearchCycleRolledBack(
+                source="engine",
+                triggers=tuple(t.name for t in triggers),
+                detail=detail,
+            )
+        )
+        return True
+
+    def _manage_latency(self) -> dict[str, Any]:
+        """Latencia del bucle de gestión de posiciones (vacía si no hay ejecución)."""
+        if not self._container.contains(ExecutionCore):
+            return {"passes": 0, "last_seconds": None, "ema_seconds": None}
+        return dict(self._container.resolve(ExecutionCore).engine.manage_latency)
 
     def _current_cpu_pct(self) -> float | None:
         """Host CPU usage, or ``None`` when it cannot be measured.

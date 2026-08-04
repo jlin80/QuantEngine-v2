@@ -54,6 +54,13 @@ def position_to_state(position: Position) -> dict[str, Any]:
         "highest_price": position.highest_price,
         "lowest_price": position.lowest_price,
         "decision_id": position.decision_id,
+        # La atribución y las señales de origen tienen que sobrevivir al
+        # reinicio: sin ellas la posición restaurada cae al holding global (en
+        # vez del suyo por estrategia) y la operación resultante llega al
+        # journal sin nada que unir con el evaluador continuo.
+        "signal_ids": list(position.signal_ids),
+        "strategy": position.strategy,
+        "strategy_category": position.strategy_category,
         "regime": position.regime,
         "score": position.score,
         "confidence": position.confidence,
@@ -95,6 +102,9 @@ def position_from_state(data: dict[str, Any]) -> Position:
         highest_price=float(data.get("highest_price", 0.0)),
         lowest_price=float(data.get("lowest_price", 0.0)),
         decision_id=data.get("decision_id"),
+        signal_ids=tuple(str(s) for s in data.get("signal_ids", ())),
+        strategy=str(data.get("strategy", "")),
+        strategy_category=str(data.get("strategy_category", "")),
         regime=str(data.get("regime", "unknown")),
         score=float(data.get("score", 0.0)),
         confidence=float(data.get("confidence", 0.0)),

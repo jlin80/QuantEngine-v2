@@ -893,3 +893,378 @@ servicios; avisa por Discord y publica en el bus. `settings.pipeline_watch`.
 
 **Tests.** 13 nuevos, incluido el escenario exacto del incidente (100% de
 descarte) y el del mercado cerrado, que no debe avisar. Suite: **879 en verde**.
+
+## 2026-08-04 — Bloque 8: cerrar el loop señal→ejecución (`signal_id` end-to-end)
+
+**Categoria:** feature · **Tags:** `ml` `trazabilidad` `evaluacion-continua` `join` `bloque-8`
+
+**Diagnostico.** La cadena estaba rota en menos sitios de los que parecia.
+`Decision.signals_considered` **ya** llevaba la tupla de `signal_id` desde la
+Fase 3; el corte estaba en `DecisionGenerated`, que no la publicaba, y en
+`PerformanceTracker._resolve`, que agregaba en `StrategyPerformance` y hacia
+`pop()` — descartando el resultado individual de cada senal. Son exactamente los
+dos huecos que el Bloque 4 dejo declarados, ni uno mas.
+
+**Propagacion.** `signal_ids` como campo en `DecisionGenerated` → `OrderRequest`
+→ `Position` → `TradeRecord`, con default vacio y `.get()` en `from_dict`: el
+journal anterior al bloque se sigue releyendo sin migracion. Mismo patron que la
+atribucion de estrategia del Bloque 1 — campo del evento, no acoplamiento.
+
+**Store por senal.** `VirtualOutcomeStore` (`app/engine/evaluation/outcomes.py`),
+append-only en `data/performance/virtual_outcomes.jsonl`, escritura por lotes
+(50) mas volcado en la cadencia del snapshot y al parar. Es opcional en el
+tracker: sin el, el evaluador se comporta como antes del bloque.
+
+**El join.** `app/ml/datasets/join.py`. Con varias senales por operacion toma la
+**media** de sus R: la decision es multi-estrategia por diseno y quedarse con
+una sola seria atribuir a una lo que votaron varias.
+
+**Lo que el join cambia de verdad.** La aproximacion por motivo de salida tenia
+un punto ciego estructural: **descartaba las operaciones que la ejecucion
+corto** (regimen, tiempo, kill switch) — justo el caso que habia que medir. El
+evaluador si las resuelve, contra precio posterior a la senal. Hay dos tests
+enfrentados que lo fijan: la misma operacion cortada por regimen entra al
+dataset con etiqueta positiva via join, y sigue descartandose sin el.
+
+**Tres casos sin match, contados.** `unmatched_legacy` (cae al camino antiguo;
+hoy es casi todo el historial), `unmatched_unresolved` (fuera de la etiqueta de
+senal, dentro de las de ejecucion) y `signal_without_trade` (senal filtrada o
+vetada por riesgo, con desglose por estrategia). En `join_breakdown`, con el
+mismo estandar que el `era_breakdown` del Bloque 4. `labelled_from_join` dice
+cuantas etiquetas vinieron de evidencia directa y cuantas de la aproximacion.
+
+**Bug preexistente cerrado de paso.** El snapshot de recuperacion
+(`app/production/recovery/snapshot.py`) no persistia `strategy` ni
+`strategy_category`: una posicion restaurada tras un reinicio perdia la
+atribucion del Bloque 1, caia al holding **global** en vez del suyo por
+estrategia, y su operacion llegaba al journal sin nada que unir. Test dedicado.
+
+**Arquitectura.** El ML declara su propio `SignalOutcome` y el composition root
+adapta el store, para no depender de `app.engine.evaluation` — misma regla que
+ADR-087. El saneamiento por era se aplica **despues** del join. Ningun camino
+hacia live.
+
+**Tests.** 19 nuevos. Suite: **898 en verde**; `ruff` + `black` + `mypy --strict`
+limpios. ADR-094. `docs/ml.md` reescrito: la seccion "Limitacion conocida
+(pendiente)" se sustituye por la metodologia nueva.
+
+**Pendiente que este bloque NO cierra.** El journal de produccion acumulado
+(1209 operaciones al 04/08) no tiene `signal_ids`: la trazabilidad completa
+empieza a acumularse desde el despliegue, no retroactivamente.
+
+## 2026-08-04 — Bloque 11: endurecer el despliegue (auditoria + guard de arranque)
+
+**Categoria:** feature+fix · **Tags:** `produccion` `aislamiento` `postmortem` `guard` `bloque-11`
+
+**Diagnostico.** El incidente del reloj fue el sintoma de que backtesting,
+research y motor en vivo comparten proceso, event loop y espacio de modulos. Se
+auditaron los patrones equivalentes; la tabla completa con veredicto por sitio
+esta en `docs/architecture.md` ("Riesgos de aislamiento de procesos").
+
+Resumen: el unico riesgo real equiparable es el `_LOOP` de
+`app/backtesting/quant_source.py` — un event loop en hilo daemon que el
+backtesting crea y **nunca cierra**. No corrompe estado del motor (el motor no
+lo usa), pero su presencia es evidencia de que un backtest corrio en el proceso,
+y el guard la aprovecha como senal. El `_buffer` de logging y el `_BACKGROUND`
+de `signal_engine` son el mismo patron con consecuencia inocua. El caso sin
+solucion a este nivel es `MetaTrader5`, que es singleton **de proceso** por
+diseno de la libreria: motor y backtest comparten terminal a la fuerza.
+
+**Sospecha investigada que resulto infundada.** `QuantCoreDecisionSource` corre
+su pipeline en otro hilo (`run_coroutine_threadsafe`), lo que sugeria que el
+reloj simulado no llegaria y que los backtests usarian hora de pared en
+silencio. Se comprobo empiricamente: **si llega** — `call_soon_threadsafe` copia
+el contexto del hilo llamante. Queda escrito para no repetir la sospecha.
+
+**Guard de arranque** (`app/engine/startup_guard.py`, ADR-095), invocado al
+principio de `QuantEngine.start()`. Tres comprobaciones: desviacion del reloj
+efectivo vs. el de pared, instrumentacion de test cargada (`pytest` en
+`sys.modules` / `PYTEST_CURRENT_TEST`) y event loop de backtesting ya activo.
+
+**Aborta, no degrada.** Un warning habria devuelto el modo de fallo del
+incidente: operar mal en silencio mientras todo figura `running`. Un motor que
+no arranca se ve en el primer minuto; uno ciego tardo cuatro dias.
+
+**Solo vigila `paper` y `production`.** En `development`/`testing` la
+instrumentacion de test es lo normal —la propia suite arranca el motor— y
+abortar alli convertiria el guard en un estorbo; un guard que estorba se acaba
+desactivando. Informa y no bloquea. Hay test de las dos mitades, incluido el de
+que un arranque limpio **no** se bloquea: el fallo esperable de un guard asi es
+el falso positivo.
+
+**Lo que el guard no puede hacer.** Enumerar monkeypatch en tiempo de ejecucion.
+Por eso detecta el **entorno que los produce**, no los parches.
+
+**Linux + Docker vs Windows (punto 3) — respuesta corta: no migrar ahora.** El
+incidente fue estado compartido dentro de un unico proceso Python; eso ocurre
+igual en Linux y en Docker, que aislan entre contenedores, no dentro de uno.
+Migrar no lo habria cortado. Ademas la dependencia MT5↔Windows convierte la
+migracion en un cambio de broker encubierto — decision de capital, no tecnica.
+El beneficio buscado (aislar backtest del motor) sale mas barato con la opcion
+recomendada: **backtest/research en proceso hijo**, propuesta y documentada sin
+implementar, como pedia el bloque.
+
+**Tests.** 10 nuevos. Suite: **908 en verde**; `ruff` + `black` + `mypy --strict`
+limpios. ADR-095 y seccion de auditoria en `docs/architecture.md`.
+
+**No se toco `qevps`.**
+
+## 2026-08-04 — Bloque 10: Research Lab listo para activar (sin activar)
+
+**Categoria:** feature · **Tags:** `research` `rollback` `activacion-gradual` `bloque-10`
+
+**Punto 1 — que cambio desde el Bloque 6.** El Research Lab **no** causo el
+incidente del reloj (fue el `BacktestLab`), pero corre sobre el mismo mecanismo:
+`ResearchLab` → `CandidatePipeline` → `BacktestLab`, mismo proceso, mismo event
+loop, mismo reloj inyectable. Con el global anterior a ADR-091, activar
+`auto_cycle` habria pasado la exposicion a esa fuga de "una vez, manual, con
+alguien mirando" a "una vez al dia, a las 02:00 UTC, sin nadie delante". Es
+defendible ahora porque ADR-091 elimina la fuga, ADR-093 la haria visible en
+media hora y ADR-095 impide arrancar contaminado — de ahi el orden 11 antes que
+10.
+
+**Punto 2 — plan de activacion en tres fases** (`docs/research.md`): A (1
+simbolo × 6 genomas, ventana 02:00-03:00, 7 dias), B (2 × 12, ventana completa,
+7 dias), C (pleno). Lo que se busca en la Fase A no es que el research produzca
+algo util, sino **medir el consumo real** — el dato que falta desde el Bloque 6,
+donde el analisis es una estimacion de orden de magnitud, no una medicion.
+
+**Criterio de aceptacion: rollback automatico** (`app/research/rollback.py`,
+ADR-096). Cuatro disparadores: CPU sostenida (>85% en 3 muestras — un pico
+durante un ciclo de research es lo esperado, disparar con el primero apagaria la
+vigilancia en el primer ciclo que hiciera su trabajo), latencia del bucle de
+gestion (>2× su propia referencia), desviacion del reloj (>5s) y alarmas de
+pipeline activas.
+
+**Hubo que instrumentar algo que no se media.** La latencia del bucle de gestion
+de posiciones — el unico que no puede llegar tarde — no tenia ninguna metrica.
+Sin ella no habia forma de saber si algo le estaba robando CPU.
+`ExecutionEngine.manage_latency` (ultima + EMA) es nuevo.
+
+**Asimetria deliberada.** El rollback solo apaga el laboratorio: nunca toca la
+operativa, no cierra posiciones y no puede habilitar live. Ante la duda se
+sacrifica el research, que cuesta un ciclo de generacion y no dinero. **No se
+rearma solo**: reactivar es decision humana, porque un rollback reversible
+automaticamente convierte un problema persistente en un ciclo de
+encendido/apagado, mas dificil de diagnosticar que el fallo.
+
+**Punto 3 respetado: no se activa nada.** `auto_cycle` sigue en `false`, con
+test. La vigilancia de rollback si viene activada por defecto — al reves que el
+ciclo: una salvaguarda no deberia requerir que la enciendan.
+
+**Punto 4 intacto.** `PromotionManager` fail-closed sin tocar: ninguna
+estrategia generada opera contra capital sin aprobacion humana, por muchas fases
+que se completen.
+
+**Detalle de calidad.** Hay un test que exige que los umbrales documentados en
+el plan sean los configurados en el codigo: un plan que diverge del codigo no
+vale nada.
+
+**Tests.** 20 nuevos. Suite: **928 en verde**; `ruff` + `black` + `mypy --strict`
+limpios. ADR-096 y plan completo en `docs/research.md`.
+
+**No se toco `qevps`.**
+
+## 2026-08-04 — Bloque 12: criterios de graduacion a live, y el gap real medido
+
+**Categoria:** feature+hallazgo · **Tags:** `live` `criterios` `journal` `paper` `bloque-12`
+
+**Punto 1 — criterios formalizados** en `app/production/live/graduation.py`
+(ADR-097): muestra >=400, expectativa >=+0.10R, profit factor >=1.30, drawdown
+<=15%, >=60 dias en paper, >=3 regimenes con >=30 operaciones cada uno, y un
+septimo que **no estaba en el enunciado**: salidas forzadas <=50%.
+
+**Punto 2 — el gap, medido contra el journal REAL de produccion.** Traido de
+`qevps` por SSH (solo lectura, con tu autorizacion explicita): 1209 operaciones,
+2026-07-23 → 2026-08-04.
+
+| Criterio | Objetivo | Real (todo) | Real (post-Bloque-1, 08-04) |
+| --- | --- | --- | --- |
+| Muestra | >=400 | 1209 ✅ | 134 ❌ |
+| Expectativa | >=+0.10R | **-0.078R** ❌ | **-0.101R** ❌ |
+| Profit factor | >=1.30 | **0.75** ❌ | **0.65** ❌ |
+| Drawdown | <=15% | 27.6% ❌ | 4.6% ✅ |
+| Dias en paper | >=60 | 11.8 ❌ | 0.4 ❌ |
+| Regimenes | >=3 | 4 ✅ | 3 ✅ |
+| Salidas forzadas | <=50% | **75.6%** ❌ | **81.3%** ❌ |
+
+**El hallazgo, sin adornos: la expectativa es negativa en TODAS las eras.**
+-0.140R (pre_contract_size), -0.097R (pre_trailing), -0.062R (post_fixes),
+-0.101R (08-04). PnL acumulado **-137.59** con drawdown maximo de 138.10 — el
+equity nunca supero su punto de partida. No es que falte muestra: es que **hoy
+no hay edge que graduar**. El gap no se cierra esperando.
+
+**Aviso sobre los costes.** Las comisiones registradas suman **0.00** en las
+1209 operaciones. El resultado real esta por tanto *sobrestimado*: en real hay
+comision y swap. La expectativa verdadera es peor que la medida.
+
+**Dato que afecta al Bloque 7.1 (falsacion del Bloque 1).** Comparando lo
+anterior al 04/08 con el dia del despliegue:
+
+| | antes 08-04 (n=1075) | 08-04 (n=134) |
+| --- | --- | --- |
+| `take_profit` | 4.2% | 5.2% |
+| `regime_change` | 66.7% | **72.4%** |
+| Duracion mediana | 411s | **773s** |
+| Expectativa | -0.075R | **-0.101R** |
+
+El **mecanismo del Bloque 1 funciona**: la duracion mediana casi se dobla, que
+es exactamente lo que el cambio pretendia. Pero las otras dos predicciones no
+acompanan — `regime_change` **subio** en vez de bajar, y la expectativa empeoro.
+
+**No declaro falsado el Bloque 1**: son 134 operaciones de un solo dia, la
+ventana de falsacion (48h) no ha cerrado, y un dia de mercado puede explicarlo.
+Pero la lectura preliminar **no muestra la mejora predicha**, y conviene saberlo
+antes de que el veredicto automatico llegue. La hipotesis de fondo ("cortamos
+las tesis antes de tiempo") puede necesitar revision: con el 72% de las salidas
+decididas por regimen, alargar el holding no basta si el filtro de regimen sigue
+cerrando igual.
+
+**Churn del oro (7.2) sigue pendiente, y ahora se por que:** el oro **no opero
+ni una vez el 04/08** (194 operaciones antes, 0 despues). No hay dato
+post-cambio que medir. No es olvido ni falta de instrumento.
+
+**Punto 3 — no activa nada.** El modulo no importa el `LiveGate`, no toca
+`allow_live` y no tiene camino a `resolved_mode()`. Hay un test que construye un
+historial que cumple **los siete** criterios y comprueba que despues
+`resolved_mode()` sigue en `paper` y `allow_live` en `False`. El propio informe
+lo dice por escrito: un informe que parece una aprobacion acabaria usandose como
+tal.
+
+**Punto 4 — ADR-097** con los umbrales y el razonamiento de cada uno.
+
+**Tests.** 14 nuevos. Suite: **942 en verde**; `ruff` + `black` + `mypy --strict`
+limpios. Herramienta: `python scripts/graduation_gap.py <journal.jsonl>`.
+
+**El journal de produccion NO se copio al repo** (esta en el scratchpad de la
+sesion): son datos de operativa, no codigo.
+
+## 2026-08-04 — Bloque 13: hitos de capital derivados, no afirmados
+
+**Categoria:** docs+feature · **Tags:** `sizing` `capital` `universo` `bloque-13`
+
+**Diagnostico.** El Bloque 7.3 ya documento los hitos (~$1k / ~$2-5k / ~$20k) y
+el punto de fondo (el tope alto expresa **granularidad del broker**, no apetito
+de riesgo). Lo que faltaba, y es lo que pedia este bloque, es la **formula**:
+sin ella los umbrales son numeros afirmados y hay que reinvestigarlos cada vez
+que cambie el broker, el simbolo o el precio.
+
+**Punto 1 — la formula.**
+
+```
+nocional_lote_minimo = volume_min x contract_size x precio
+equity necesario para un tope = nocional_lote_minimo / (tope / 100)
+```
+
+El numerador lo fijan el broker y el mercado; el denominador crece con la
+cuenta. **El tope no deja de ser necesario poco a poco: deja de serlo en un
+punto concreto y calculable.**
+
+La derivacion reproduce los hitos que estaban afirmados. El "~$20k para el oro"
+no era intuicion: es $4.083 / 0.20 = **$20.414**.
+
+| Simbolo | Nocional lote min. | @$200 | @$1k | @$5k | @$20k |
+| --- | --- | --- | --- | --- | --- |
+| ETHUSDm | ~$195 | 97% | 19% | 4% | 1% |
+| USTECm | ~$281 | 140% | 28% | 6% | 1% |
+| BTCUSDm | ~$650 | 325% | 65% | 13% | 3% |
+| XAUUSDm | ~$4.083 | 2041% | 408% | 82% | **20%** |
+
+**Punto 3 — checklist por hito** en `docs/architecture.md`, accionable linea a
+linea, para no repetir la auditoria manual del 23/07 y del 27/07. Incluye un
+detalle que no estaba: `max_correlation_exposure_pct` (800%) con equity pequeno
+**nunca se ha activado de verdad**, asi que su grupo de correlacion cripto
+conviene revisarlo *antes* de que el limite empiece a morder, no despues.
+
+**La tabla es verificable, no prosa.** 11 tests derivan los hitos desde
+`InstrumentSpec`: cuando cambie el broker, el `contract_size` o el precio de
+referencia, la tabla documentada y los numeros divergiran y alguien se enterara.
+Mismo criterio que en los Bloques 10 y 12.
+
+**Punto 2 — universo de simbolos.** Hoy son **4 simbolos, y no por eleccion**:
+Exness demo deshabilita las altcoins (`trade_mode=0`), descarta `BTCUSDTm` y
+`USTEC_x100m` sin cotizacion y `ETHBTCm` por `contract_size=100`. De los 4, el
+oro esta apagado. **Operativa real: 3 simbolos, dos de ellos altamente
+correlacionados (BTC y ETH)** — por eso `max_correlation_exposure_pct` es casi
+decorativo: el universo entero esta correlacionado.
+
+Con feed/ejecucion nativa de exchange (enlaza con el Bloque 9): diversificacion
+real con altcoins de regimen distinto al de BTC, y granularidad ordenes de
+magnitud mejor — el problema de este bloque entero **practicamente desaparece**.
+El oro no aplica: no hay XAU en un exchange cripto.
+
+**No es una recomendacion de cambiar de broker** — es decision de capital, y
+seria prematura mientras la expectativa siga negativa (ADR-097). Es el dato para
+cuando esa decision se plantee: **el techo de diversificacion actual no es del
+motor, es del broker.**
+
+**Tests.** 11 nuevos. Suite: **953 en verde**; `ruff` + `black` + `mypy --strict`
+limpios. Sin ningun cambio operativo aplicado: no se toco ningun tope, ni el
+toggle del oro, ni el broker.
+
+## 2026-08-04 — Bloque 9: order flow nativo — informe (y una correccion del diagnostico)
+
+**Categoria:** hallazgo+docs · **Tags:** `order-flow` `microestructura` `mt5` `informe` `bloque-9`
+
+**El diagnostico del enunciado era optimista, y hay que corregirlo.** La premisa
+era que el order flow corre sobre el feed de MT5 y por eso sale "aproximado". La
+auditoria del codigo dice algo mas fuerte: **con MT5 no esta aproximado, esta
+ausente.**
+
+- `_CAPABILITIES` del proveedor MT5 = `{TICKER, TRADES, CANDLES}` — sin
+  `ORDERBOOK`. Y pese a declarar `TRADES`, `_poll_once` solo emite `Ticker`,
+  nunca `Trade`: `get_recent_trades()` devuelve vacio para todo simbolo MT5.
+- Efecto: `imbalance`, `book_pressure`, `spoofing_score`, `iceberg_score` y
+  `consumption` son `None`/`0`; `delta`, `CVD`, `aggression`, `absorption` y
+  `exhaustion` se calculan sobre lista vacia.
+- El `volume` de las velas MT5 es `tick_volume` (cambios de precio, no tamano
+  negociado) y `trades` reutiliza ese mismo numero.
+
+**Confirmacion empirica en el journal real:** de 1209 operaciones, **cero** de
+`delta`, `cvd` u `order_book_imbalance`. Las tres estrategias puras de order
+flow nunca han disparado en produccion. Las que si operan son SMC estructural,
+que se calcula sobre OHLC y no depende del libro. Diagnostico afinado: **SMC
+estructural esta bien servido por MT5; el order flow no esta servido.**
+
+**Punto 2 — desincronizacion medida, no estimada.** Compare el precio de entrada
+de cada operacion contra el cierre del minuto en Binance spot:
+
+| Par | n | Sesgo medio | Desv. mediana | p95 | Max |
+| --- | --- | --- | --- | --- | --- |
+| BTCUSDm vs BTCUSDT | 294 | −11.0 bps | 10.9 bps | 17.7 bps | 33.9 bps |
+| ETHUSDm vs ETHUSDT | 464 | −9.8 bps | 9.8 bps | 20.2 bps | 35.4 bps |
+
+El CFD cotiza ~10 bps por debajo del spot, de forma **estable** (la mediana
+coincide con el sesgo medio: es offset, no ruido). Irrelevante para senales de
+order flow, que son diferenciales; **relevante para niveles y ejecucion**, que
+deben seguir usando siempre el precio del broker. El modo dual es viable solo
+con esa separacion limpia.
+
+**Punto 3 — no lo hice, y explico por que.** Comparar la tasa de falsas senales
+MT5 vs libro nativo no tiene sentido: con MT5 el brazo "antes" es el conjunto
+vacio. No hay 0 senales buenas contra N malas; hay **0 senales**. Lo medible
+seria una evaluacion desde cero del order flow nativo, que exige el backfill de
+libro pendiente desde la Fase 2 — la parte cara del bloque, y el resultado no
+cambiaria la recomendacion. Averiguarlo costo menos que hacerlo.
+
+**Punto 5 — recomendacion: no es prioritario, y no por el motivo esperado.** No
+es que el dato aproximado baste. Es que **hoy no hay order flow y el motor
+pierde dinero con las estrategias que si funcionan**: expectativa negativa en
+todas las eras y 75% de salidas decididas por la ejecucion (ADR-097). Anadir una
+familia de estrategias nueva a un motor cuya ejecucion destruye el edge de las
+que ya tiene es optimizar en el orden equivocado. El order flow nativo no
+arregla que el 72% de las posiciones se cierren por regimen.
+
+**Lo que si recomiendo y es gratis:** desactivar `delta`, `cvd` y
+`order_book_imbalance` mientras la fuente sea MT5, y documentar que requieren un
+proveedor con libro. Una estrategia inerte que figura como activa es deuda de
+honestidad, no de rendimiento. **No lo aplico**: apagar estrategias es tu
+decision (misma regla que el Bloque 2).
+
+**Cuando reabrir esto:** cuando la expectativa sea positiva y estable con las
+estrategias actuales. Ademas, el mismo movimiento resolveria el techo de
+diversificacion y el problema de granularidad del Bloque 13.
+
+**Sin codigo de produccion**, como pedia el bloque: no se cambio el ruteo, no se
+toco ningun proveedor, no se activo nada. Informe completo en
+`docs/orderflow_nativo.md`.

@@ -705,6 +705,13 @@ class QuantEvaluationSettings(BaseModel):
     r_history_limit: int = 500
     snapshot_path: Path = _PROJECT_ROOT / "data" / "performance" / "strategy_stats.json"
     snapshot_interval_seconds: float = 300.0
+    # Resultado virtual **por señal** (Bloque 8). El snapshot de arriba guarda
+    # el agregado por estrategia, que no permite unir fila a fila con el Trade
+    # Journal: sin esto, la calidad de la señal sólo se puede aproximar desde
+    # el motivo de salida de la operación ejecutada.
+    outcomes_path: Path = _PROJECT_ROOT / "data" / "performance" / "virtual_outcomes.jsonl"
+    persist_outcomes: bool = True
+    outcomes_flush_size: int = 50
 
 
 class QuantSettings(BaseModel):
@@ -1525,6 +1532,37 @@ class ResearchBudgetSettings(BaseModel):
     skip_if_positions_open: bool = True
 
 
+class ResearchRollbackSettings(BaseModel):
+    """Umbrales que **apagan** el ciclo autónomo si el motor operativo se degrada.
+
+    El presupuesto decide si el ciclo puede *arrancar*; esto decide si hay que
+    *apagarlo*. Son preguntas distintas: la primera mira el estado previo y su
+    peor caso es posponer un ciclo; la segunda mira el efecto sobre el motor y
+    su peor caso es haber estado degradando la operativa sin que nadie lo note.
+
+    Sólo apaga el laboratorio. Nunca toca la operativa ni puede habilitar live:
+    ante la duda, el que se sacrifica es el research.
+
+    **No se rearma solo**: reactivar `auto_cycle` es una decisión humana. Un
+    rollback reversible automáticamente convertiría un problema persistente en
+    un ciclo de encendido/apagado, más difícil de diagnosticar que el fallo.
+    """
+
+    enabled: bool = True
+    # CPU sostenida, no un pico: un pico aislado durante un ciclo de research es
+    # exactamente lo esperado, y disparar con él haría la vigilancia inútil.
+    max_cpu_pct: float = 85.0
+    cpu_breaches_before_rollback: int = 3
+    # El bucle de gestión de posiciones es el único que no puede llegar tarde.
+    # Se compara contra su propia referencia, no contra un absoluto: lo que
+    # importa es la degradación relativa, no el número de milisegundos.
+    max_manage_latency_ratio: float = 2.0
+    # Con muestra escasa no se juzga la latencia: comparar contra una línea base
+    # que no existe es cómo se fabrican los falsos positivos.
+    min_manage_passes: int = 30
+    max_clock_skew_seconds: float = 5.0
+
+
 class ResearchSettings(BaseModel):
     """Quant Research Lab (Fase 10): investiga, valida y promueve estrategias.
 
@@ -1535,6 +1573,9 @@ class ResearchSettings(BaseModel):
     """
 
     enabled: bool = False
+    # Punto 4 del Bloque 6 y punto 3 del Bloque 10: el ciclo queda cableado,
+    # presupuestado y con rollback automático, pero **apagado**. Activarlo es
+    # una decisión del operador, no del código. Hay un test que lo fija.
     # Ciclo autónomo de generación: sin esto el laboratorio existía pero **nada
     # lo disparaba** (experiments=0 indefinidamente), porque sólo se registraba
     # el notificador en el scheduler y nunca el laboratorio en sí.
@@ -1566,6 +1607,7 @@ class ResearchSettings(BaseModel):
     shadow: ShadowModeSettings = Field(default_factory=ShadowModeSettings)
     promotion: PromotionSettings = Field(default_factory=PromotionSettings)
     budget: ResearchBudgetSettings = Field(default_factory=ResearchBudgetSettings)
+    rollback: ResearchRollbackSettings = Field(default_factory=ResearchRollbackSettings)
 
 
 class Settings(BaseSettings):

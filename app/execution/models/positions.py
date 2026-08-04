@@ -48,6 +48,9 @@ class Position:
         mark_price: Último precio de valoración conocido.
         exit_reason: Motivo de cierre.
         decision_id: Decisión de origen.
+        signal_ids: Señales que originaron esa decisión, para unir la operación
+            con el resultado virtual del evaluador continuo. Vacías en
+            posiciones adoptadas del broker al arrancar.
         regime: Régimen de mercado al abrir.
         strategy: Estrategia dominante de la decisión de origen ("" si no se
             pudo atribuir). Determina el holding mínimo por estrategia.
@@ -81,6 +84,7 @@ class Position:
     lowest_price: float = 0.0
     exit_reason: ExitReason | None = None
     decision_id: str | None = None
+    signal_ids: tuple[str, ...] = ()
     regime: str = "unknown"
     strategy: str = ""
     strategy_category: str = ""
@@ -184,6 +188,7 @@ class Position:
             "trailing_active": self.trailing_active,
             "exit_reason": self.exit_reason.value if self.exit_reason else None,
             "decision_id": self.decision_id,
+            "signal_ids": list(self.signal_ids),
             "regime": self.regime,
             "strategy": self.strategy,
             "strategy_category": self.strategy_category,

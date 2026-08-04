@@ -222,6 +222,7 @@ class DecisionEngine:
                 summary=decision.explanation[0] if decision.explanation else "",
                 strategy=decision.primary_strategy,
                 strategy_category=decision.primary_category,
+                signal_ids=decision.signals_considered,
             )
         )
         self._log.info(

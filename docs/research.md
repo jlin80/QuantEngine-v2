@@ -183,3 +183,89 @@ motivo para pagar ese coste antes de tener la primera evidencia.
 La promoción de cualquier estrategia generada **sigue exigiendo aprobación
 explícita** (PromotionManager fail-closed): nada de esto cambia con el ciclo
 activado.
+
+## Activación del ciclo autónomo (`auto_cycle`) — plan gradual
+
+> **Estado: `auto_cycle = false`.** Todo lo de esta sección está implementado y
+> probado, pero **el ciclo sigue apagado**. Activarlo es una decisión del
+> operador, no del código. Hay un test que lo fija.
+
+### Qué cambió desde el Bloque 6: el incidente del reloj
+
+El Bloque 10 pregunta si el Research Lab pudo contribuir al incidente del
+2026-07-31. **No lo causó** —fue el `BacktestLab`— pero la respuesta honesta es
+incómoda: **corre sobre el mismo mecanismo**. `ResearchLab` →
+`CandidatePipeline` → `BacktestLab`, mismo proceso, mismo event loop, mismo
+reloj inyectable.
+
+Con el reloj en un global de módulo (el estado anterior a ADR-091), activar
+`auto_cycle` no habría sido neutral: habría pasado la exposición a esa fuga de
+"una vez, manual, con alguien mirando" a **una vez al día, automática, a las
+02:00 UTC, sin nadie delante**. El incidente tardó 4 días en detectarse con un
+disparo manual.
+
+Qué ha cambiado, y por qué ahora es defendible:
+
+- **ADR-091** — el reloj vive en un `ContextVar`: la fuga ya no puede ocurrir.
+- **ADR-093** — alarmas de ciego/mudo: si el motor deja de operar por lo que
+  sea, se sabe en media hora, no en cuatro días.
+- **ADR-095** — guard de arranque: el motor no arranca contaminado.
+- **Rollback automático** (abajo) — si el ciclo degrada la operativa, se apaga.
+
+**Recomendación: no activar sin el guard de arranque desplegado.** Es el orden
+en el que se implementaron a propósito (Bloque 11 antes que el 10).
+
+### Umbrales de rollback automático
+
+`settings.research.rollback` (activo por defecto — al revés que el ciclo: una
+salvaguarda no debería requerir que la enciendan). Si alguno dispara durante un
+ciclo, `auto_cycle` pasa a `false`, se publica `ResearchCycleRolledBack` y se
+avisa por Discord.
+
+| Disparador | Umbral | Por qué así |
+| --- | --- | --- |
+| CPU sostenida | >85 % en 3 muestras consecutivas | Un pico durante un ciclo de research **es lo esperado**. Disparar con el primero apagaría la vigilancia en el primer ciclo que hiciera su trabajo. |
+| Latencia del bucle de gestión | >2× su propia referencia | Es el único bucle que no puede llegar tarde. Se compara contra su línea base, no contra un absoluto: importa la degradación relativa, no los milisegundos. Requiere ≥30 pasadas — comparar contra una base que no existe fabrica falsos positivos. |
+| Desviación del reloj | >5 s | La causa exacta del incidente, vigilada también desde aquí. |
+| Alarma de pipeline | `MarketDataBlind` o `SignalDrought` activa | Con el motor sin operar el laboratorio no tiene prioridad. No hace falta demostrar que el research lo causó: apagarlo no cuesta nada. |
+
+**Sólo apaga el laboratorio.** Nunca toca la operativa, no cierra posiciones y
+no puede habilitar live. Ante la duda, el que se sacrifica es el research.
+
+**No se rearma solo.** Reactivar es una decisión humana, tras mirar la causa. Un
+rollback reversible automáticamente convertiría un problema persistente en un
+ciclo de encendido/apagado, más difícil de diagnosticar que el fallo original.
+
+**Es en memoria, no toca el `.env`.** El job lee `auto_cycle` en cada disparo,
+así que basta para que no vuelva a entrar. Persistirlo sería que el código se
+reescriba la configuración del operador.
+
+### Plan de activación en tres fases
+
+Cada fase tiene un criterio de paso explícito. Lo que se busca en la Fase A no
+es que el research produzca algo útil, sino **medir el consumo real** — el dato
+que falta desde el Bloque 6, donde el análisis es una estimación de orden de
+magnitud, no una medición en la VPS.
+
+| | Presupuesto | Ventana | Duración | Criterio para pasar |
+| --- | --- | --- | --- | --- |
+| **A** | 1 símbolo × 6 genomas | 02:00-03:00 UTC | 7 días | Ningún rollback disparado; latencia del bucle de gestión sin degradación medible; consumo real dentro de lo estimado. |
+| **B** | 2 símbolos × 12 genomas | 01:00-05:00 UTC | 7 días | Igual que A, más: los candidatos generados llegan a `CandidateStore` sin errores. |
+| **C** | Presupuesto pleno | 01:00-05:00 UTC | permanente | — |
+
+Ante cualquier rollback, se vuelve a la fase anterior; no se sube hasta
+entender qué lo disparó.
+
+**La promoción no cambia en ninguna fase.** `PromotionManager` sigue
+fail-closed: ninguna estrategia generada opera contra capital sin tu aprobación
+explícita, por muchas fases que se completen.
+
+### Para activar la Fase A
+
+```
+QE_RESEARCH__AUTO_CYCLE=true
+QE_RESEARCH__BUDGET__MAX_SYMBOLS_PER_RUN=1
+QE_RESEARCH__BUDGET__MAX_GENERATED_PER_RUN=6
+QE_RESEARCH__BUDGET__WINDOW_START_HOUR_UTC=2
+QE_RESEARCH__BUDGET__WINDOW_END_HOUR_UTC=3
+```

@@ -122,6 +122,7 @@ class PositionManager:
         stop_loss: float | None,
         take_profit: float | None,
         decision_id: str | None = None,
+        signal_ids: tuple[str, ...] = (),
         regime: str = "unknown",
         strategy: str = "",
         strategy_category: str = "",
@@ -138,6 +139,7 @@ class PositionManager:
             stop_loss: Stop inicial.
             take_profit: Objetivo inicial.
             decision_id: Decisión de origen.
+            signal_ids: Señales que originaron esa decisión.
             regime: Régimen al abrir.
             strategy: Estrategia dominante de la decisión.
             strategy_category: Categoría de esa estrategia.
@@ -164,6 +166,7 @@ class PositionManager:
             mark_price=fill.price,
             commission_paid=fill.commission,
             decision_id=decision_id,
+            signal_ids=signal_ids,
             regime=regime,
             strategy=strategy,
             strategy_category=strategy_category,

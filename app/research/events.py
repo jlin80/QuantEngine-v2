@@ -140,6 +140,19 @@ def metric_fields(metrics: dict[str, float], keys: tuple[str, ...]) -> dict[str,
     return {key: f"{metrics[key]:.3f}" for key in keys if key in metrics}
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class ResearchCycleRolledBack(Event):
+    """El ciclo autónomo se desactivó solo porque el motor operativo se degradó.
+
+    No se rearma solo: volver a activarlo es una decisión humana. Un rollback
+    reversible automáticamente convertiría un problema persistente en un ciclo
+    de encendido/apagado, más difícil de diagnosticar que el fallo original.
+    """
+
+    triggers: tuple[str, ...]
+    detail: str = ""
+
+
 __all__ = [
     "CandidateFailed",
     "CandidateQualified",
@@ -149,6 +162,7 @@ __all__ = [
     "FeatureValidated",
     "OptimizationCompleted",
     "RankingUpdated",
+    "ResearchCycleRolledBack",
     "ResearchFailed",
     "ShadowReportReady",
     "StrategyGenerated",

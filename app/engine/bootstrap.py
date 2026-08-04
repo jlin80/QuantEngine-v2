@@ -23,7 +23,7 @@ from app.documentation.service import DocumentationService
 from app.engine.confidence import ConfidenceEngine
 from app.engine.consensus import ConsensusEngine
 from app.engine.decision_engine import DecisionEngine
-from app.engine.evaluation import PerformanceTracker
+from app.engine.evaluation import PerformanceTracker, VirtualOutcomeStore
 from app.engine.feature_store import FeatureStore
 from app.engine.filters import build_filter_chain
 from app.engine.market_context import MarketContextEngine
@@ -63,6 +63,7 @@ from app.market.storage import MarketDataWriter
 from app.market.stream import FeedMetrics, WebSocketManager
 from app.market.validator import DataValidator
 from app.ml.api import MLEngine
+from app.ml.datasets import SignalOutcome
 from app.ml.notifications import MLNotifier
 from app.ml.services import VirtualStrategyStats
 from app.monitoring.health import HealthMonitor
@@ -397,7 +398,15 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
     container.register_instance(HistoryWriter, history_writer)
 
     # Evaluación continua (Fase 4): resultado virtual de cada señal.
-    tracker = PerformanceTracker(quant.evaluation, market_service)
+    # El store (Bloque 8) conserva ese resultado fila a fila, indexado por
+    # `signal_id`, que es lo que permite unirlo después con el Trade Journal.
+    outcomes = VirtualOutcomeStore(
+        quant.evaluation.outcomes_path,
+        persist=quant.evaluation.persist_outcomes,
+        flush_size=quant.evaluation.outcomes_flush_size,
+    )
+    container.register_instance(VirtualOutcomeStore, outcomes)
+    tracker = PerformanceTracker(quant.evaluation, market_service, outcomes)
     container.register_instance(PerformanceTracker, tracker)
 
     # El sink reparte cada señal resuelta a persistencia batched Y al
@@ -779,11 +788,23 @@ def _build_ml(container: Container, settings: Settings, bus: EventBus) -> None:
     )
     virtual_stats_provider = (lambda: _virtual_stats(tracker)) if tracker is not None else None
 
+    # Tercera fuente, y la más fina (Bloque 8): el resultado virtual de cada
+    # señal, no el agregado por estrategia. Es lo que permite unir cada
+    # operación con la resolución de su propia señal. Se adapta aquí por la
+    # misma razón que la anterior.
+    outcome_store = (
+        container.resolve(VirtualOutcomeStore) if container.contains(VirtualOutcomeStore) else None
+    )
+    signal_outcomes_provider = (
+        (lambda: _signal_outcomes(outcome_store)) if outcome_store is not None else None
+    )
+
     engine = MLEngine(
         settings,
         bus=bus,
         trades_provider=trades_provider,
         virtual_stats_provider=virtual_stats_provider,
+        signal_outcomes_provider=signal_outcomes_provider,
     )
     container.register_instance(MLEngine, engine)
 
@@ -806,6 +827,25 @@ def _build_ml(container: Container, settings: Settings, bus: EventBus) -> None:
                 enabled=settings.ml.meta.apply_governance,
             ),
         )
+
+
+def _signal_outcomes(store: VirtualOutcomeStore) -> dict[str, SignalOutcome]:
+    """Adapt the per-signal virtual outcomes to the ML layer's shape.
+
+    Se relee el fichero en cada llamada a propósito: el dataset se construye en
+    el entrenamiento nocturno, no en el camino caliente, y un índice cacheado
+    quedaría desactualizado justo respecto a las señales más recientes — que
+    son las que interesan.
+    """
+    return {
+        signal_id: SignalOutcome(
+            signal_id=signal_id,
+            strategy=outcome.strategy,
+            r_multiple=outcome.r_multiple,
+            outcome=outcome.outcome,
+        )
+        for signal_id, outcome in store.index().items()
+    }
 
 
 def _virtual_stats(tracker: PerformanceTracker) -> dict[str, VirtualStrategyStats]:

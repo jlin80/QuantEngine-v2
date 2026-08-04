@@ -23,7 +23,13 @@ from app.core.events.bus import EventBus
 from app.core.exceptions import InsufficientDataError, MLError
 from app.execution.models.trades import TradeRecord
 from app.ml.auto_ml import AutoML, AutoMLResult
-from app.ml.datasets import SIGNAL_LABEL, Dataset, DatasetBuilder, era_summary
+from app.ml.datasets import (
+    SIGNAL_LABEL,
+    Dataset,
+    DatasetBuilder,
+    SignalOutcome,
+    era_summary,
+)
 from app.ml.drift import DriftDetector, DriftReport
 from app.ml.events import (
     DriftDetected,
@@ -74,6 +80,14 @@ Se inyecta como callable para que la capa de ML no dependa del motor de
 estrategias: el composition root adapta el ``PerformanceTracker``.
 """
 
+SignalOutcomesProvider = Callable[[], Mapping[str, SignalOutcome]]
+"""Resultado virtual **por señal** del evaluador continuo (Bloque 8).
+
+El anterior devuelve el agregado por estrategia; éste devuelve la fila, que es
+lo que permite unir cada operación con la resolución de su propia señal. Mismo
+motivo para el callable: el composition root adapta el ``VirtualOutcomeStore``.
+"""
+
 
 class MLEngine:
     """Facade over the Machine Learning layer.
@@ -87,6 +101,10 @@ class MLEngine:
             evaluador continuo (Fase 4) — mide la calidad de la señal *en sí*.
             El Meta Strategy Manager las usa como prior mientras la muestra
             ejecutada de una estrategia sea escasa.
+        signal_outcomes_provider: Fuente del resultado virtual por ``signal_id``
+            (Bloque 8). Con ella, la etiqueta de calidad de señal sale del join
+            real contra el evaluador; sin ella, de la aproximación por motivo de
+            salida heredada del Bloque 4.
         persist: Si el registro y los experimentos escriben a disco.
     """
 
@@ -97,6 +115,7 @@ class MLEngine:
         bus: EventBus | None = None,
         trades_provider: TradesProvider | None = None,
         virtual_stats_provider: VirtualStatsProvider | None = None,
+        signal_outcomes_provider: SignalOutcomesProvider | None = None,
         persist: bool = True,
     ) -> None:
         self._settings = settings
@@ -104,6 +123,9 @@ class MLEngine:
         self._bus = bus
         self._trades_provider: TradesProvider = trades_provider or (lambda: [])
         self._virtual_stats_provider: VirtualStatsProvider = virtual_stats_provider or (lambda: {})
+        self._signal_outcomes_provider: SignalOutcomesProvider = signal_outcomes_provider or (
+            lambda: {}
+        )
         self._log = logging.getLogger("app.ml")
 
         self._engineer = FeatureEngineer()
@@ -179,18 +201,34 @@ class MLEngine:
             label: ``win`` (calidad de ejecución, por defecto) o
                 ``signal_quality`` (calidad de la señal en sí).
         """
-        return self._builder.build(self._trades_provider(), label=label)
+        return self._builder.build(
+            self._trades_provider(),
+            label=label,
+            outcomes=self._signal_outcomes_provider(),
+        )
 
     def build_signal_dataset(self) -> Dataset:
         """Dataset etiquetado por **calidad de señal**, no de ejecución.
 
-        Excluye las operaciones cuyo cierre lo decidió la ejecución (régimen,
-        tiempo, kill switch, manual): esas nunca pusieron a prueba su tesis, así
-        que su resultado no dice nada sobre la señal. Es la contraparte del
-        dataset por defecto, no su sustituto — juntos separan "¿esta estrategia
-        tiene edge?" de "¿la ejecución está capturando ese edge?".
+        Desde el Bloque 8 la etiqueta sale del **join real** con el evaluador
+        continuo: para cada operación, el resultado virtual de sus señales,
+        medido sobre precio posterior a la señal. Eso incluye las operaciones
+        que la ejecución cortó por régimen o por tiempo — precisamente las que
+        la aproximación anterior tenía que descartar por no poder juzgarlas.
+
+        Para el historial sin ``signal_ids`` (todo el journal anterior al
+        bloque) se mantiene esa aproximación: sólo cuentan las operaciones cuyo
+        cierre resolvió la tesis. ``metadata["join_breakdown"]`` dice cuántas
+        filas vinieron de cada camino.
+
+        Es la contraparte del dataset por defecto, no su sustituto — juntos
+        separan "¿esta estrategia tiene edge?" de "¿la ejecución lo captura?".
         """
-        return self._builder.build(self._trades_provider(), label=SIGNAL_LABEL)
+        return self._builder.build(
+            self._trades_provider(),
+            label=SIGNAL_LABEL,
+            outcomes=self._signal_outcomes_provider(),
+        )
 
     def data_quality_report(self) -> dict[str, Any]:
         """Qué datos entran al entrenamiento y por qué (auditoría del Bloque 4)."""

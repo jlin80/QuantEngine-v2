@@ -50,6 +50,14 @@ class DecisionGenerated(Event):
     ejecución no conoce ni el Decision Engine ni los plugins de estrategia
     —sólo el bus—, y necesita la atribución para aplicar el holding mínimo por
     estrategia y para segmentar el Trade Journal. Vacías si no se pudo atribuir.
+
+    ``signal_ids`` son las señales que el consenso consideró para esta decisión
+    (``Decision.signals_considered``). Viajan por la misma razón y por el mismo
+    mecanismo —campo del evento, no acoplamiento entre módulos—: sin ellas el
+    Trade Journal no se puede unir fila a fila con el resultado virtual que
+    calcula el evaluador continuo, y la calidad de la señal sólo se puede
+    aproximar desde el motivo de salida de la operación. Vacías en decisiones
+    sin señales activas y en las fuentes deterministas del backtesting.
     """
 
     decision_id: str
@@ -61,6 +69,7 @@ class DecisionGenerated(Event):
     summary: str
     strategy: str = ""
     strategy_category: str = ""
+    signal_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
