@@ -2189,3 +2189,74 @@ sobre spot de Binance (no el CFD que opera). Las muestras por estrategia son de
 prueba que **con los datos disponibles no hay evidencia de edge en ninguna, ni
 de un ranking estable entre ellas**. La forma correcta de refutarlo es un
 walk-forward con mas historia y mas simbolos, que el laboratorio ya soporta.
+
+
+## El motor es monotimeframe, y el regimen casi no entra en la decision (2026-08-04)
+
+**Verificado en codigo.** No hay analisis multi-timeframe en ninguna parte del
+camino de decision:
+
+| Componente | Timeframe | Ventana |
+| --- | --- | --- |
+| Las 20 estrategias | 1m | - |
+| `RegimeDetector` | 1m, lookback 50 | **50 minutos** |
+| `MarketContextEngine` | 1m | - |
+| ATR (periodo 14) | 1m | 14 minutos |
+| Feature Store (default) | 1m | - |
+
+Los unicos sitios donde aparecen 5m/15m/1h/4h son normalizadores y proveedores
+-la fontaneria que sabria parsearlos-. **Nada en el camino de decision pide otra
+cosa que 1m**, y el agregador construye velas de 5m que nadie consume.
+
+Es una hipotesis plausible para el resultado de `strategy_edge.py`: media
+biblioteca son conceptos de *estructura de mercado* (`bos`, `choch`, `mss`,
+`order_block`, `fair_value_gap`) y la estructura leida en velas de 1 minuto se
+rompe cada pocos minutos. Detectar estructura ahi es detectar ruido - lo que
+explicaria que el ranking no se replique entre simbolos (r = +0.084).
+
+### El experimento, y por que NO resuelve la hipotesis
+
+Se construyo la agregacion a marcos superiores sin lookahead
+(`app/backtesting/htf.py`, 9 tests) y se barrio el timeframe del detector de
+regimen de 1m a 1h manteniendo la entrada en 1m
+(`scripts/multi_timeframe.py`). **Los seis escenarios dan resultados
+practicamente identicos** (9 operaciones, mismo WR, mismo PF; la expectativa
+varia en la tercera decimal).
+
+Eso no refuta la hipotesis: revela que **el regimen apenas alimenta la
+decision**. Auditado:
+
+- La cadena de filtros **no lo consulta** en absoluto.
+- El consenso en uso es `weighted_average`, que **no aplica**
+  `regime_multipliers` (solo lo haria `regime_weighting`).
+- De las 20 estrategias, solo `mean_reversion` lo lee directamente, mas el motor
+  de confirmaciones y un gate en `strategies/shared/api.py`.
+
+Cambiar el marco de una senal que casi nadie escucha no puede cambiar el
+resultado. **La hipotesis multi-timeframe queda sin probar, no descartada.**
+
+### Hallazgo colateral, y es el mas serio: el backtest no reproduce las salidas
+
+`app/backtesting/simulator/execution_factory.py` construye el `ExecutionEngine`
+con **`context=None`**. En esa rama, `_market_view` devuelve `regime="unknown"`
+y `volatility="normal"` de forma fija. Consecuencia:
+
+**La salida por cambio de regimen -el 72 % de los cierres en produccion- no
+existe en el backtest.**
+
+Implicaciones en las dos direcciones, porque las tiene:
+
+- **Refuerza** la conclusion de que no hay edge en las senales. El backtest mide
+  las estrategias con salidas limpias de SL/TP, sin interferencia del regimen -
+  es la prueba mas favorable posible para la senal - y aun asi pierden a spread
+  cero.
+- **Debilita** cualquier lectura de la *mezcla de salidas* o de la duracion
+  media en backtest: ahi el backtest y produccion son sistemas distintos.
+
+Es deuda de fidelidad del laboratorio, no un bug de esta sesion, pero conviene
+tenerla escrita antes de seguir usando el backtest para decidir.
+
+**Siguiente paso para probar de verdad la hipotesis multi-timeframe:** no basta
+mover el timeframe del detector; hay que **dar efecto al regimen en la
+decision** - un filtro de sesgo que impida abrir contra la estructura del marco
+superior. Eso es funcionalidad nueva, no un barrido de configuracion.

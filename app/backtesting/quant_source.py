@@ -22,6 +22,7 @@ import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from app.backtesting.htf import HigherTimeframeAggregator
 from app.cache.memory import InMemoryCache
 from app.cache.service import CacheService
 from app.config.settings import Settings
@@ -185,9 +186,21 @@ class QuantCoreDecisionSource:
         spread_bps: Spread a materializar en el ticker sintético de cada vela
             (debe reflejar el spread real del broker, p. ej. ~5.3 bps en ETH de
             Exness) para que los filtros y el contexto vean el costo real.
+        higher_timeframes: Marcos superiores a construir desde la serie de 1m y
+            publicar en el estado de mercado. El motor es hoy monotimeframe (todo
+            1m, 50 minutos de visión); esto permite **medir** si un contexto
+            superior aporta algo antes de cablearlo. Sólo se publican velas ya
+            cerradas: ver :mod:`app.backtesting.htf`.
     """
 
-    def __init__(self, settings: Settings, symbol: str, *, spread_bps: float) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        symbol: str,
+        *,
+        spread_bps: float,
+        higher_timeframes: Sequence[Timeframe] = (),
+    ) -> None:
         self._settings = settings
         self._symbol = symbol.upper()
         self._spread_frac = spread_bps / 10_000.0
@@ -195,6 +208,11 @@ class QuantCoreDecisionSource:
         cache = MarketCache(CacheService(primary=None, fallback=InMemoryCache()))
         self._market = MarketDataService(self._state, cache, None)
         self._features = FeatureStore(self._market)
+        self._higher_timeframes = tuple(higher_timeframes)
+        self._aggregators = [
+            HigherTimeframeAggregator(timeframe=tf, symbol=self._symbol)
+            for tf in self._higher_timeframes
+        ]
 
         quant = settings.quant
         self._regime = RegimeDetector(self._market, quant.regime)
@@ -273,6 +291,8 @@ class QuantCoreDecisionSource:
         cache = MarketCache(CacheService(primary=None, fallback=InMemoryCache()))
         self._market = MarketDataService(self._state, cache, None)
         self._features = FeatureStore(self._market)
+        for aggregator in self._aggregators:
+            aggregator.reset()
 
     # ------------------------------------------------------------------
     # DecisionSource
@@ -345,6 +365,13 @@ class QuantCoreDecisionSource:
         """
         for i in range(self._fed_index + 1, index + 1):
             self._state.update_candle(candles[i])
+            # Marcos superiores: cada agregador devuelve una vela sólo cuando
+            # queda CERRADA. Publicar la que está en curso daría a la estrategia
+            # el máximo y el mínimo de minutos que aún no han ocurrido.
+            for aggregator in self._aggregators:
+                higher = aggregator.push(candles[i])
+                if higher is not None:
+                    self._state.update_candle(higher)
         self._fed_index = index
         last = candles[index]
         half = last.close * self._spread_frac / 2.0

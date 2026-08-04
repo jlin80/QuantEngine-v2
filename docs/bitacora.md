@@ -1384,3 +1384,60 @@ que las estrategias sean irreparables: prueba que con los datos disponibles no
 hay evidencia de edge en ninguna ni de un ranking estable. Refutarlo requiere un
 walk-forward con mas historia y mas simbolos — que el laboratorio ya soporta y
 es el siguiente paso natural.
+
+
+## 2026-08-04 - Multi-timeframe: el motor solo ve 50 minutos (y el regimen casi no se usa)
+
+**Categoria:** hallazgo - **Tags:** `multi-timeframe` `regimen` `backtesting` `fidelidad`
+
+**Pregunta.** Toma el bot contexto de marcos superiores (1h-4h de sesgo, 15m de
+direccion, 1m de entrada)? **No. Es estrictamente monotimeframe.**
+
+Las 20 estrategias, el detector de regimen, el Market Context y el Feature Store
+leen todos 1m. Con el `lookback` de 50 del detector, **toda la vision de mercado
+del motor son 50 minutos**. Los unicos sitios con 5m/15m/1h/4h son los
+normalizadores y proveedores; nada en el camino de decision los pide. El
+agregador construye velas de 5m que nadie consume.
+
+**Por que importa:** media biblioteca son conceptos de estructura de mercado
+(`bos`, `choch`, `mss`, `order_block`, `fair_value_gap`), y la estructura leida
+en 1m se rompe cada pocos minutos. Detectar estructura ahi es detectar ruido -
+la mejor explicacion que tenemos para r = +0.084 entre BTC y ETH.
+
+**Lo construido.** `app/backtesting/htf.py`: agregacion de 1m a marcos
+superiores **sin lookahead** - una vela de 1h solo se publica cuando cierra,
+porque publicar la que esta en curso le daria a la estrategia el maximo y el
+minimo de minutos que aun no han ocurrido. Un backtest con lookahead no es
+optimista, es invalido. 9 tests lo fijan, incluido el del caso con numeros.
+
+**El experimento no resuelve la hipotesis, y hay que decirlo.** El barrido del
+timeframe del regimen (1m a 1h, entrada siempre en 1m) da **seis escenarios
+practicamente identicos**. No refuta nada: revela que **el regimen apenas
+alimenta la decision**. Auditado: la cadena de filtros no lo consulta, el
+consenso en uso (`weighted_average`) no aplica `regime_multipliers`, y de las 20
+estrategias solo `mean_reversion` lo lee. Cambiar el marco de una senal que casi
+nadie escucha no puede cambiar el resultado.
+
+**La hipotesis multi-timeframe queda SIN PROBAR, no descartada.**
+
+**Hallazgo colateral, y es el mas serio.** El backtest construye el
+`ExecutionEngine` con `context=None`, asi que `regime` es siempre `"unknown"` y
+`volatility` siempre `"normal"`. **La salida por cambio de regimen -el 72 % de
+los cierres en produccion- no existe en el backtest.**
+
+Corta en las dos direcciones y ambas importan:
+- **Refuerza** el "no hay edge": el backtest mide las senales con salidas
+  limpias de SL/TP, sin interferencia del regimen -la prueba mas favorable
+  posible- y aun asi pierden a spread cero.
+- **Debilita** cualquier lectura de mezcla de salidas o duracion en backtest:
+  ahi backtest y produccion son sistemas distintos.
+
+Es deuda de fidelidad del laboratorio, anterior a esta sesion, pero conviene
+tenerla escrita antes de seguir usando el backtest para decidir.
+
+**Siguiente paso real:** para probar la hipotesis no basta mover el timeframe;
+hay que **dar efecto al regimen en la decision** - un filtro de sesgo que impida
+abrir contra la estructura del marco superior. Es funcionalidad nueva, no un
+barrido de configuracion, y por eso no la he metido sin consultar.
+
+**Tests.** 9 nuevos. Suite: **978 en verde** en 3.14 y en 3.12.10.
