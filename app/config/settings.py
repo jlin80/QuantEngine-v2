@@ -639,9 +639,63 @@ class QuantContextSettings(BaseModel):
     )
     max_spread_bps: float = 5.0
     min_volume: float = 0.0
-    atr_pct_low: float = 0.05
-    atr_pct_high: float = 0.8
+    # Umbrales de clasificación de volatilidad, como % del precio.
+    #
+    # Los valores anteriores (0.05 / 0.80) estaban calibrados para una escala
+    # temporal mucho mayor y en 1m no clasificaban NADA: medido sobre 1187
+    # operaciones reales, el ATR% máximo observado fue 0.261 % — es decir, el
+    # umbral HIGH de 0.80 % era inalcanzable por construcción y `volatility`
+    # llegaba constante a `normal` en el 100 % de las operaciones. Una variable
+    # constante no informa a nadie: ni al `ConfidenceEngine`, ni a los filtros,
+    # ni al ML (que la recibía como feature muerta).
+    #
+    # Los valores nuevos salen de la distribución real en 1m (p≈25 y p≈85).
+    atr_pct_low: float = 0.04
+    atr_pct_high: float = 0.12
+    # Los umbrales por símbolo existen porque la escala **no es comparable entre
+    # activos**: la mediana de ATR% en 1m es 0.038 % en oro y 0.068 % en ETH, así
+    # que un único par de umbrales marcaría al oro como LOW casi siempre y a ETH
+    # casi nunca. Resolución en dos escalones: por símbolo → global.
+    atr_pct_low_by_symbol: dict[str, float] = Field(
+        default_factory=lambda: {
+            "BTCUSDM": 0.04,
+            "ETHUSDM": 0.05,
+            "USTECM": 0.04,
+            "XAUUSDM": 0.03,
+        }
+    )
+    atr_pct_high_by_symbol: dict[str, float] = Field(
+        default_factory=lambda: {
+            "BTCUSDM": 0.12,
+            "ETHUSDM": 0.14,
+            "USTECM": 0.13,
+            "XAUUSDM": 0.07,
+        }
+    )
     stale_data_seconds: float = 30.0
+
+    def atr_pct_low_for(self, symbol: str) -> float:
+        """Umbral LOW del símbolo, con el global como fallback.
+
+        Args:
+            symbol: Símbolo (se normaliza a mayúsculas).
+
+        Returns:
+            El umbral aplicable.
+        """
+        return self.atr_pct_low_by_symbol.get(symbol.upper(), self.atr_pct_low)
+
+    def atr_pct_high_for(self, symbol: str) -> float:
+        """Umbral HIGH del símbolo, con el global como fallback.
+
+        Args:
+            symbol: Símbolo (se normaliza a mayúsculas).
+
+        Returns:
+            El umbral aplicable.
+        """
+        return self.atr_pct_high_by_symbol.get(symbol.upper(), self.atr_pct_high)
+
     # Ventanas de noticias: [["2026-07-17T14:25Z","2026-07-17T14:35Z"], ...]
     news_blackouts: list[tuple[str, str]] = Field(default_factory=list)
 

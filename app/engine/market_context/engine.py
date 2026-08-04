@@ -63,9 +63,12 @@ class MarketContextEngine:
 
         volatility = VolatilityState.NORMAL
         if atr_pct is not None:
-            if atr_pct >= self._settings.atr_pct_high:
+            # Umbrales por símbolo: la escala de ATR% no es comparable entre
+            # activos (oro ~0.038 % vs ETH ~0.068 % de mediana en 1m), así que
+            # un par único de umbrales dejaba la variable constante.
+            if atr_pct >= self._settings.atr_pct_high_for(symbol):
                 volatility = VolatilityState.HIGH
-            elif atr_pct <= self._settings.atr_pct_low:
+            elif atr_pct <= self._settings.atr_pct_low_for(symbol):
                 volatility = VolatilityState.LOW
 
         return MarketContext(

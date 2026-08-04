@@ -51,6 +51,11 @@ WHITELIST: tuple[str, ...] = (
     "quant.consensus.min_agreement",
     "quant.context.max_spread_bps",
     "quant.context.atr_pct_low",
+    # `atr_pct_high` faltaba en la whitelist: se podia ajustar el umbral bajo en
+    # caliente pero no el alto, que era justo el que estaba mal calibrado.
+    "quant.context.atr_pct_high",
+    "quant.context.atr_pct_low_by_symbol",
+    "quant.context.atr_pct_high_by_symbol",
     "paper.initial_balance",
     "paper.slippage_bps",
     "discord.enabled",

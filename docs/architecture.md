@@ -2045,3 +2045,87 @@ sigue siendo correcta, porque el override de `app.cache.redis_backend` en
 y redis 5.3.1, o decidir conscientemente subir produccion. No lo hago por mi
 cuenta: cambiar el interprete o los paquetes de la maquina del operador excede
 lo que pide el pendiente.
+
+## ADR-098 · La volatilidad se clasifica por simbolo, con umbrales del timeframe real
+
+**Contexto.** `MarketContext.volatility` llegaba `normal` en el **100 %** de las
+1209 operaciones del journal de produccion. No era un feature roto: era una
+calibracion de otra escala temporal.
+
+Medido: el ATR% en 1m tiene mediana 0.038-0.068 % y **maximo observado 0.261 %**.
+El umbral `atr_pct_high` valia **0.80 %** — inalcanzable por construccion. El
+otro lado lo cerraba el `.env` de `qevps`, que bajaba `atr_pct_low` de 0.05 a
+0.02 (por debajo del p5 real). La banda `[0.02, 0.80]` capturaba absolutamente
+todo.
+
+**Por que importa mas de lo que parece.** Una variable constante no es un dato
+neutro: es una feature muerta que consume su sitio. El `ConfidenceEngine` la
+pondera, los filtros la consultan, y el ML la recibe como columna de entrada con
+varianza cero — donde no aporta nada pero **si diluye** el peso relativo de las
+que si informan.
+
+**Decision.** Umbrales derivados de la distribucion real en 1m (p≈25 y p≈85), y
+**por simbolo**, con el global como fallback — mismo patron de resolucion en
+escalones que ADR-083 usa para el holding.
+
+**Por que por simbolo.** La escala de ATR% no es comparable entre activos: la
+mediana en 1m es 0.038 % en oro y 0.068 % en ETH. Un unico par de umbrales
+marcaria al oro como LOW casi siempre y a ETH casi nunca — cambiando una
+constante inutil por otra igual de inutil, solo que menos evidente.
+
+**Consecuencias.** Los tests fijan el contrato contra la distribucion real
+medida, no contra numeros elegidos: si alguien sube el umbral fuera del rango
+observado, el test que exige que HIGH sea alcanzable falla. Se anadio ademas
+`quant.context.atr_pct_high` a la whitelist del Config Center — **faltaba**, asi
+que el umbral bajo se podia ajustar en caliente y el alto, que era el mal
+calibrado, no.
+
+## Calibracion de stops y objetivos: por que recalibrar NO arregla la expectativa
+
+**El hallazgo mecanico.** `sizing.atr_stop_multiplier = 1.5` **no se aplica
+nunca en produccion**. La distancia del stop es
+`max(ATR x 1.5, piso_porcentual, piso_de_spread)` y uno de los dos pisos gana
+siempre:
+
+| Simbolo | ATR | ATR x1.5 | piso 0.15 % | piso spread x8 | stop real | manda |
+| --- | --- | --- | --- | --- | --- | --- |
+| BTCUSDm | 5.4 bps | 8.2 | **15.0** | 12.5 | 15.0 | `min_stop_pct` |
+| ETHUSDm | 6.8 bps | 10.2 | 15.0 | **42.2** | 42.0 | `spread x8` |
+| USTECm | 5.9 bps | 8.9 | **15.0** | 10.3 | 15.0 | `min_stop_pct` |
+| XAUUSDm | 3.8 bps | 5.7 | **15.0** | 4.7 | 15.0 | `min_stop_pct` |
+
+El stop deja de ser adaptativo a la volatilidad, y el objetivo
+(`stop x reward_risk`) hereda el problema: acaba a 4-8x ATR. El precio en 1m
+recorre tipicamente **1-3x ATR** antes de que la operacion termine (mediana de
+1.22x ATR en las salidas por regimen), asi que el objetivo casi nunca se alcanza
+— 52 take-profits en 1209 operaciones.
+
+**ETH es un caso aparte.** Su spread (5.27 bps) es el **78 %** de su ATR
+(6.8 bps). El piso de spread lo empuja a un stop de 6.2x ATR y un objetivo de
+9.3x ATR. A esa relacion coste/movimiento, el scalping de ETH no es viable
+independientemente de la calibracion.
+
+**La validacion, que es lo que decide.** Se barrieron `min_stop_pct` (0.15 →
+0.03), `atr_stop_multiplier` (1.0-2.0) y `reward_risk` (1.5 / 1.2) corriendo el
+**QuantCore real** sobre velas 1m reales de Binance (`scripts/calibrate_stops.py`):
+
+- **Ninguna combinacion da expectativa positiva.** La mejor (R:R 1.2) pasa de
+  −0.083R a −0.049R en ETH: mejora, pero no cruza cero.
+- **En ETH, bajar `min_stop_pct` de 0.15 a 0.03 no cambia literalmente nada**
+  (120 operaciones, 48.3 % WR, PF 0.72 en las cuatro filas). Confirmacion
+  empirica de que su stop lo fija el piso de spread.
+- **Lo decisivo: tambien pierde a spread CERO** (PF 0.11-0.56 en todas las
+  combinaciones, ambos simbolos). **El problema no es el coste ni la
+  calibracion de los niveles: son las senales de entrada.**
+
+**Consecuencia.** No se cambia ningun parametro de sizing: seria mover numeros
+sin evidencia de mejora. El trabajo pendiente esta en la calidad de las senales,
+no en donde se ponen los niveles. Coherente con lo medido en ADR-097 (las
+operaciones que resuelven su propia tesis dan −0.252R) — y con que el Bloque 1
+no mejorase la expectativa: alargar el holding da mas tiempo para llegar a un
+objetivo que esta fuera de alcance, y mas tiempo para tocar el stop.
+
+**Deuda anotada:** el `atr_stop_multiplier` es hoy codigo muerto. O se le da
+efecto (bajando los pisos, con la contrapartida de que el ruido del spread
+barreria el stop) o se elimina para que la configuracion no prometa una
+adaptatividad que no existe. No se resuelve aqui porque no cambia el resultado.

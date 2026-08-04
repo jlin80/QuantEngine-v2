@@ -1268,3 +1268,69 @@ diversificacion y el problema de granularidad del Bloque 13.
 **Sin codigo de produccion**, como pedia el bloque: no se cambio el ruteo, no se
 toco ningun proveedor, no se activo nada. Informe completo en
 `docs/orderflow_nativo.md`.
+
+## 2026-08-04 — Calibracion: volatilidad muerta, stops no adaptativos y Python 3.12
+
+**Categoria:** fix+hallazgo · **Tags:** `volatilidad` `sizing` `calibracion` `python` `entorno`
+
+Tres frentes pedidos tras el analisis del Bloque 12.
+
+### 1. `volatility` era una feature muerta (ADR-098, CORREGIDO)
+
+Llegaba `normal` en el 100 % de las 1209 operaciones. No estaba rota: estaba
+calibrada para otra escala temporal. El ATR% en 1m tiene maximo observado
+**0.261 %** y el umbral HIGH valia **0.80 %** — inalcanzable por construccion. El
+otro lado lo cerraba el `.env` de `qevps` (`ATR_PCT_LOW=0.02`, por debajo del p5
+real). La banda capturaba todo.
+
+Importa mas de lo que parece: una constante no es un dato neutro. El
+`ConfidenceEngine` la pondera, los filtros la consultan y el ML la recibe como
+columna de varianza cero, donde **diluye** el peso de las que si informan.
+
+Corregido con umbrales derivados de la distribucion real (p≈25 y p≈85) y **por
+simbolo**, porque la escala no es comparable entre activos (mediana 0.038 % en
+oro vs 0.068 % en ETH): un umbral unico cambiaria una constante inutil por otra.
+Resolucion en escalones simbolo → global, mismo patron que ADR-083.
+
+De paso: **`quant.context.atr_pct_high` no estaba en la whitelist** del Config
+Center. Se podia ajustar en caliente el umbral bajo y no el alto, que era justo
+el mal calibrado.
+
+### 2. El R:R — recalibrar NO arregla la expectativa (medido, NO aplicado)
+
+`atr_stop_multiplier=1.5` **no se aplica nunca**: el stop sale siempre de uno de
+los dos pisos (`min_stop_pct` o `spread x8`). Por eso el stop no es adaptativo y
+el objetivo acaba a 4-8x ATR, cuando el precio en 1m recorre 1-3x ATR antes de
+que la operacion termine. De ahi 52 take-profits en 1209 operaciones.
+
+ETH es caso aparte: su spread es el **78 % de su ATR**. A esa relacion
+coste/movimiento no es viable para scalping, se calibre como se calibre.
+
+**Validado en el laboratorio** (`scripts/calibrate_stops.py`, QuantCore real
+sobre velas 1m reales de Binance):
+
+- Ninguna combinacion da expectativa positiva; la mejor (R:R 1.2) pasa de
+  −0.083R a −0.049R en ETH — mejora sin cruzar cero.
+- En ETH, bajar `min_stop_pct` de 0.15 a 0.03 **no cambia nada** (120 ops,
+  48.3 % WR, PF 0.72 en las cuatro filas): confirma que manda el piso de spread.
+- **Decisivo: tambien pierde a spread CERO** (PF 0.11-0.56 en todas las
+  combinaciones y ambos simbolos).
+
+**El problema no es el coste ni donde estan los niveles: son las senales de
+entrada.** Por eso **no se cambio ningun parametro de sizing** — seria mover
+numeros sin evidencia. Coherente con ADR-097 (las operaciones que resuelven su
+tesis dan −0.252R) y explica que el Bloque 1 no mejorase la expectativa.
+
+Deuda anotada: `atr_stop_multiplier` es codigo muerto. O se le da efecto bajando
+los pisos (con el spread barriendo el stop como contrapartida) o se elimina,
+para que la config no prometa una adaptatividad que no existe.
+
+### 3. Deriva de Python, cerrada
+
+Instalado Python 3.12.10 junto al 3.14, con venv `.venv312` que replica
+produccion (redis 5.3.1). **La suite completa pasa en el interprete que opera**,
+no solo en el de desarrollo. `mypy --python-version 3.12` y `ruff
+--target-version py312` tambien limpios.
+
+Sigue pendiente decidir si el desarrollo se hace por defecto sobre 3.12 (lo
+recomendable) o si se sube produccion.
