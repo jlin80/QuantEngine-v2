@@ -43,7 +43,14 @@ class ConsensusReached(Event):
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class DecisionGenerated(Event):
-    """El Decision Engine emitió una decisión (aceptada o no)."""
+    """El Decision Engine emitió una decisión (aceptada o no).
+
+    ``strategy``/``strategy_category`` son la atribución de la decisión a la
+    estrategia que más aportó al consenso. Viajan en el evento porque la
+    ejecución no conoce ni el Decision Engine ni los plugins de estrategia
+    —sólo el bus—, y necesita la atribución para aplicar el holding mínimo por
+    estrategia y para segmentar el Trade Journal. Vacías si no se pudo atribuir.
+    """
 
     decision_id: str
     symbol: str
@@ -52,6 +59,8 @@ class DecisionGenerated(Event):
     score: float
     confidence: float
     summary: str
+    strategy: str = ""
+    strategy_category: str = ""
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

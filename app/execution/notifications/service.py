@@ -29,6 +29,8 @@ _BUILDERS: dict[type[Event], Callable[[Any], Notification]] = {
     ev.RiskTriggered: templates.risk_triggered,
     ev.KillSwitchTriggered: templates.kill_switch,
     ev.CircuitBreakerTriggered: templates.circuit_breaker,
+    ev.StrategyExperimentVerdict: templates.strategy_experiment_verdict,
+    ev.HoldingChangeFalsified: templates.holding_change_falsified,
 }
 
 

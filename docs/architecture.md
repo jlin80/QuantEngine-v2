@@ -1270,3 +1270,306 @@ hipótesis futuras.
 - Adaptador de broker real (MT5/OANDA para XAUUSD) — **solo después** de que
   una estrategia supere el Strategy Qualification Pipeline y acumule evidencia
   en paper; hasta entonces `resolved_mode()` sigue forzando `paper` (ADR-034).
+
+## ADR-083 · Holding mínimo por estrategia, resuelto en tres escalones
+
+**Contexto.** `regime_change_min_holding_seconds` era un valor global. Las
+estrategias no comparten el tiempo que su tesis necesita para resolverse
+(`order_block` ~1950s vs `bos` ~135s medidos por el evaluador continuo), así que
+cualquier valor único es un promedio que perjudica a ambos extremos: corta a las
+de tesis larga antes de tiempo (el 80% de las salidas eran por régimen) y deja a
+las cortas sin una salida por régimen útil. Medido: +0.26R virtual vs −0.15R real.
+
+**Decisión.** El umbral se resuelve por posición con
+`ExecutionSettings.min_holding_seconds_for(strategy, category)`, con fallback en
+tres escalones: **valor propio de la estrategia → valor de su categoría → valor
+global**. Para que la ejecución pueda resolverlo, la decisión se atribuye a la
+estrategia que más aportó al consenso (`Decision.primary_strategy`, determinista
+por orden de inserción de las contribuciones) y esa atribución viaja **en el
+evento** `DecisionGenerated`, no por una llamada directa: el motor de ejecución
+no conoce ni el Decision Engine ni los plugins de `app.strategies`.
+
+**Alternativas descartadas.** (a) Un mapa estrategia→categoría en la ejecución:
+duplicaría lo que cada plugin ya declara y se desincronizaría al añadir
+estrategias. (b) Inyectar el registro de estrategias en la ejecución: acopla dos
+capas que hoy sólo se hablan por eventos.
+
+**Consecuencias.** Una estrategia nueva sin historial no necesita configuración:
+hereda el umbral de su categoría, y si tampoco la tiene, el global — es decir, se
+comporta exactamente como antes del cambio. El umbral aplicado se persiste en
+`context_snapshot.min_holding_seconds` de cada trade, así que la decisión es
+auditable a posteriori. El límite global de 4h (`max_holding_minutes`) se sigue
+evaluando **antes** y no queda afectado.
+
+## ADR-084 · El evaluador continuo sólo resuelve contra precio posterior a la señal
+
+**Contexto.** `PerformanceTracker.evaluate_open` seleccionaba las velas con
+`c.end > opened_at`, lo que incluye la vela **en curso** cuando la señal dispara.
+El rango high/low de esa vela contiene precio anterior a la señal, así que una
+operación virtual podía "resolverse" contra movimiento que ya había ocurrido. El
+síntoma visible fue `choch`: duración media de ~4s (la señal disparaba cerca del
+cierre de vela y esa misma vela la resolvía) con una expectativa inflada de
++0.938R. El sesgo afectaba a toda estrategia que dispara tarde dentro de la vela.
+
+**Decisión.** El filtro pasa a `c.start >= opened_at`: sólo velas que empiezan
+después de la entrada. Es la única lectura que no mira hacia atrás.
+
+**Consecuencias.** Las métricas del evaluador continuo son ahora comparables con
+la ejecución real, que es lo que hace útil el contraste señal-vs-ejecución del
+que depende el etiquetado dual del ML. La contrapartida es una resolución algo
+más tardía (hasta una vela de retraso) y que **el histórico previo al fix no es
+comparable con el posterior**: por eso `choch` no recibe un holding propio hasta
+acumular muestra nueva.
+
+## ADR-085 · Los experimentos por estrategia proponen, nunca aplican
+
+**Contexto.** Una estrategia con R negativo persistente necesita una decisión, y
+esa decisión no debería depender de que el operador se acuerde de mirar los
+números tres días después de un cambio. Pero desactivar automáticamente una
+estrategia por una ventana de 72h es exactamente el tipo de automatismo que se
+equivoca caro: la muestra puede ser corta, el mercado puede haber cambiado de
+régimen, y el cambio que se estaba midiendo puede necesitar más tiempo.
+
+**Decisión.** El sistema automatiza la **medición y el aviso**, no la acción.
+Al vencer la fecha de corte emite un veredicto con los números y, si procede,
+marca la estrategia como candidata a desactivación y avisa por Discord. El
+toggle `execution.strategies_enabled` sólo lo mueve un humano.
+
+Tres salvaguardas más: la ventana se **extiende** en vez de juzgar con muestra
+insuficiente; sólo cuentan las operaciones cerradas **dentro** de la ventana (el
+experimento juzga bajo las reglas nuevas, no bajo las que se acaban de cambiar);
+y el estado se persiste append-only para que un reinicio no reinicie el reloj.
+
+**Consecuencias.** El operador recibe una propuesta accionable con evidencia en
+lugar de un recordatorio, y el sistema nunca se apaga una fuente de señal por su
+cuenta. El coste es que una estrategia mala sigue operando hasta que un humano
+actúa — asumido a propósito: el toggle bloquea sólo la apertura, así que una
+estrategia desactivada sigue generando historial y se puede reevaluar.
+
+## ADR-086 · El gobierno del Meta Strategy Manager se aplica por evento y se audita
+
+**Contexto.** El MSM calculaba pesos y activaciones desde la Fase 7 y los
+publicaba en el bus, pero el unico suscriptor era el notificador de Discord: el
+consenso seguia usando los pesos de configuracion. Ademas, `label_trades` nunca
+encontraba la estrategia de origen, asi que el MSM veia una sola entrada
+agregada (`portfolio`) en lugar de una por estrategia. El gobierno existia sobre
+el papel en los dos extremos: ni entraba evidencia util, ni salia efecto real.
+
+**Decision.** Un servicio dedicado (`MetaGovernanceApplier`) cierra el lazo por
+**eventos**, no por una referencia directa: el MSM sigue sin conocer al Strategy
+Engine. Su superficie completa son tres metodos de configuracion
+(`set_weight`/`enable_strategy`/`disable_strategy`), y **cada cambio efectivo se
+registra en el audit log append-only** con el valor anterior, el nuevo y el
+motivo.
+
+**Alternativas descartadas.** (a) Que el MSM llamara al Strategy Engine
+directamente: acopla la capa de ML al motor de estrategias y rompe la regla de
+comunicacion por eventos. (b) Aplicar los pesos dentro del Decision Engine al
+leerlos: dejaria el cambio sin auditoria y sin un punto unico donde vetarlo.
+
+**Consecuencias.** El gobierno automatico es real y reversible: `apply_governance`
+en `false` deja el aplicador en modo observacion, auditando lo que *habria*
+hecho. Un peso que se mueve solo siempre tiene una entrada de auditoria que lo
+explica. El aplicador no puede habilitar live porque no conoce ni la ejecucion
+ni el Live Gate.
+
+## ADR-087 · Evidencia mixta por estrategia: ejecutada manda, virtual rellena
+
+**Contexto.** Gobernar el peso de una estrategia con 4 operaciones cerradas es
+gobernar con ruido. Pero esa misma estrategia puede tener cientos de senales
+resueltas por el evaluador continuo, que mide la calidad de la senal *en si*
+(TP/SL/timeout puros contra velas futuras, sin sizing ni salidas por regimen).
+
+**Decision.** El score que fija el peso es una mezcla: la evidencia ejecutada
+pesa `min(1, trades/min_trades)` y el resto lo aporta la virtual. En cuanto la
+muestra ejecutada alcanza el minimo, la virtual deja de influir por completo.
+La traza de que evidencia sostuvo cada decision viaja en el informe y en la
+auditoria.
+
+**Limite explicito.** La **desactivacion** sigue exigiendo muestra ejecutada. El
+rendimiento virtual ignora costes, slippage y salidas por regimen, asi que puede
+ser optimista de forma sistematica: sirve para decidir cuanto peso dar a una
+estrategia joven, no para apagarla. Hay un test que lo fija.
+
+**Consecuencias.** Una estrategia nueva o poco operada deja de quedarse anclada
+en el peso neutro por falta de historial ejecutado, sin que una metrica optimista
+pueda apagar nada por si sola. Depende de que el evaluador continuo mida bien —
+por eso el fix del ADR-084 es un prerrequisito de este ADR, no un detalle aparte.
+
+## ADR-088 · El training set del ML se segmenta por era de ejecucion
+
+**Contexto.** El ML aprende del historial del propio motor, que arrastra bugs de
+ejecucion ya arreglados (stop mal calculado pre-27/07, trailing que apretaba nada
+mas abrir pre-29/07, salida por regimen que cortaba la tesis). Entrenar sobre
+ellos sin distinguirlos ensena al modelo a penalizar contextos que tenian edge:
+la etiqueta dice "operacion mala" cuando la causa fue la ejecucion, no la senal.
+
+**Decision.** Cada operacion se clasifica en una **era de ejecucion** declarada
+en configuracion (nombre, fecha de corte, peso, motivo), por su **hora de
+entrada**. Las eras cuya medicion es invalida se **excluyen** (peso 0); las de
+sesgo acotado se conservan con peso reducido.
+
+**Por que excluir en vez de ponderar a la baja la primera era.** Un stop mal
+calculado no produce una muestra ruidosa alrededor del valor correcto: produce un
+R sistematicamente equivocado, correlacionado con el propio bug. Bajarle el peso
+deja el sesgo dentro, solo que mas callado.
+
+**Por que clasificar por hora de entrada.** Una operacion abierta antes de un fix
+corrio bajo las reglas viejas durante casi toda su vida aunque cerrara despues.
+Clasificar por salida marcaria como limpias operaciones que no lo son; por
+entrada se marca como contaminado algo de mas, que es el error barato.
+
+**Consecuencias.** Anadir la proxima era es configuracion, no codigo. La
+procedencia queda auditable en los metadatos del dataset y en `/api/ml/status`.
+`ml.data_quality.enabled=false` restaura el comportamiento anterior, para poder
+medir el efecto del saneamiento en vez de asumirlo.
+
+## ADR-089 · Dos etiquetas: calidad de senal y calidad de ejecucion
+
+**Contexto.** La etiqueta unica (`win`) mezcla dos preguntas distintas: si la
+senal tenia edge, y si la ejecucion capturo ese edge. Una operacion cerrada por
+cambio de regimen o por tiempo **nunca llego a poner a prueba su tesis**, asi que
+contarla como "senal mala" ensena al modelo justo lo contrario de lo que ocurrio.
+
+**Decision.** Dos etiquetas explicitas. `win`/`rr_positive`/`not_stopped` miden
+la **ejecucion** y usan todas las salidas. `signal_quality` mide la **senal** y
+usa solo las operaciones cuyo cierre resolvio la tesis (objetivo, stop, trailing,
+break-even). Cada dataset declara que mide en `metadata["label_measures"]`.
+
+**Limitacion asumida.** La fuente ideal para `signal_quality` es el evaluador
+continuo (TP/SL/timeout puros contra velas futuras, sin ejecucion), pero hoy no
+hay clave de union fila a fila: el evaluador agrega por estrategia y el
+`TradeRecord` no lleva los `signal_id` de origen. La aproximacion desde el
+journal es honesta y sin lookahead, pero sigue midiendo operaciones ejecutadas,
+con sus costes. El cierre del hueco esta documentado en `docs/ml.md`.
+
+**Consecuencias.** Se puede entrenar y comparar los dos objetivos por separado, y
+la divergencia entre ambos es en si misma la metrica que interesa: mide cuanto
+edge esta perdiendo la ejecucion.
+
+## ADR-090 · Un modelo caduca cuando cambian las reglas de ejecucion, no solo cuando empeora
+
+**Contexto.** La puerta de validacion mide si un modelo es bueno *sobre los datos
+con los que se entreno*. No dice nada sobre si esos datos siguen describiendo
+como opera el motor. Cambiar el holding minimo, el sizing, un filtro de riesgo o
+el trailing altera la distribucion de operaciones que el motor genera, pero
+**las metricas del modelo activo no se mueven**: siguen siendo las del dia en que
+se valido. El modelo caduca en silencio.
+
+**Decision.** Se congela junto a cada modelo un **hash de las reglas de ejecucion
+significativas** y se compara periodicamente con las vigentes. Al diferir, el
+modelo se marca como "requiere reentrenamiento" y se avisa por Discord indicando
+que familia de reglas cambio.
+
+**Que entra en la huella y que no.** Entran las reglas que cambian *que
+operaciones existen y como se gestionan* (holding, trailing, sizing, filtros de
+riesgo, toggles de simbolo/estrategia). Quedan fuera cadencias, rutas e
+intervalos de reporte: una alerta que salta por cambios cosmeticos ensena al
+operador a ignorarla, y una alerta ignorada es peor que ninguna.
+
+**Por que no reentrenar automaticamente.** Porque el cambio de regla que dispara
+la alerta es justo el momento en que **todavia no existen datos bajo las reglas
+nuevas**. Reentrenar en ese instante produciria un modelo entrenado sobre el
+regimen viejo con la etiqueta de estar al dia — peor que saber que esta obsoleto.
+La decision de cuando reentrenar necesita un humano que sepa cuanta muestra nueva
+hay. Coherente con la regla de la fase: el ML asesora, nunca decide por si solo.
+
+**Consecuencias.** Un estado `unknown` distingue "no consta" de "obsoleto" para
+los modelos anteriores a este control, en vez de dar una falsa tranquilidad.
+`RULES_VERSION` permite invalidar todas las huellas a proposito cuando cambie el
+propio criterio de que es significativo.
+
+## Sizing y limites de exposicion frente al crecimiento del capital
+
+> **Por que esta escrito aqui:** estos limites estan calibrados para un equity
+> concreto y pequeno. Si la cuenta crece y nadie los revisa, se quedan pegados —
+> y el modo de fallo no es un error, es riesgo silencioso.
+
+### Calibracion actual
+
+Los topes vigentes (`execution.risk.max_exposure_pct` y companeros) estan
+pensados para **~$200-500 de equity con leverage 2000:1**. Con ese capital, un
+`max_exposure_pct` del orden de 2000 % no es agresivo: es lo minimo para que el
+**lote minimo del broker quepa** en la cuenta. El oro, por ejemplo, necesita un
+nocional que con un tope del 20 % exigiria ~20k de equity.
+
+Es decir: el tope alto no expresa apetito de riesgo, expresa una **restriccion de
+granularidad del broker**. Esa es la razon por la que puede envejecer mal — deja
+de ser necesario mucho antes de dejar de estar configurado.
+
+### Cuando hay que revisarlos
+
+| Equity | Que revisar |
+| --- | --- |
+| **~$1 000** | Primer aviso. `max_exposure_pct` empieza a ser holgura real y no necesidad. Comprobar si el lote minimo de cada simbolo ya cabe con topes normales. |
+| **~$2 000-5 000** | `max_exposure_pct` deberia bajar hacia valores convencionales (100-300 %). Revisar `max_symbol_exposure_pct` y `max_correlation_exposure_pct`, que con equity pequeno casi nunca se activaban. |
+| **~$20 000** | El oro cabe con un tope del 20 %. A partir de aqui los topes deberian estar dominados por criterio de riesgo, no por granularidad del broker. Revisar tambien `risk_per_trade_pct`, calibrado con la misma logica. |
+
+### Senal de que hay que actuar
+
+Si `max_exposure_pct` sigue en miles cuando el equity ya permite operar con topes
+convencionales, el sistema esta autorizando una exposicion que **ya no necesita**.
+Los limites siguen "funcionando" —no saltan errores— y por eso el problema no se
+manifiesta hasta que un movimiento adverso lo revela.
+
+Los cuatro parametros a revisar juntos, porque se calibraron juntos:
+`execution.risk.max_exposure_pct`, `execution.risk.max_symbol_exposure_pct`,
+`execution.risk.max_correlation_exposure_pct` y
+`execution.sizing.risk_per_trade_pct`.
+
+Todos estan en la whitelist del Config Center, asi que se pueden ajustar sin
+reinicio — pero **no hay nada automatico que avise**: es una revision manual
+ligada a hitos de capital, y por eso queda escrita aqui.
+
+## ADR-091 · El reloj inyectable vive en un ContextVar, no en un global
+
+**Contexto.** `utc_now()` es un seam para que el backtesting reproduzca el tiempo
+historico sin duplicar el motor de ejecucion (ADR de la Fase 6). El proveedor se
+guardaba en un **global de modulo**. Pero el `BacktestLab` corre en el **mismo
+proceso y el mismo event loop** que el motor en vivo, asi que ese global no
+distingue quien pregunta la hora.
+
+Consecuencia observada en produccion (2026-07-31 → 2026-08-04): un backtest
+instalo el reloj simulado, su bloque nunca se cerro, y el motor vivio 4 dias
+creyendo que era el 31 de julio. El validador de mercado veia todos los ticks del
+broker "en el futuro" y descartaba el 100%: sin velas, sin señales, sin
+operaciones. El proceso seguia vivo y respondiendo, asi que nada aviso.
+
+Y el problema no era solo la fuga: **aunque el bloque cerrase correctamente, el
+motor en vivo veia la hora simulada durante toda la ejecucion del backtest**.
+
+**Decision.** El proveedor pasa a `ContextVar`. El alcance del reloj simulado
+queda limitado a la tarea que lo instala y a las que ella crea — exactamente el
+alcance de un backtest, que es lo que se queria — y las tareas del motor en vivo,
+creadas en otro contexto, ven siempre el reloj de pared.
+
+**Alternativas descartadas.** (a) Correr los backtests en otro proceso: es la
+solucion mas fuerte y sigue siendo deseable a futuro, pero es un cambio de
+arquitectura mucho mayor y no habria arreglado la fuga de hoy. (b) Un `try/finally`
+mas defensivo: no resuelve nada, el `finally` ya existia — el bloque simplemente
+nunca llego a ejecutarse.
+
+**Consecuencias.** El backtesting mantiene su semantica (sus propias tareas
+heredan el contexto y ven la hora simulada; hay test que lo fija). `wall_now()` y
+`clock_skew_seconds()` permiten **medir** la desviacion, que es lo que faltaba
+para que el fallo fuese visible.
+
+## ADR-092 · La desconexion de un WebSocket se detecta leyendo, no escribiendo
+
+**Contexto.** El endpoint `/ws/events` empujaba eventos en un `while True` y solo
+salia con `WebSocketDisconnect`. Cuando un cliente desaparece **sin cierre
+limpio**, `send_json` no lanza: asyncio marca el transporte con `_conn_lost`,
+descarta el envio y vuelve. El bucle seguia consumiendo eventos y "enviandolos"
+a un socket muerto indefinidamente, y la suscripcion al bus nunca se liberaba.
+
+En produccion eso fue el **75% de todas las lineas de log** (`socket.send()
+raised exception.`, que CPython emite a partir del quinto intento sobre un
+transporte perdido) y un suscriptor zombi por cada recarga del dashboard.
+
+**Decision.** El envio va en una tarea aparte y la corrutina del endpoint espera
+en `websocket.receive()`. En un canal de solo lectura para el cliente, `receive`
+solo retorna cuando llega el `websocket.disconnect`: es la unica señal fiable.
+
+**Consecuencias.** La limpieza de la suscripcion deja de depender de que el envio
+falle — que es justo lo que no ocurria. Escribir sobre un socket muerto ya no
+puede convertirse en un bucle infinito silencioso.

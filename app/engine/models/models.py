@@ -322,7 +322,37 @@ class Decision:
     filters_blocking: tuple[str, ...] = ()
     explanation: tuple[str, ...] = ()
     regime: str = Regime.UNKNOWN.value
+    strategy_categories: dict[str, str] = field(default_factory=dict)
     context_summary: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def primary_strategy(self) -> str:
+        """Estrategia que más aportó al consenso ("" si no hay consenso).
+
+        La decisión es multi-estrategia por diseño, pero la ejecución necesita
+        atribuir la posición a *una* para poder aplicarle su holding mínimo y
+        segmentar métricas por estrategia. Se toma la de mayor contribución;
+        a igualdad, la primera participante (orden estable del consenso) para
+        que la atribución sea determinista y reproducible en tests.
+        """
+        if self.consensus is None:
+            return ""
+        contributions = self.consensus.contributions
+        if not contributions:
+            return self.consensus.participants[0] if self.consensus.participants else ""
+        # `max` sobre el orden de inserción del dict conserva el primero en
+        # caso de empate: determinista, sin depender del orden alfabético.
+        best = ""
+        best_value = float("-inf")
+        for name, value in contributions.items():
+            if value > best_value:
+                best, best_value = name, value
+        return best
+
+    @property
+    def primary_category(self) -> str:
+        """Categoría de :attr:`primary_strategy` ("" si se desconoce)."""
+        return self.strategy_categories.get(self.primary_strategy, "")
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe dict."""
@@ -341,6 +371,9 @@ class Decision:
             "filters_blocking": list(self.filters_blocking),
             "explanation": list(self.explanation),
             "regime": self.regime,
+            "strategy_categories": self.strategy_categories,
+            "primary_strategy": self.primary_strategy,
+            "primary_category": self.primary_category,
             "context_summary": self.context_summary,
         }
 

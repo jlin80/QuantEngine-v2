@@ -49,6 +49,10 @@ class Position:
         exit_reason: Motivo de cierre.
         decision_id: Decisión de origen.
         regime: Régimen de mercado al abrir.
+        strategy: Estrategia dominante de la decisión de origen ("" si no se
+            pudo atribuir). Determina el holding mínimo por estrategia.
+        strategy_category: Categoría de esa estrategia (smc, breakout, …),
+            usada como segundo escalón del fallback de holding mínimo.
         score: Score de la decisión de origen.
         confidence: Confianza de la decisión de origen.
         entry_reasons: Razones de entrada.
@@ -78,6 +82,8 @@ class Position:
     exit_reason: ExitReason | None = None
     decision_id: str | None = None
     regime: str = "unknown"
+    strategy: str = ""
+    strategy_category: str = ""
     score: float = 0.0
     confidence: float = 0.0
     entry_reasons: tuple[str, ...] = ()
@@ -179,6 +185,8 @@ class Position:
             "exit_reason": self.exit_reason.value if self.exit_reason else None,
             "decision_id": self.decision_id,
             "regime": self.regime,
+            "strategy": self.strategy,
+            "strategy_category": self.strategy_category,
             "score": self.score,
             "confidence": self.confidence,
             "entry_reasons": list(self.entry_reasons),

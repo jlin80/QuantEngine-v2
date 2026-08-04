@@ -373,3 +373,482 @@ habilitar la revisión ML del pipeline cuando haya historial de operaciones.
 **Regla respetada:** el laboratorio **no opera** y **nunca** habilita live —
 `allow_live=False`, `resolved_mode()→paper`—; la promoción exige aprobación
 humana. Repo sin commitear (commits manuales del usuario).
+
+## 2026-08-03 — Bloque 1: holding time por estrategia (y el artefacto de los 4s)
+
+**Categoría:** fix · **Tags:** `ejecucion` `regimen` `holding` `evaluacion-continua`
+
+**Diagnóstico.** El evaluador continuo daba +0.26R en señales virtuales y la
+ejecución real −0.15R. `regime_change_min_holding_seconds` era un valor **global**:
+un promedio que no le sirve a ninguna estrategia. `order_block` necesita ~1950s
+para resolver su tesis y `bos` ~135s; con un único umbral, o se corta al primero
+antes de tiempo o se deja al segundo sin salida útil por régimen.
+
+**Investigación del `choch` de 4s (punto 2 del bloque) — era un artefacto real.**
+`PerformanceTracker.evaluate_open` filtraba las velas con `c.end > opened_at`, lo
+que dejaba entrar la vela **en curso** en el momento de la señal. El rango
+high/low de esa vela incluye precio **anterior** a la señal, así que la operación
+virtual se resolvía contra movimiento que ya había ocurrido, y `closed_at` era el
+cierre de esa misma vela: de ahí una duración media de ~4s y una expectativa
+inflada. No era específico de `choch` — contaminaba a toda estrategia que dispara
+tarde dentro de la vela; `choch` sólo era la más expuesta.
+
+**Cambios.**
+- `PerformanceTracker.evaluate_open` sólo resuelve contra velas que **empiezan**
+  después de la entrada (`c.start >= opened_at`). Las métricas del evaluador
+  vuelven a medir sólo lo que la señal pudo prever.
+- Atribución de estrategia extremo a extremo: `Decision.primary_strategy` /
+  `primary_category` (derivadas de las contribuciones del consenso, deterministas)
+  → `DecisionGenerated.strategy`/`strategy_category` (viaja por el bus, la
+  ejecución no conoce los plugins) → `Position` → `TradeRecord`. Vacías cuando no
+  se puede atribuir (p. ej. posiciones adoptadas del broker al arrancar).
+- `ExecutionSettings.min_holding_seconds_for(strategy, category)`: fallback en
+  tres escalones — valor por estrategia → por categoría → global. Semillas
+  tomadas de la duración media del evaluador continuo.
+  **`choch` se deja sin valor propio a propósito** hasta tener muestra limpia
+  post-fix; cae a su categoría (`smc`, 900s).
+- El umbral aplicado a cada posición queda en `context_snapshot.min_holding_seconds`
+  del Trade Journal: sin eso no se puede auditar si una salida por régimen
+  respetó el holding por estrategia o cayó al fallback.
+- Whitelist del Config Center y `.env.example` actualizados (las dos tablas
+  nuevas aplican **en caliente**, como el valor global).
+
+**Intacto.** El límite de 4h (`max_holding_minutes`) se sigue evaluando **antes**
+que la salida por régimen: la red de seguridad global no se toca.
+
+**Deuda preexistente cerrada de paso (Bloque 7.4).** Los 3 errores de mypy en
+`app/cache/redis_backend.py` **no eran del código**: el venv tenía instalado
+`types-redis 4.6` (stubs obsoletos, deprecados desde que redis-py trae los suyos)
+que shadoweaba los tipos inline de `redis 8.0`. Desinstalado → los 3 desaparecen
+sin tocar el módulo. Cerrado también el `noqa: BLE001` inútil de
+`app/market/feed/feed.py:169`.
+
+**Tests.** 13 nuevos: resolución del umbral (propio / categoría / global /
+mayúsculas / `choch` sin valor propio), no-corte de `order_block` frente a corte
+de `bos` en la misma situación, viaje de la atribución hasta el journal,
+prioridad del límite de 4h, auditoría del umbral aplicado, y dos de regresión del
+evaluador (la vela en curso no resuelve; la posterior sí). Suite: **760 en verde**;
+`ruff` + `black` + `mypy --strict` limpios en todo el repo.
+
+**Arquitectura.** Sin acoplamiento nuevo: la atribución viaja por el Event Bus,
+no por llamadas directas. Sin código de fases futuras. Ningún camino, directo ni
+indirecto, hacia habilitar live.
+
+**Qué esperar.** Menos salidas por `regime_change` en las estrategias de tesis
+larga (smc/volume) y una duración mediana que sube hacia lo esperado por
+estrategia. La falsación automática de esto es el Bloque 7.1.
+
+## 2026-08-03 — Bloque 2: experimentos con fecha de corte por estrategia
+
+**Categoría:** feature · **Tags:** `ejecucion` `estrategias` `discord` `decision-asistida`
+
+**Diagnóstico.** `atr_expansion` y `mean_reversion` llevan R negativo consistente,
+pero la decisión de apagarlas dependía de que el operador se acordara de revisar
+los números tres días después de un cambio. Eso no escala y se olvida.
+
+**Propuesta implementada.** Un experimento con fecha de corte por estrategia:
+al vencer la ventana se mide la expectativa con las operaciones cerradas
+**dentro de la ventana**, y el sistema emite un veredicto.
+
+- `deactivation_candidate`: muestra suficiente y expectativa bajo el umbral →
+  aviso a Discord con los números y la propuesta.
+- `passed`: se recuperó → experimento cerrado sin acción.
+- `extended`: no hubo operaciones suficientes (< `min_trades`) → la ventana se
+  alarga en vez de emitir un veredicto con 3 operaciones, que sería ruido.
+
+**Regla dura respetada (punto 2 del bloque).** El mecanismo **no desactiva
+nada**. Publica `StrategyExperimentVerdict`, el `ExecutionNotifier` lo convierte
+en embed, y apagar la estrategia sigue siendo mover `strategies_enabled` a mano.
+Hay un test que lo fija explícitamente.
+
+**Por qué la ventana empieza con el experimento.** El experimento juzga a la
+estrategia **bajo las reglas nuevas** (holding por estrategia del Bloque 1).
+Contar operaciones anteriores al cambio mediría justo lo que el cambio pretendía
+arreglar. Test dedicado.
+
+**Toggle por estrategia.** `execution.strategies_enabled`, con la misma semántica
+que `symbols_enabled`: bloquea **sólo la apertura**. La estrategia sigue emitiendo
+señales y votando en el consenso, así que su historial no se corta y se puede
+medir qué habría hecho de haber operado. Una decisión sin atribución nunca se
+bloquea. En la whitelist del Config Center (aplica en caliente).
+
+**Persistencia.** Registro append-only en
+`data/execution/strategy_experiments.jsonl`. Sin rehidratación, cada reinicio
+del motor reiniciaría el reloj y la fecha de corte no llegaría nunca; el estado
+resultante (incluida una fecha de corte ya extendida) viaja con cada veredicto.
+Tres tests cubren el reinicio.
+
+**Cableado.** `StrategyExperimentManager` en el composition root, inyectado en el
+`ExecutionEngine`; job `strategy_experiment_check` en el scheduler (1h,
+`run_immediately`), detrás de `execution.experiments.enabled`.
+
+**Tests.** 15 nuevos. Suite: **775 en verde**; `ruff` + `black` + `mypy --strict`
+limpios.
+
+**Arquitectura.** El gestor no conoce el Event Bus ni Discord: devuelve
+veredictos y el motor los publica — testeable en aislamiento y sin acoplar la
+capa de notificación. Sin funcionalidad de fases futuras. Ningún camino hacia
+live.
+
+## 2026-08-03 — Bloque 3: el Meta Strategy Manager gobernando de verdad
+
+**Categoría:** fix · **Tags:** `ml` `meta-strategy` `gobierno` `auditoria` `fase-7`
+
+**Diagnóstico.** El MSM "existía pero no gobernaba nada útil" por **dos** motivos
+independientes, no uno:
+
+1. **No veía estrategias.** `StrategyIntelligence.label_trades` leía la
+   estrategia de `context_snapshot["strategy"]`, que nadie rellenaba nunca. Su
+   propio docstring lo anticipaba: *"cuando la ejecución rellene el snapshot con
+   la estrategia dominante, esto queda cableado sin cambios"*. Como no se
+   rellenaba, **todas** las operaciones caían al default `"portfolio"` y el MSM
+   recibía una única entrada agregada — de ahí el `weights: {"portfolio": 1.04}`.
+2. **Nadie aplicaba sus decisiones.** `StrategyWeightsUpdated` sólo tenía un
+   suscriptor: el notificador de Discord. Los pesos que usaba el consenso
+   seguían siendo los de configuración, fijos desde el arranque. El MSM
+   calculaba, publicaba, avisaba... y no cambiaba nada.
+
+**Cambios.**
+- `label_trades` prefiere ahora `trade.strategy` (el campo de primera clase que
+  anadio el Bloque 1), con `context_snapshot` como compatibilidad para el
+  journal antiguo y `"portfolio"` solo para lo genuinamente no atribuible
+  (posiciones adoptadas del broker al arrancar).
+- **`MetaGovernanceApplier`** (`app/engine/meta_governance/`): servicio que
+  escucha `StrategyWeightsUpdated` y `MetaStrategyDecision` y los traduce a
+  `StrategyEngine.set_weight` / `enable_strategy` / `disable_strategy`. Nuevo
+  `StrategyEngine.set_weight`, que refleja el peso tambien en `stats` para que
+  el dashboard muestre el vigente y no el de arranque.
+- `MLEngine.run_meta_evaluation` publica ademas una `MetaStrategyDecision` por
+  cada `disable`/`enable`: el aplicador necesita saber *que* estrategia y por
+  que, no solo el mapa de pesos.
+- **Evidencia mixta (punto 1 del bloque).** El MSM combina las dos fuentes por
+  estrategia: el Trade Journal (Fase 5, lo que la ejecucion capturo) y el
+  evaluador continuo (Fase 4, la calidad de la senal en si). El segundo pesa
+  `1 - trades/min_trades` mientras la muestra ejecutada sea escasa: 4
+  operaciones cerradas no son evidencia para mover un peso, pero esa misma
+  estrategia puede tener cientos de senales resueltas. `VirtualStrategyStats` se
+  declara en la capa de ML y el composition root adapta el `PerformanceTracker`,
+  para que ML no dependa de `app.engine.evaluation`.
+
+**Limites deliberados.**
+- **La evidencia virtual nunca desactiva** una estrategia: no incluye costes,
+  slippage ni salidas por regimen. Solo influye en el peso. Test dedicado.
+- El aplicador solo mueve **configuracion**. No abre ni cierra posiciones, no
+  toca codigo y no puede habilitar live: no conoce la ejecucion ni el Live Gate.
+- **Todo cambio efectivo se audita** (append-only, con peso anterior, nuevo,
+  actor `meta_strategy_manager` y motivo). Un peso que cambia solo y sin rastro
+  es indistinguible de un bug. Un peso sin cambio real no ensucia la auditoria.
+- `ml.meta.apply_governance=false` deja el aplicador en **modo observacion**:
+  registra lo que habria hecho sin tocar nada. Util para mirar al MSM antes de
+  dejarle gobernar.
+
+**Tests.** 15 nuevos. Suite: **790 en verde**; `ruff` + `black` + `mypy --strict`
+limpios.
+
+**Arquitectura.** Todo por el Event Bus: el MSM no conoce al Strategy Engine ni
+al reves. Sin funcionalidad de fases futuras. Ningun camino hacia live.
+
+## 2026-08-03 — Bloque 4: sanear los datos de entrenamiento del ML
+
+**Categoria:** feature · **Tags:** `ml` `training-set` `eras` `etiquetas` `auditoria`
+
+**Diagnostico.** El ML entrena con el historial que genera el propio motor, y ese
+historial arrastra bugs de ejecucion ya arreglados. Entrenando sin distinguirlos,
+el modelo no aprende "esta senal es mala": aprende "esta senal es mala **porque
+la ejecucion la saboteo**", y acaba penalizando contextos que si tenian edge.
+
+**Defensa 1 — segmentacion y ponderacion por era** (`app/ml/datasets/eras.py`,
+configurable en `ml.data_quality`). Cada operacion se clasifica por su **hora de
+entrada** (lectura conservadora: una operacion abierta antes de un fix corrio
+bajo las reglas viejas casi toda su vida, aunque cerrara despues):
+
+| Era | Hasta | Peso | Criterio |
+| --- | --- | --- | --- |
+| `pre_contract_size_y_familias_regimen` | 2026-07-27 | 0.0 (excluida) | Stop mal calculado: su R **no mide la senal, mide un stop equivocado**. No es muestra floja, es medicion invalida. |
+| `pre_trailing_activate_r` | 2026-07-29 | 0.35 | Sesgo real pero **acotado y direccional**; la entrada y su contexto siguen siendo validos. |
+| `post_fixes` | — | 1.0 | Historial limpio. |
+
+Las eras son **declarativas**: cuando se arregle el proximo bug de ejecucion
+basta anadir una entrada a la configuracion, sin fechas incrustadas en codigo.
+
+**Defensa 2 — etiqueta dual (punto 2b del bloque).** Se separan dos preguntas
+que no son la misma:
+- `win`/`rr_positive`/`not_stopped` -> **calidad de ejecucion** (todas las salidas).
+- `signal_quality` -> **calidad de la senal**: solo cuentan las operaciones cuyo
+  cierre **resolvio la tesis** (objetivo/stop/trailing/BE). Las que cerro la
+  ejecucion (regimen, tiempo, kill switch, manual) se descartan: esa operacion
+  nunca puso a prueba su propia tesis, y etiquetarla como "senal mala" es
+  exactamente el error que este bloque evita.
+
+Cada dataset declara que mide en `metadata["label_measures"]`.
+
+**Correccion de alineacion.** `Dataset.subset` no cortaba los vectores por fila:
+tras un split, cada muestra habria heredado el peso de otra. Ahora
+`sample_weights`/`sample_eras` se cortan con las filas. Test dedicado.
+
+**Auditoria (punto 3).** `dataset.metadata["era_breakdown"]`,
+`MLEngine.data_quality_report()` y `/api/ml/status` responden "que datos entraron
+al entrenamiento y por que" sin releer el journal. Cada exclusion lleva su motivo
+escrito; hay un test que exige que no este vacio. Documentado en `docs/ml.md`.
+
+**Limitacion documentada, no disimulada.** La fuente de verdad ideal para la
+calidad de senal es el evaluador continuo, pero **hoy no se puede unir fila a
+fila** con el Trade Journal: el evaluador guarda estadistica agregada por
+estrategia, no el resultado virtual de cada senal, y el `TradeRecord` lleva
+`decision_id` pero no los `signal_id` que lo originaron. Por eso
+`signal_quality` se aproxima desde el propio journal filtrando por motivo de
+salida — aproximacion honesta y sin lookahead, pero sigue midiendo operaciones
+ejecutadas. Cerrar el hueco exige (1) persistir el resultado virtual por
+`signal_id` y (2) propagar los `signal_id` hasta el `TradeRecord`. Anotado en
+`docs/ml.md` como pendiente explicito.
+
+**Nota sobre los fixtures.** Los de test se movieron de 2026-01-01 a 2026-08-01:
+con las fechas antiguas caian en la era excluida y la suite se quedaba sin datos.
+Es la senal de que el filtro funciona.
+
+**Tests.** 14 nuevos, incluido el que pide el punto 4 del bloque
+(`test_a_trade_from_a_buggy_era_never_enters_with_the_same_weight_as_a_clean_one`).
+Suite: **804 en verde**; `ruff` + `black` + `mypy --strict` limpios.
+
+**Arquitectura.** Sin acoplamiento nuevo; el saneamiento vive en la capa de
+datasets del ML. Ningun camino hacia live.
+
+## 2026-08-03 — Bloque 5: gate de vigencia del ML frente a las reglas de ejecucion
+
+**Categoria:** feature · **Tags:** `ml` `gate` `reentrenamiento` `discord`
+
+**Diagnostico.** `min_cv_auc` evita **activar un modelo malo**. Falta detectar
+algo distinto: que un modelo **bueno** dejo de ser representativo porque
+cambiaron las reglas bajo las que se entreno. Nada en sus metricas lo delata —
+su AUC de validacion sigue siendo el mismo numero de ayer — asi que sigue
+asesorando con la estadistica de un motor que ya no existe.
+
+Es un riesgo inmediato, no teorico: el Bloque 1 acaba de cambiar el holding.
+
+**Solucion.** `app/ml/monitoring/execution_rules.py` calcula un **hash de las
+reglas de ejecucion significativas**, agrupadas en cuatro familias (las que
+nombra el bloque): `holding`, `trailing`, `sizing`, `risk`, mas `toggles` de
+simbolos/estrategias. La huella se congela junto al modelo al registrarlo
+(`ModelRecord.execution_rules_hash` + instantanea legible) y se compara con la
+vigente.
+
+**Lo que queda deliberadamente fuera de la huella:** cadencias, rutas de fichero
+e intervalos de reporte. Una alerta que salta por cambios inocuos entrena al
+operador a ignorarla. Hay un test que fija esto.
+
+**Cuatro estados**, no dos:
+- `ok` — el modelo se entreno con las reglas vigentes.
+- `stale` — cambiaron; **requiere reentrenamiento**. La alerta dice **que familia
+  de reglas** cambio, no solo que algo cambio.
+- `unknown` — modelo registrado antes de que existiera este control. No se
+  afirma que este obsoleto, solo que no consta: se sugiere reentrenar para fijar
+  la huella.
+- `no_model` — nada que validar.
+
+**Regla dura respetada (punto 2 del bloque).** El gate **alerta y sugiere**, y
+nunca desactiva el modelo, activa otro ni dispara un reentrenamiento automatico.
+Un reentrenamiento automatico ante cualquier cambio de configuracion seria una
+via comoda para que el motor se reentrene solo sobre datos que aun no existen.
+El test `test_a_stale_model_raises_an_alert_and_stays_active` comprueba que tras
+la alerta el modelo sigue activo y con el mismo id.
+
+**Cableado.** Job `ml_execution_rules_check` (1h, `run_immediately`), evento
+`ModelRequiresRetraining` y su embed de Discord — que incluye explicitamente
+"Accion tomada: ninguna (el ML asesora, no decide)".
+
+`RULES_VERSION` permite invalidar todas las huellas a proposito si cambia *que*
+reglas se consideran significativas.
+
+**Tests.** 13 nuevos. Suite: **817 en verde**; `ruff` + `black` + `mypy --strict`
+limpios.
+
+**Arquitectura.** El gate solo diagnostica y publica un evento; Discord reacciona
+desacoplado. Ningun camino hacia live.
+
+## 2026-08-03 — Bloque 6: Research Lab al scheduler con presupuesto de CPU
+
+**Categoria:** feature · **Tags:** `research` `fase-10` `scheduler` `cpu` `presupuesto`
+
+**Diagnostico.** El ciclo autonomo ya existia (`auto_cycle`), pero **sin ningun
+techo**: ni ventana horaria, ni tope de trabajo por ejecucion, ni timeout. Un
+ciclo de generacion son cientos de backtests, y comparte VPS con el bucle de
+gestion de posiciones, que corre cada 2s y es el unico que no puede llegar tarde.
+
+**Tres limites duros** (`app/research/budget.py`, `settings.research.budget`):
+- **Ventana horaria** 01:00-05:00 UTC por defecto — entre el cierre americano y
+  la apertura europea. `start == end` = siempre abierta (forma explicita de
+  quitar solo la restriccion horaria).
+- **Tope de trabajo**: 2 simbolos x 12 genomas. `max_generated_per_run` es la
+  variable que mas multiplica el numero de backtests.
+- **Timeout duro** de 900s con `asyncio.wait_for`: un ciclo colgado no puede
+  seguir consumiendo CPU hasta el disparo siguiente. Los candidatos ya
+  registrados se conservan.
+
+**Dos vetos de cortesia**: no arrancar con posiciones abiertas (el laboratorio
+puede esperar; una posicion viva, no) ni con la CPU por encima del 70%. Un
+sensor de CPU que no reporta **no bloquea** — misma regla que Safe Mode.
+
+**Decision de diseno.** `budget.enabled=false` **deniega**, no relaja: un
+laboratorio sin techo en la VPS que opera es justo lo que se evita. Test dedicado.
+
+**Punto 4 respetado: no se activa nada.** `auto_cycle` sigue en `false` por
+defecto. Hay un test que lo fija.
+
+**Puntos 1 y 2 — documentacion, sin decidir por el usuario.** `docs/research.md`
+lleva ahora el consumo estimado (24 pipelines/ciclo, ~2 vCPU saturados durante
+como mucho 15 min, una vez al dia) y el analisis **misma VPS vs otra maquina**
+con pros y contras de ambas. La recomendacion se deja como lectura, no como
+decision: la misma VPS es razonable para acumular la primera evidencia; mover
+tiene sentido cuando el cuello de botella sea el research y no la falta de
+experimentos.
+
+> El consumo es una estimacion de orden de magnitud, **no medida en la VPS**.
+> Hay que verificarla con una ejecucion real antes de dejarlo activo.
+
+**Punto 3 intacto.** La promocion sigue exigiendo aprobacion humana
+(PromotionManager fail-closed); nada de esto cambia con el ciclo activado.
+
+**Bug preexistente cerrado de paso.** `app/dashboard/api/routes/system.py`
+importaba `QuantEngine` al nivel superior, cerrando un ciclo
+`engine.engine -> dashboard.api -> routes.system -> engine.engine`. Cualquier
+proceso que importara `app.engine.engine` primero fallaba — es decir, el fallo
+dependia del **orden de importacion**, no del codigo, y los tests que tocaban el
+motor no se podian ejecutar en aislamiento. Import diferido dentro de la funcion.
+
+**Tests.** 15 nuevos. Suite: **832 en verde**; `ruff` + `black` + `mypy --strict`
+limpios.
+
+**Arquitectura.** El presupuesto decide y explica; el motor aplica. Se prueba sin
+levantar el laboratorio. Ningun camino hacia live.
+
+## 2026-08-03 — Bloque 7: robustez adicional
+
+**Categoria:** feature+fix · **Tags:** `falsacion` `sizing` `deuda` `oro`
+
+### 7.1 — Falsacion automatica del cambio del Bloque 1 (implementado)
+
+"Se desplego sin errores" no es evidencia de que un cambio funcione. El Bloque 1
+hizo tres predicciones concretas y `app/execution/falsification.py` las mide
+solo en su ventana (48h por defecto):
+
+1. `take_profit` **sube del 0 %** — si ninguna operacion llega al objetivo, el
+   holding sigue cortando la tesis antes de tiempo.
+2. `regime_change` **baja del 80 %** — era el sintoma original.
+3. La **duracion mediana** se acerca a la esperada **por estrategia** (no a un
+   numero global: `bos` espera 135s y `order_block` 1950s, y comparar contra un
+   promedio no diria nada).
+
+Decisiones que importan:
+- El veredicto se publica **acierte o falle**. Una prediccion que solo se reporta
+  cuando se cumple no es una falsacion, es una felicitacion. Test dedicado.
+- Muestra insuficiente **extiende la ventana** en vez de concluir con ruido.
+- Solo se exige que la duracion **no se quede corta**: pasarse de largo ya lo
+  acota el limite global de 4h, y no era el fallo que este cambio corregia.
+- El modulo no cambia ninguna configuracion. Solo mide y publica.
+
+Cableado: job `holding_falsification_check` (1h), evento `HoldingChangeFalsified`
+y su embed de Discord. Estado persistido, asi que un reinicio no reinicia la
+ventana ni repite el veredicto.
+
+### 7.3 — Sizing frente al crecimiento del capital (documentado)
+
+Nueva seccion en `docs/architecture.md` con los hitos de revision (~$1 000,
+~$2 000-5 000, ~$20 000) y los cuatro parametros que hay que revisar **juntos**,
+porque se calibraron juntos. El punto de fondo, escrito explicitamente: el tope
+alto **no expresa apetito de riesgo, expresa una restriccion de granularidad del
+broker** (que el lote minimo quepa). Por eso envejece mal — deja de ser necesario
+mucho antes de dejar de estar configurado, y el modo de fallo no es un error sino
+riesgo silencioso.
+
+### 7.4 — Deuda preexistente (cerrada en el Bloque 1)
+
+- Los 3 mypy de `app/cache/redis_backend.py` **no eran del codigo**: `types-redis`
+  4.6 (stubs deprecados) shadoweaba los tipos inline de redis 8.0.
+- Cerrado el `noqa: BLE001` inutil de `app/market/feed/feed.py:169`.
+- `black` no estaba instalado en el venv y habia 9 ficheros con drift de formato;
+  instalado con el pin del repo (26.5.1) y formateado.
+
+### 7.2 — Churn del oro: PENDIENTE, y no por olvido
+
+Los 72 cierres/dia del oro habia que retomarlos **una vez aplicado el Bloque 1**,
+porque el holding por estrategia probablemente los cambie. El Bloque 1 esta
+implementado pero **no desplegado**, asi que todavia no hay datos post-cambio que
+medir: cualquier conclusion ahora seria sobre el regimen viejo.
+
+El instrumento para medirlo ya existe: la falsacion del 7.1 mide exactamente la
+mezcla de salidas y la duracion mediana. Cuando el veredicto llegue, el churn del
+oro se lee de ahi. Queda anotado como el siguiente paso tras el despliegue.
+
+**Tests.** 14 nuevos. Suite: **846 en verde**; `ruff` + `black` + `mypy --strict`
+limpios en todo el repo.
+
+## 2026-08-04 — INCIDENTE: el motor lleva 4 dias sin operar (reloj congelado)
+
+**Categoria:** incident · **Tags:** `produccion` `reloj` `backtesting` `websocket` `postmortem`
+
+### Sintoma
+
+Spam de alertas y **cero operaciones** desde el 31/07. El motor no estaba caido:
+respondia a la API, tenia 0 posiciones abiertas y `app.log` rotaba **10 MB cada
+35 minutos**.
+
+### Causa raiz: el reloj de replay se filtro al motor en vivo
+
+`app/utils/time.py` guardaba el proveedor de tiempo en un **global de modulo**, y
+el `BacktestLab` corre en el **mismo proceso y el mismo event loop** que el motor.
+El 2026-07-31 a las 16:41 UTC un backtest instalo el reloj simulado con
+`use_clock(...)` y su bloque nunca llego a cerrarse (tarea colgada o cancelada sin
+desenrollar). `backtesting/status` mostraba `experiments: 0`, coherente con
+"arranco y no termino".
+
+A partir de ahi `utc_now()` devolvia siempre `2026-07-31T16:41:00`. Todas las
+lineas de log llevaban ese timestamp, identico al segundo, durante 4 dias.
+
+**Por que dejo de operar:** el validador de mercado compara el timestamp de cada
+tick contra `utc_now()`. Con el reloj 3,5 dias atrasado, **todo** tick del broker
+parecia venir del futuro:
+
+```
+Data quality [ETHUSDM] future_timestamp:
+exchange_ts=2026-08-04T04:04:55 > local+0:00:05 (discard=True)
+```
+
+Descarte del 100% de los ticks -> sin velas -> sin señales -> sin decisiones ->
+sin operaciones. **Ninguna alarma salto porque el motor no estaba caido: estaba
+ciego**, y ninguna metrica reflejaba la hora interna.
+
+**Arreglo.** El proveedor pasa a un `ContextVar`. El reloj simulado alcanza solo
+a la tarea que lo instala y a las que ella crea — el alcance real de un backtest —
+y las tareas del motor en vivo siguen viendo el reloj de pared **pase lo que pase
+con el bloque**. 11 tests nuevos, incluidos el de tareas hermanas y el del bloque
+que nunca se cierra (ambos fallaban con la implementacion anterior).
+
+**Red de seguridad.** `HealthMonitor` mide ahora `clock_skew_seconds` (reloj
+efectivo vs. reloj de pared, via `wall_now()`, que ignora el inyectado). Una
+desviacion por encima de `health.max_clock_skew_seconds` (5s) marca el sistema
+**UNHEALTHY**, no degradado: con el reloj mal el motor deja de operar en silencio.
+
+### Segundo bug, independiente: fuga de suscripciones en el WebSocket
+
+El 75% de las lineas de log eran `asyncio | WARNING | socket.send() raised
+exception.`. CPython lo emite en `proactor_events.py` cuando se escribe sobre un
+transporte con `_conn_lost`, a partir del 5º intento — y **no lanza excepcion**,
+descarta y vuelve.
+
+El endpoint `/ws/events` era un `while True` que solo salia con
+`WebSocketDisconnect`. Cuando el cliente desaparece sin cierre limpio (pestaña
+cerrada, red caida, dashboard reiniciado) `send_json` no lanza, asi que el bucle
+seguia consumiendo eventos y "enviandolos" a un socket muerto indefinidamente:
+un WARNING por cada evento del motor y **una suscripcion al bus que nunca se
+liberaba**. Cada recarga del dashboard dejaba otro zombi acumulando ruido.
+
+**Arreglo.** El envio va a una tarea aparte y el endpoint se queda en
+`websocket.receive()`, que es la unica señal fiable de desconexion en un canal
+de solo lectura. 2 tests de regresion sobre el contador de suscriptores del bus.
+
+### Deuda de diseño anotada
+
+El motor estuvo 4 dias sin operar y **nada aviso**. El `clock_skew` cubre esta
+causa concreta, pero no la clase de fallo: convendria una alarma sobre la **tasa
+de descarte del validador** (100% sostenido = ciego) y sobre **ausencia de
+señales** en ventana de mercado abierto. Pendiente, no hecho.

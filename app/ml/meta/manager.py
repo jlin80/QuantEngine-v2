@@ -11,7 +11,7 @@ ponderación). Y nunca abre ni cierra posiciones: sus pesos alimentan al consens
 que sigue pasando por el Decision Engine y el Risk Manager. Solo paper trading.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +21,7 @@ from app.ml.services.strategy_intelligence import (
     LabeledTrade,
     StrategyIntelligence,
     StrategyScore,
+    VirtualStrategyStats,
 )
 from app.utils.time import utc_now
 
@@ -62,15 +63,36 @@ class MetaStrategyManager:
         self._weights: dict[str, float] = {}
         self._active: dict[str, bool] = {}
         self._fail_counts: dict[str, int] = {}
+        # Nº de operaciones visto en la última evaluación de cada estrategia:
+        # sirve para no contar dos veces la misma evidencia (ver `_govern`).
+        self._seen_trades: dict[str, int] = {}
         self._audit: list[dict[str, Any]] = []
         self._evaluations = 0
 
-    def evaluate(self, labeled_trades: Sequence[LabeledTrade]) -> MetaReport:
-        """Score strategies and adjust their weights/activation."""
+    def evaluate(
+        self,
+        labeled_trades: Sequence[LabeledTrade],
+        virtual: Mapping[str, VirtualStrategyStats] | None = None,
+    ) -> MetaReport:
+        """Score strategies and adjust their weights/activation.
+
+        Args:
+            labeled_trades: Operaciones ejecutadas etiquetadas por estrategia
+                (Trade Journal, Fase 5). Miden lo que el motor **capturó**.
+            virtual: Rendimiento por estrategia del evaluador continuo (Fase 4).
+                Mide la calidad de la señal *en sí*, sin ejecución de por medio.
+                Se usa como **prior** mientras la muestra ejecutada sea escasa:
+                una estrategia con 4 operaciones cerradas no da evidencia para
+                mover su peso, pero puede tener cientos de señales evaluadas.
+
+        Returns:
+            El informe del ciclo, con pesos, decisiones y auditoría.
+        """
         scores = self._intelligence.rank(labeled_trades)
+        virtual_stats = dict(virtual or {})
         decisions: list[dict[str, Any]] = []
         for score in scores:
-            decisions.append(self._govern(score))
+            decisions.append(self._govern(score, virtual_stats.get(score.name)))
         self._evaluations += 1
         active = [name for name, on in self._active.items() if on]
         disabled = [name for name, on in self._active.items() if not on]
@@ -82,22 +104,41 @@ class MetaStrategyManager:
             ranking=[s.to_dict() for s in scores],
         )
 
-    def _govern(self, score: StrategyScore) -> dict[str, Any]:
+    def _govern(
+        self, score: StrategyScore, virtual: VirtualStrategyStats | None = None
+    ) -> dict[str, Any]:
         """Decide activation and weight for a single strategy."""
         name = score.name
         previous_weight = self._weights.get(name, 1.0)
         was_active = self._active.get(name, True)
         degraded = self._is_degraded(score)
-        self._fail_counts[name] = self._fail_counts.get(name, 0) + 1 if degraded else 0
+
+        # Sólo cuenta como "periodo degradado" si hay evidencia NUEVA. Sin esta
+        # guarda, evaluar cada hora sobre el mismo historial cerrado convierte
+        # una única observación en N observaciones: `disable_after_periods=3`
+        # dejaba de significar "degradada de forma sostenida" y pasaba a
+        # significar "degradada, y han pasado 3 horas". Los periodos tienen que
+        # ser observaciones independientes o el umbral no mide nada.
+        fresh_evidence = self._seen_trades.get(name) != score.trades
+        self._seen_trades[name] = score.trades
+        if degraded and fresh_evidence:
+            self._fail_counts[name] = self._fail_counts.get(name, 0) + 1
+        elif not degraded:
+            self._fail_counts[name] = 0
+
+        effective_score, evidence = self._effective_score(score, virtual)
 
         if self._fail_counts[name] >= self._settings.disable_after_periods:
             self._active[name] = False
             self._weights[name] = self._settings.min_weight
-            action = "disable"
+            # `disable` sólo es una DECISIÓN la primera vez; a partir de ahí es
+            # un estado. Reanunciarlo en cada vuelta llenaba Discord de avisos
+            # idénticos y hacía que el aplicador reescribiera lo ya aplicado.
+            action = "disable" if was_active else "keep_disabled"
             detail = f"Degradada {self._fail_counts[name]} evaluaciones seguidas; se desactiva."
         else:
             self._active[name] = True
-            target = self._target_weight(score.score)
+            target = self._target_weight(effective_score)
             new_weight = previous_weight + self._settings.weight_smoothing * (
                 target - previous_weight
             )
@@ -116,16 +157,58 @@ class MetaStrategyManager:
             "detail": detail,
             "metrics": {
                 "score": round(score.score, 2),
+                "effective_score": round(effective_score, 2),
                 "trades": score.trades,
                 "expectancy_r": round(score.recent.expectancy_r, 4),
                 "profit_factor": round(score.recent.profit_factor, 4),
             },
+            # Qué evidencia sostuvo esta decisión (ejecutada / virtual / mixta)
+            # y con qué peso. Sin esto no se puede auditar por qué subió el peso
+            # de una estrategia con 4 operaciones cerradas.
+            "evidence": evidence,
         }
-        if action != "keep":
+        if action not in ("keep", "keep_disabled"):
             self._audit.append(
                 {"evaluation": self._evaluations, "at": utc_now().isoformat(), **decision}
             )
         return decision
+
+    def _effective_score(
+        self, score: StrategyScore, virtual: VirtualStrategyStats | None
+    ) -> tuple[float, dict[str, Any]]:
+        """Blend executed and virtual evidence into the score that sets weight.
+
+        La muestra ejecutada manda en cuanto es suficiente. Por debajo de
+        ``min_trades`` su peso decrece linealmente y el resto lo aporta el
+        evaluador continuo, que para entonces suele tener cientos de señales
+        resueltas de la misma estrategia. Sin esto, una estrategia con 4
+        operaciones cerradas movía su peso con evidencia que no es evidencia.
+
+        Nota deliberada: esto **sólo** afecta al peso. La desactivación
+        (:meth:`_is_degraded`) sigue exigiendo muestra ejecutada — no se apaga
+        una estrategia por su rendimiento virtual, que no incluye costes,
+        slippage ni salidas por régimen.
+
+        Returns:
+            El score efectivo y la traza de qué evidencia lo sostiene.
+        """
+        min_trades = max(1, self._settings.min_trades)
+        executed_weight = min(1.0, score.trades / min_trades)
+        if virtual is None or virtual.evaluated <= 0 or executed_weight >= 1.0:
+            return score.score, {
+                "source": "executed",
+                "executed_weight": round(executed_weight, 4),
+                "executed_trades": score.trades,
+            }
+        virtual_score = virtual.score()
+        blended = executed_weight * score.score + (1.0 - executed_weight) * virtual_score
+        return blended, {
+            "source": "blended" if score.trades else "virtual",
+            "executed_weight": round(executed_weight, 4),
+            "executed_trades": score.trades,
+            "virtual_score": round(virtual_score, 2),
+            "virtual": virtual.to_dict(),
+        }
 
     def _is_degraded(self, score: StrategyScore) -> bool:
         """Whether a strategy currently fails the minimum criteria."""

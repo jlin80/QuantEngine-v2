@@ -154,3 +154,51 @@ class DiscordNotificationFailed(Event):
 
     title: str
     error: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class StrategyExperimentOpened(Event):
+    """Se abrió un experimento con fecha de corte sobre una estrategia."""
+
+    strategy: str
+    deadline: str  # ISO-8601 UTC
+    min_trades: int
+    max_expectancy_r: float
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class StrategyExperimentVerdict(Event):
+    """Venció un experimento y se emitió su veredicto.
+
+    ``outcome`` es ``deactivation_candidate`` / ``passed`` / ``extended``.
+    Un veredicto **nunca** desactiva la estrategia: sólo informa. Apagarla es
+    mover ``execution.strategies_enabled`` a mano.
+    """
+
+    strategy: str
+    outcome: str
+    trades: int
+    expectancy_r: float
+    win_rate: float
+    total_r: float
+    window_hours: float
+    detail: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class HoldingChangeFalsified(Event):
+    """Veredicto de la falsación del cambio de holding por estrategia.
+
+    ``outcome`` es ``confirmed`` / ``refuted`` / ``pending``. Se publica
+    **acierte o falle**: una predicción que sólo se reporta cuando se cumple no
+    es una falsación, es una felicitación.
+    """
+
+    outcome: str
+    trades: int
+    window_hours: float
+    take_profit_pct: float
+    regime_change_pct: float
+    median_holding_seconds: float
+    expected_holding_seconds: float
+    detail: str

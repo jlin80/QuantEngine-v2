@@ -292,9 +292,15 @@ def test_open_broker_positions_maps_detail() -> None:
     fake = FakeMT5(
         positions=[
             SimpleNamespace(
-                ticket=584945506, symbol="USTECm", type=0, volume=0.01,
-                price_open=28073.69, sl=28031.58, tp=28136.86,
-                time=1785270000, magic=777_001,
+                ticket=584945506,
+                symbol="USTECm",
+                type=0,
+                volume=0.01,
+                price_open=28073.69,
+                sl=28031.58,
+                tp=28136.86,
+                time=1785270000,
+                magic=777_001,
             )
         ]
     )
@@ -315,8 +321,15 @@ def test_open_broker_positions_ignores_foreign_magic() -> None:
     fake = FakeMT5(
         positions=[
             SimpleNamespace(
-                ticket=1, symbol="XAUUSDm", type=0, volume=0.01, price_open=4000.0,
-                sl=0.0, tp=0.0, time=1785270000, magic=999_999,
+                ticket=1,
+                symbol="XAUUSDm",
+                type=0,
+                volume=0.01,
+                price_open=4000.0,
+                sl=0.0,
+                tp=0.0,
+                time=1785270000,
+                magic=999_999,
             )
         ]
     )
@@ -330,8 +343,15 @@ def test_open_broker_positions_maps_missing_stops_to_none() -> None:
     fake = FakeMT5(
         positions=[
             SimpleNamespace(
-                ticket=7, symbol="ETHUSDm", type=1, volume=0.27, price_open=1946.24,
-                sl=0.0, tp=0.0, time=1785270000, magic=777_001,
+                ticket=7,
+                symbol="ETHUSDm",
+                type=1,
+                volume=0.27,
+                price_open=1946.24,
+                sl=0.0,
+                tp=0.0,
+                time=1785270000,
+                magic=777_001,
             )
         ]
     )

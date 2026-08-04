@@ -179,3 +179,42 @@ def test_disabled_tracker_ignores_everything(tmp_path: Path):
     tracker = _tracker(tmp_path, make_market(), enabled=False)
     _record(tracker, **_levels())
     assert tracker.status()["strategies"] == {}
+
+
+def test_the_candle_in_progress_at_entry_never_resolves_the_trade(tmp_path: Path):
+    """Regresión: una señal no se resuelve contra precio anterior a ella misma.
+
+    El filtro anterior (``c.end > opened_at``) dejaba entrar la vela EN CURSO
+    cuando la señal disparaba, cuyo rango incluye movimiento previo a la señal.
+    Efecto medido en producción: `choch` mostraba una duración media de ~4s
+    (disparaba cerca del cierre de vela y esa misma vela la "resolvía") y una
+    expectativa inflada. Aquí la vela de entrada barre el stop ANTES de la
+    señal: no debe contar, y la operación queda viva.
+    """
+    candle_start = utc_now() - timedelta(minutes=30)
+    # Vela de entrada: su mínimo (98.5) perfora el stop (99.0), pero eso ya
+    # había ocurrido cuando la señal dispara, 30s después del inicio de vela.
+    candles = make_candles([100.0], start=candle_start, highs=[100.2], lows=[98.5])
+    tracker = _tracker(tmp_path, make_market(candles=candles))
+    _record(tracker, timestamp=candle_start + timedelta(seconds=30), **_levels())
+
+    resolved = tracker.evaluate_open()
+
+    assert resolved == 0
+    perf = tracker.performance("alpha")
+    assert perf is not None
+    assert perf.tracked == 1
+    assert perf.evaluated == 0, "no puede resolverse con precio previo a la señal"
+
+
+def test_candles_starting_after_entry_do_resolve_the_trade(tmp_path: Path):
+    """La contrapartida: el precio POSTERIOR a la señal sí la resuelve."""
+    candle_start = utc_now() - timedelta(minutes=30)
+    candles = make_candles([100.0, 102.5], start=candle_start, range_pad=0.1)
+    tracker = _tracker(tmp_path, make_market(candles=candles))
+    _record(tracker, timestamp=candle_start + timedelta(seconds=30), **_levels())
+
+    assert tracker.evaluate_open() == 1
+    perf = tracker.performance("alpha")
+    assert perf is not None
+    assert perf.wins == 1

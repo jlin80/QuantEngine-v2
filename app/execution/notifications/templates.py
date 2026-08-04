@@ -12,12 +12,14 @@ from typing import Any
 from app.execution.events import (
     BreakEvenActivated,
     CircuitBreakerTriggered,
+    HoldingChangeFalsified,
     KillSwitchTriggered,
     OrderRejected,
     PositionClosed,
     PositionOpened,
     RiskTriggered,
     StopMoved,
+    StrategyExperimentVerdict,
     TrailingUpdated,
 )
 from app.notifications.models import Notification, NotificationLevel
@@ -194,6 +196,70 @@ def report(title: str, snapshot: dict[str, Any], performance: dict[str, Any]) ->
             "Profit factor": f"{performance.get('profit_factor', 0):.2f}",
             "Expectativa": _money(performance.get("expectancy", 0.0)),
             "Operaciones": str(performance.get("total_trades", 0)),
+        },
+        source="execution",
+    )
+
+
+_VERDICT_STYLE: dict[str, tuple[str, NotificationLevel]] = {
+    "deactivation_candidate": ("🚩 Candidata a desactivación", NotificationLevel.WARNING),
+    "passed": ("✅ Estrategia recuperada", NotificationLevel.SUCCESS),
+    "extended": ("⏳ Experimento extendido", NotificationLevel.INFO),
+}
+
+
+def strategy_experiment_verdict(event: StrategyExperimentVerdict) -> Notification:
+    """Embed for the verdict of a cut-off experiment on a strategy.
+
+    El aviso lleva los números y la propuesta, nunca una acción ya tomada: el
+    sistema no desactiva estrategias por su cuenta.
+    """
+    headline, level = _VERDICT_STYLE.get(
+        event.outcome, ("📋 Veredicto de experimento", NotificationLevel.INFO)
+    )
+    return Notification(
+        title=f"{headline} · {event.strategy}",
+        message=event.detail,
+        level=level,
+        fields={
+            "Estrategia": event.strategy,
+            "Expectativa": f"{event.expectancy_r:+.3f} R",
+            "Operaciones": str(event.trades),
+            "Win rate": f"{event.win_rate * 100:.0f}%",
+            "R acumulada": f"{event.total_r:+.2f} R",
+            "Ventana": f"{event.window_hours:.0f} h",
+        },
+        source="execution",
+    )
+
+
+_FALSIFICATION_STYLE: dict[str, tuple[str, NotificationLevel]] = {
+    "confirmed": ("✅ Cambio de holding confirmado", NotificationLevel.SUCCESS),
+    "refuted": ("❌ El cambio de holding NO hizo lo previsto", NotificationLevel.WARNING),
+    "pending": ("⏳ Falsación del holding: muestra insuficiente", NotificationLevel.INFO),
+}
+
+
+def holding_change_falsified(event: HoldingChangeFalsified) -> Notification:
+    """Embed for the automated falsification of the holding change.
+
+    Se notifica también cuando la predicción falla: "se desplegó sin errores" no
+    es evidencia de que un cambio funcione.
+    """
+    headline, level = _FALSIFICATION_STYLE.get(
+        event.outcome, ("📋 Falsación del holding", NotificationLevel.INFO)
+    )
+    return Notification(
+        title=headline,
+        message=event.detail,
+        level=level,
+        fields={
+            "Take profit": f"{event.take_profit_pct:.1f}%",
+            "Regime change": f"{event.regime_change_pct:.1f}%",
+            "Duración mediana": f"{event.median_holding_seconds:.0f}s",
+            "Esperada": f"{event.expected_holding_seconds:.0f}s",
+            "Operaciones": str(event.trades),
+            "Ventana": f"{event.window_hours:.0f} h",
         },
         source="execution",
     )

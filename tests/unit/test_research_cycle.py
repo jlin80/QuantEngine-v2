@@ -45,6 +45,12 @@ def _engine(market, symbols, *, candles_needed=100):
     settings.research.cycle_symbols = symbols
     settings.research.cycle_timeframe = "1m"
     settings.research.cycle_candles = candles_needed
+    # Presupuesto abierto: estas pruebas cubren el ciclo en si, no sus limites.
+    # `start == end` significa "ventana siempre abierta" (ver `in_window`), y el
+    # tope de simbolos se sube para no truncar los casos multi-simbolo.
+    settings.research.budget.window_start_hour_utc = 0
+    settings.research.budget.window_end_hour_utc = 0
+    settings.research.budget.max_symbols_per_run = 10
     container = Container()
     container.register_instance(type(market), market)
     engine = QuantEngine.__new__(QuantEngine)

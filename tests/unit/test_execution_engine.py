@@ -360,8 +360,13 @@ async def test_adopts_broker_positions_on_start():
         engine._paper,
         [
             BrokerPosition(
-                ticket=584945506, symbol="USTECM", is_long=True, volume=0.01,
-                price_open=28073.69, stop_loss=28031.58, take_profit=28136.86,
+                ticket=584945506,
+                symbol="USTECM",
+                is_long=True,
+                volume=0.01,
+                price_open=28073.69,
+                stop_loss=28031.58,
+                take_profit=28136.86,
             )
         ],
     )
@@ -388,8 +393,13 @@ async def test_adoption_is_idempotent():
     engine = make_engine(market)
     live = [
         BrokerPosition(
-            ticket=999, symbol="ETHUSDM", is_long=False, volume=0.27,
-            price_open=1946.24, stop_loss=1949.21, take_profit=1941.91,
+            ticket=999,
+            symbol="ETHUSDM",
+            is_long=False,
+            volume=0.27,
+            price_open=1946.24,
+            stop_loss=1949.21,
+            take_profit=1941.91,
         )
     ]
     engine._paper = _BrokerWithLivePositions(engine._paper, live)
@@ -459,9 +469,7 @@ async def test_stop_floor_ignores_missing_spread():
     engine = make_engine(market)
 
     price = 1880.0
-    assert engine._stop_distance(_view(spread_bps=None), price) == pytest.approx(
-        price * 0.15 / 100
-    )
+    assert engine._stop_distance(_view(spread_bps=None), price) == pytest.approx(price * 0.15 / 100)
 
 
 async def test_atr_still_wins_when_wider_than_both_floors():

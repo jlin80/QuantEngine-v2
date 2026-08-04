@@ -55,8 +55,16 @@ class ModelRegistry:
         author: str = "system",
         result: str = "",
         state: ModelState = ModelState.EVALUATED,
+        execution_rules_hash: str = "",
+        execution_rules: dict[str, Any] | None = None,
     ) -> ModelRecord:
-        """Register a new model version (never overwrites an existing one)."""
+        """Register a new model version (never overwrites an existing one).
+
+        ``execution_rules_hash`` congela las reglas de ejecución vigentes al
+        entrenar. Un modelo entrenado bajo otras reglas sigue asesorando con la
+        estadística de un motor que ya no existe, y sus métricas de validación
+        no lo delatan: hace falta guardarlas para poder compararlas.
+        """
         model_id = uuid.uuid4().hex[:12]
         record = ModelRecord(
             id=model_id,
@@ -69,6 +77,8 @@ class ModelRegistry:
             author=author,
             result=result,
             feature_names=feature_names,
+            execution_rules_hash=execution_rules_hash,
+            execution_rules=dict(execution_rules or {}),
         )
         self._records[model_id] = record
         self._order.append(model_id)
@@ -264,9 +274,7 @@ class ModelRegistry:
                 continue
             try:
                 models_dir.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    json.dumps(to_dict(), ensure_ascii=False), encoding="utf-8"
-                )
+                path.write_text(json.dumps(to_dict(), ensure_ascii=False), encoding="utf-8")
             except (OSError, TypeError, ValueError) as exc:
                 self._log.error("No se pudo persistir el modelo %s: %r", model_id, exc)
 

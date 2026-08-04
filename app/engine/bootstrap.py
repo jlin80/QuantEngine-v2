@@ -27,6 +27,7 @@ from app.engine.evaluation import PerformanceTracker
 from app.engine.feature_store import FeatureStore
 from app.engine.filters import build_filter_chain
 from app.engine.market_context import MarketContextEngine
+from app.engine.meta_governance import MetaGovernanceApplier
 from app.engine.models import SignalRecord
 from app.engine.plugins import PluginLoader
 from app.engine.quant_core import QuantCore
@@ -38,6 +39,7 @@ from app.engine.validators import SignalValidator
 from app.execution.api import ExecutionCore
 from app.execution.commission import CommissionEngine
 from app.execution.execution_engine import ExecutionEngine
+from app.execution.falsification import HoldingChangeFalsifier
 from app.execution.journal import TradeJournal
 from app.execution.latency import LatencyEngine
 from app.execution.notifications import ExecutionNotifier
@@ -48,6 +50,7 @@ from app.execution.position_manager import PositionManager
 from app.execution.risk_manager import RiskManager
 from app.execution.sizing import PositionSizer
 from app.execution.slippage import SlippageEngine
+from app.execution.strategy_experiments import StrategyExperimentManager
 from app.market.aggregator import CandleAggregator
 from app.market.cache import MarketCache
 from app.market.collector import TickCollector
@@ -61,6 +64,7 @@ from app.market.stream import FeedMetrics, WebSocketManager
 from app.market.validator import DataValidator
 from app.ml.api import MLEngine
 from app.ml.notifications import MLNotifier
+from app.ml.services import VirtualStrategyStats
 from app.monitoring.health import HealthMonitor
 from app.monitoring.watchdog import Watchdog
 from app.notifications.channels.discord import DiscordWebhookChannel
@@ -68,7 +72,7 @@ from app.notifications.channels.discord_router import build_routed_discord
 from app.notifications.models import NotificationLevel
 from app.notifications.service import NotificationService
 from app.production.api import ProductionAPI
-from app.production.audit import AuditLog
+from app.production.audit import AuditLog, audit_log
 from app.production.backup import BackupService
 from app.production.failover import FailoverCoordinator
 from app.production.improvement import ContinuousImprovementEngine, ImprovementService
@@ -357,9 +361,7 @@ def _build_market(
     if container.contains(MT5Connection):
         connection = container.resolve(MT5Connection)
         poll = settings.broker.mt5.tick_poll_seconds
-        registry.register(
-            "mt5", lambda _s: MT5MarketProvider(connection, poll_seconds=poll)
-        )
+        registry.register("mt5", lambda _s: MT5MarketProvider(connection, poll_seconds=poll))
     container.register_instance(ProviderRegistry, registry)
 
     feed = MarketFeed(market, registry, collector, bus, ws_manager)
@@ -540,6 +542,16 @@ def _build_execution(container: Container, settings: Settings, bus: EventBus) ->
         container.resolve(MarketContextEngine) if container.contains(MarketContextEngine) else None
     )
 
+    # Experimentos con fecha de corte por estrategia (Bloque 2). Sólo proponen
+    # desactivaciones y avisan por Discord: no tocan `strategies_enabled`.
+    experiments = StrategyExperimentManager(execution.experiments)
+    container.register_instance(StrategyExperimentManager, experiments)
+
+    # Falsación del cambio de holding por estrategia (Bloque 7.1): mide sola la
+    # predicción del Bloque 1 y publica el veredicto, acierte o falle.
+    falsifier = HoldingChangeFalsifier(execution.falsification, execution)
+    container.register_instance(HoldingChangeFalsifier, falsifier)
+
     engine = ExecutionEngine(
         execution,
         market_service,
@@ -554,6 +566,8 @@ def _build_execution(container: Container, settings: Settings, bus: EventBus) ->
         performance,
         bus,
         context_engine,
+        experiments,
+        falsifier,
     )
     container.register_instance(ExecutionEngine, engine)
 
@@ -733,13 +747,58 @@ def _build_ml(container: Container, settings: Settings, bus: EventBus) -> None:
     journal = container.resolve(TradeJournal) if container.contains(TradeJournal) else None
     trades_provider = journal.all if journal is not None else None
 
-    engine = MLEngine(settings, bus=bus, trades_provider=trades_provider)
+    # Segunda fuente de evidencia por estrategia: el evaluador continuo (Fase 4).
+    # Mide la calidad de la señal *en sí* (TP/SL/timeout puros contra velas
+    # futuras), sin sizing, trailing ni salidas por régimen. El Meta Strategy
+    # Manager la usa como prior mientras la muestra ejecutada sea escasa. Se
+    # adapta aquí, en el composition root, para que la capa de ML no dependa de
+    # `app.engine.evaluation`.
+    tracker = (
+        container.resolve(PerformanceTracker) if container.contains(PerformanceTracker) else None
+    )
+    virtual_stats_provider = (lambda: _virtual_stats(tracker)) if tracker is not None else None
+
+    engine = MLEngine(
+        settings,
+        bus=bus,
+        trades_provider=trades_provider,
+        virtual_stats_provider=virtual_stats_provider,
+    )
     container.register_instance(MLEngine, engine)
 
     # El notificador se suscribe al bus y traduce los hitos del ML a Discord.
     # El MLEngine no lo conoce: sólo publica eventos.
     notifications = container.resolve(NotificationService)
     container.register_instance(MLNotifier, MLNotifier(notifications, bus))
+
+    # Cierre del lazo de gobierno: el MSM publicaba pesos y activaciones que
+    # nadie aplicaba, así que el consenso seguía usando los pesos de arranque.
+    # El aplicador traduce esos eventos a configuración del Strategy Engine,
+    # auditando cada cambio. Sólo mueve configuración: no opera ni habilita live.
+    if container.contains(StrategyEngine):
+        container.register_instance(
+            MetaGovernanceApplier,
+            MetaGovernanceApplier(
+                container.resolve(StrategyEngine),
+                bus,
+                audit=audit_log,
+                enabled=settings.ml.meta.apply_governance,
+            ),
+        )
+
+
+def _virtual_stats(tracker: PerformanceTracker) -> dict[str, VirtualStrategyStats]:
+    """Adapt the continuous evaluator's stats to the ML layer's shape."""
+    stats: dict[str, VirtualStrategyStats] = {}
+    for name, perf in tracker.status()["strategies"].items():
+        stats[name] = VirtualStrategyStats(
+            strategy=name,
+            evaluated=int(perf.get("evaluated") or 0),
+            win_rate=float(perf.get("win_rate") or 0.0),
+            profit_factor=float(perf.get("profit_factor") or 0.0),
+            expectancy_r=float(perf.get("expectancy_r") or 0.0),
+        )
+    return stats
 
 
 def _build_research(container: Container, settings: Settings, bus: EventBus) -> None:

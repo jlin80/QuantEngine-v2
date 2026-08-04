@@ -188,6 +188,15 @@ class DecisionEngine:
             filters_blocking=tuple(r.name for r in blocking),
             explanation=tuple(explanation),
             regime=regime,
+            # La categoría la declara cada estrategia y viaja en la señal; se
+            # arrastra a la decisión para que la ejecución pueda resolver el
+            # holding mínimo por categoría sin importar `app.strategies`
+            # (el motor de ejecución no conoce los plugins, sólo eventos).
+            strategy_categories={
+                s.strategy_name: str(s.metadata.get("category", ""))
+                for s in active
+                if s.metadata.get("category")
+            },
             context_summary=context.summary(),
         )
         status = SignalStatus.ACCEPTED if accepted else SignalStatus.REJECTED
@@ -211,6 +220,8 @@ class DecisionEngine:
                 score=decision.score,
                 confidence=decision.confidence,
                 summary=decision.explanation[0] if decision.explanation else "",
+                strategy=decision.primary_strategy,
+                strategy_category=decision.primary_category,
             )
         )
         self._log.info(

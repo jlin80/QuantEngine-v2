@@ -1,0 +1,6 @@
+{"timestamp": "2026-07-31T16:41:00+00:00", "level": "WARNING", "logger": "app.market.validator", "message": "Data quality [ETHUSDM] future_timestamp: exchange_ts=2026-08-04T04:04:55.419000+00:00 > local+0:00:05 (discard=True)"}
+{"timestamp": "2026-07-31T16:41:00+00:00", "level": "WARNING", "logger": "app.market.validator", "message": "Data quality [BTCUSDM] future_timestamp: exchange_ts=2026-08-04T04:04:56.062000+00:00 > local+0:00:05 (discard=True)"}
+{"timestamp": "2026-07-31T16:41:00+00:00", "level": "WARNING", "logger": "app.market.validator", "message": "Data quality [XAUUSDM] future_timestamp: exchange_ts=2026-08-04T04:04:55.857000+00:00 > local+0:00:05 (discard=True)"}
+{"timestamp": "2026-07-31T16:41:00+00:00", "level": "WARNING", "logger": "app.market.validator", "message": "Data quality [USTECM] future_timestamp: exchange_ts=2026-08-04T04:04:56.646000+00:00 > local+0:00:05 (discard=True)"}
+{"timestamp": "2026-07-31T16:41:00+00:00", "level": "WARNING", "logger": "app.market.validator", "message": "Data quality [ETHUSDM] future_timestamp: exchange_ts=2026-08-04T04:04:55.419000+00:00 > local+0:00:05 (discard=True)"}
+{"timestamp": "2026-07-31T16:41:00+00:00", "level": "WARNING", "logger": "app.market.validator", "message": "Data quality [BTCUSDM] future_timestamp: exchange_ts=2026-08-04T04:04:57.118000+00:00 > local+0:00:05 (discard=True)"}

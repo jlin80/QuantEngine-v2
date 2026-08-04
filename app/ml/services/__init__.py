@@ -7,6 +7,7 @@ from app.ml.services.strategy_intelligence import (
     LabeledTrade,
     StrategyIntelligence,
     StrategyScore,
+    VirtualStrategyStats,
 )
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "StrategyIntelligence",
     "StrategyScore",
     "TradeStats",
+    "VirtualStrategyStats",
     "group_stats",
     "session_label",
 ]

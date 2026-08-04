@@ -197,10 +197,20 @@ class PerformanceTracker(Service):
         moment = now or utc_now()
         resolved = 0
         for trade in list(self._open.values()):
+            # Sólo velas que EMPIEZAN después de la entrada. Con el filtro
+            # anterior (`c.end > opened_at`) entraba la vela EN CURSO en el
+            # momento de la señal, cuyo rango high/low incluye precio previo a
+            # la señal: la operación virtual se resolvía contra movimiento que
+            # ya había ocurrido. Efecto medido: `choch` daba una duración media
+            # de ~4 s (la señal disparaba cerca del cierre de vela y esa misma
+            # vela la resolvía) y una expectativa inflada. No es un caso
+            # particular de `choch`: contaminaba a toda estrategia que dispara
+            # tarde dentro de la vela. Ahora la resolución sólo usa precio
+            # posterior a la entrada, que es lo único que la señal pudo prever.
             candles = [
                 c
                 for c in self._market.get_candles(trade.symbol, self._timeframe, 500)
-                if c.end > trade.opened_at
+                if c.start >= trade.opened_at
             ]
             done = False
             for i, candle in enumerate(candles):

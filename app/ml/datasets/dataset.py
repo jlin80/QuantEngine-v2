@@ -46,13 +46,33 @@ class Dataset:
         """Fraction of positive samples (0.0 for an empty dataset)."""
         return self.positives / len(self.y) if self.y else 0.0
 
+    @property
+    def sample_weights(self) -> list[float]:
+        """Per-row training weight (``1.0`` cuando no se declaró ninguno).
+
+        Los pone el ``DatasetBuilder`` según la era de ejecución de cada
+        operación, para no aprender de bugs ya arreglados.
+        """
+        weights = self.metadata.get("sample_weights")
+        if isinstance(weights, list) and len(weights) == len(self.x):
+            return [float(w) for w in weights]
+        return [1.0] * len(self.x)
+
     def subset(self, indices: Sequence[int]) -> "Dataset":
         """Build a dataset from a subset of row indices (preserves order)."""
+        rows = list(indices)
+        metadata = {**self.metadata, "subset_of": self.metadata.get("id")}
+        # Los vectores por fila deben cortarse con las filas: si no, un split
+        # deja los pesos desalineados y cada muestra hereda el peso de otra.
+        for key in ("sample_weights", "sample_eras"):
+            values = self.metadata.get(key)
+            if isinstance(values, list) and len(values) == len(self.x):
+                metadata[key] = [values[i] for i in rows]
         return Dataset(
             feature_names=self.feature_names,
-            x=[self.x[i] for i in indices],
-            y=[self.y[i] for i in indices],
-            metadata={**self.metadata, "subset_of": self.metadata.get("id")},
+            x=[self.x[i] for i in rows],
+            y=[self.y[i] for i in rows],
+            metadata=metadata,
         )
 
     def split(self, test_size: float = 0.25) -> tuple["Dataset", "Dataset"]:

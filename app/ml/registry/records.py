@@ -40,6 +40,13 @@ class ModelRecord:
         result: Notas del resultado (motivos de aprobación/rechazo).
         active: Si es el modelo activo (asesor, nunca decide por sí solo).
         feature_names: Esquema de features con el que se entrenó.
+        execution_rules_hash: Huella de las reglas de ejecución vigentes cuando
+            se entrenó (holding, sizing, filtros de riesgo, trailing). Si las
+            reglas cambian, el modelo deja de representar cómo opera el motor y
+            se marca como "requiere reentrenamiento". Vacía en los modelos
+            registrados antes de que existiera este control.
+        execution_rules: Instantánea legible de esas reglas, para poder decir
+            *qué* cambió y no sólo que algo cambió.
     """
 
     id: str
@@ -53,6 +60,8 @@ class ModelRecord:
     result: str = ""
     active: bool = False
     feature_names: list[str] = field(default_factory=list)
+    execution_rules_hash: str = ""
+    execution_rules: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: utc_now().isoformat())
 
     def to_dict(self) -> dict[str, Any]:
@@ -70,6 +79,8 @@ class ModelRecord:
             "result": self.result,
             "active": self.active,
             "feature_names": self.feature_names,
+            "execution_rules_hash": self.execution_rules_hash,
+            "execution_rules": self.execution_rules,
         }
 
     @classmethod
@@ -87,5 +98,7 @@ class ModelRecord:
             result=str(data.get("result", "")),
             active=bool(data.get("active", False)),
             feature_names=list(data.get("feature_names", [])),
+            execution_rules_hash=str(data.get("execution_rules_hash", "")),
+            execution_rules=dict(data.get("execution_rules", {})),
             created_at=str(data.get("created_at", utc_now().isoformat())),
         )

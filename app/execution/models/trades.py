@@ -50,6 +50,9 @@ class TradeRecord:
         atr: ATR al abrir.
         volatility: Estado de volatilidad al abrir.
         regime: Régimen al abrir.
+        strategy: Estrategia dominante de la decisión de origen ("" si no
+            se pudo atribuir: decisiones antiguas o posiciones adoptadas).
+        strategy_category: Categoría de esa estrategia (smc, breakout, …).
         score: Score de la decisión.
         confidence: Confianza de la decisión.
         exit_reason: Motivo de salida.
@@ -80,6 +83,8 @@ class TradeRecord:
     atr: float | None = None
     volatility: str = "normal"
     regime: str = "unknown"
+    strategy: str = ""
+    strategy_category: str = ""
     score: float = 0.0
     confidence: float = 0.0
     exit_reason: ExitReason = ExitReason.MANUAL
@@ -142,6 +147,8 @@ class TradeRecord:
             atr=opt(data.get("atr")),
             volatility=str(data.get("volatility", "normal")),
             regime=str(data.get("regime", "unknown")),
+            strategy=str(data.get("strategy", "")),
+            strategy_category=str(data.get("strategy_category", "")),
             score=float(data.get("score", 0.0)),
             confidence=float(data.get("confidence", 0.0)),
             exit_reason=ExitReason(data.get("exit_reason", ExitReason.MANUAL.value)),
@@ -178,6 +185,8 @@ class TradeRecord:
             "atr": self.atr,
             "volatility": self.volatility,
             "regime": self.regime,
+            "strategy": self.strategy,
+            "strategy_category": self.strategy_category,
             "score": self.score,
             "confidence": self.confidence,
             "exit_reason": self.exit_reason.value,

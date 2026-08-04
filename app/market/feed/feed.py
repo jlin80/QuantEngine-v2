@@ -166,7 +166,7 @@ class MarketFeed(Service):
                 except (ProviderError, NotImplementedError) as exc:
                     self._log.debug("Backfill %s %s skipped: %s", symbol, timeframe.value, exc)
                     continue
-                except Exception:  # noqa: BLE001 — el backfill nunca tumba la suscripción
+                except Exception:  # el backfill nunca tumba la suscripción
                     self._log.warning(
                         "Backfill %s %s failed", symbol, timeframe.value, exc_info=True
                     )

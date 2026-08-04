@@ -5,6 +5,90 @@ versionado [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Fixed
+- **CRITICO — el reloj de backtest congelaba el motor en vivo.** El proveedor de
+  tiempo era un global de módulo y el `BacktestLab` comparte proceso y event loop
+  con el motor: un backtest cuyo bloque no se cerró dejó `utc_now()` congelado 4
+  días, el validador descartó el 100% de los ticks y el motor dejó de operar en
+  silencio. Ahora el proveedor vive en un `ContextVar` (ADR-091).
+- **Fuga de suscripciones en `/ws/events`.** Un cliente que se iba sin cierre
+  limpio dejaba el bucle escribiendo a un socket muerto para siempre (un WARNING
+  de asyncio por evento, 75% del log) y su suscripción al bus viva (ADR-092).
+- Import circular latente `engine.engine → dashboard.api → routes.system →
+  engine.engine`: fallaba según el orden de importación e impedía ejecutar en
+  aislamiento los tests que tocan el motor.
+- `Dataset.subset` no cortaba los vectores por fila: tras un split cada muestra
+  habría heredado el peso de otra.
+- **El Meta Strategy Manager no veía estrategias**: `label_trades` leía la
+  estrategia de un `context_snapshot` que nadie rellenaba, así que todas las
+  operaciones caían al agregado `portfolio`. Ahora usa la atribución de primera
+  clase `trade.strategy`.
+- **Nadie aplicaba las decisiones del MSM**: `StrategyWeightsUpdated` sólo lo
+  escuchaba el notificador de Discord; el consenso seguía con los pesos de
+  arranque.
+- **El evaluador continuo resolvía señales contra precio anterior a ellas mismas.**
+  `PerformanceTracker.evaluate_open` incluía la vela en curso al dispararse la
+  señal, cuyo rango contiene movimiento previo. Producía la duración media de ~4s
+  de `choch` y expectativas infladas en toda estrategia que dispara tarde dentro
+  de la vela. Ahora sólo resuelve contra velas que empiezan tras la entrada
+  (ADR-084).
+- **Holding mínimo por estrategia** en la salida por cambio de régimen: un valor
+  global cortaba a las estrategias de tesis larga antes de que resolvieran
+  (+0.26R virtual vs -0.15R real). Se resuelve por estrategia → categoría →
+  global (ADR-083). El límite global de 4h queda intacto.
+- Deuda de calidad preexistente: 3 errores de `mypy` en `app/cache/redis_backend.py`
+  causados por `types-redis` (stubs obsoletos que shadoweaban los tipos inline de
+  redis-py) y un `noqa: BLE001` inútil en `app/market/feed/feed.py`.
+
+### Added
+- **Falsación automática del cambio de holding** (`app/execution/falsification.py`):
+  mide en su ventana si `take_profit` sube del 0 %, `regime_change` baja del 80 %
+  y la duración mediana alcanza la esperada **por estrategia**; publica el
+  veredicto **acierte o falle**. No cambia ninguna configuración.
+- Documentados en `docs/architecture.md` los hitos de capital a los que hay que
+  revisar los límites de exposición y el `risk_per_trade_pct`.
+- **Presupuesto de CPU del ciclo autónomo del Research Lab**
+  (`app/research/budget.py`, `settings.research.budget`): ventana horaria de baja
+  actividad, tope de símbolos/genomas por ejecución, timeout duro y vetos por
+  CPU alta o posiciones abiertas. `auto_cycle` **sigue desactivado por defecto**;
+  consumo estimado y análisis misma-VPS-vs-otra-máquina en `docs/research.md`.
+- **Gate de vigencia del modelo frente a las reglas de ejecución**
+  (`app/ml/monitoring/execution_rules.py`): huella de holding/trailing/sizing/
+  riesgo congelada con cada modelo, comparada cada hora; estados `ok`/`stale`/
+  `unknown`/`no_model`, evento `ModelRequiresRetraining` y alerta Discord que
+  indica qué familia de reglas cambió. **Nunca desactiva ni reentrena solo**
+  (ADR-090).
+- **Saneamiento del training set del ML** (`app/ml/datasets/eras.py`,
+  `ml.data_quality`): segmentación por era de ejecución, con exclusión de la era
+  de medición inválida y peso reducido para la de sesgo acotado (ADR-088).
+- **Etiqueta dual** `signal_quality` (calidad de señal) frente a `win` (calidad
+  de ejecución); cada dataset declara qué mide (ADR-089).
+- `MLEngine.build_signal_dataset()` y `MLEngine.data_quality_report()`; el
+  desglose por era sale también en `/api/ml/status`.
+- **El Meta Strategy Manager gobierna de verdad**: `MetaGovernanceApplier`
+  (`app/engine/meta_governance/`) aplica pesos y activaciones al Strategy Engine
+  por evento y **audita cada cambio**; `StrategyEngine.set_weight`;
+  `ml.meta.apply_governance` (con modo observación) (ADR-086).
+- **Evidencia mixta por estrategia** en el MSM: Trade Journal (ejecutado) +
+  evaluador continuo (`VirtualStrategyStats`). La virtual sólo pesa mientras la
+  ejecutada sea escasa y **nunca** desactiva una estrategia (ADR-087).
+- **Experimentos con fecha de corte por estrategia** (`app/execution/strategy_experiments/`):
+  al vencer la ventana se mide la expectativa dentro de ella y se emite veredicto
+  (`deactivation_candidate` / `passed` / `extended`), con aviso a Discord y
+  registro append-only. **Nunca desactiva nada**: sólo propone (ADR-085).
+- `execution.strategies_enabled`: toggle de operativa por estrategia con la misma
+  semántica que `symbols_enabled` (bloquea sólo la apertura; la estrategia sigue
+  emitiendo señales y votando). En la whitelist del Config Center.
+- Job `strategy_experiment_check` en el scheduler y eventos
+  `StrategyExperimentOpened` / `StrategyExperimentVerdict`.
+- Atribución de estrategia extremo a extremo: `Decision.primary_strategy` /
+  `primary_category` → `DecisionGenerated` → `Position` → `TradeRecord`. Habilita
+  el holding por estrategia y la segmentación por estrategia del Trade Journal.
+- `execution.regime_change_min_holding_by_strategy` y `..._by_category` en la
+  whitelist del Config Center (aplican en caliente) y en `.env.example`.
+- `context_snapshot.min_holding_seconds` en cada trade: el umbral que realmente
+  se le aplicó, para poder auditar las salidas por régimen.
+
 ## [0.10.0] — 2026-07-19 · Fase 10: Quant Research Lab y evolución autónoma
 
 > **Regla absoluta:** el laboratorio **no opera**. Es independiente de producción,

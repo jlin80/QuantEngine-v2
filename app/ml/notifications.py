@@ -140,6 +140,25 @@ def _training_failed(event: ev.ModelTrainingFailed) -> Notification:
     )
 
 
+def _requires_retraining(event: ev.ModelRequiresRetraining) -> Notification:
+    """Aviso de que el modelo activo dejó de ser representativo.
+
+    El aviso dice **qué** grupo de reglas cambió: uno que no señala la causa se
+    acaba ignorando. Y deja claro que no se ha tocado nada.
+    """
+    return _note(
+        "🔁 El modelo activo requiere reentrenamiento",
+        event.detail,
+        NotificationLevel.WARNING,
+        {
+            "Modelo": f"v{event.model_version}" if event.model_version else "—",
+            "Motivo": event.reason,
+            "Reglas cambiadas": ", ".join(event.changed) or "—",
+            "Acción tomada": "ninguna (el ML asesora, no decide)",
+        },
+    )
+
+
 _BUILDERS: dict[type[Event], Callable[[Any], Notification]] = {
     ev.ModelTrainingStarted: _training_started,
     ev.ModelTrainingFinished: _training_finished,
@@ -153,6 +172,7 @@ _BUILDERS: dict[type[Event], Callable[[Any], Notification]] = {
     ev.StrategyWeightsUpdated: _weights_updated,
     ev.MetaStrategyDecision: _meta_decision,
     ev.ModelTrainingFailed: _training_failed,
+    ev.ModelRequiresRetraining: _requires_retraining,
 }
 
 

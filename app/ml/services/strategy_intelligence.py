@@ -18,6 +18,47 @@ LabeledTrade = tuple[str, TradeRecord]
 """Operación etiquetada con la estrategia que la originó."""
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class VirtualStrategyStats:
+    """Rendimiento de una estrategia según el evaluador continuo (Fase 4).
+
+    Son operaciones **virtuales**: cada señal con niveles se resuelve contra las
+    velas posteriores con TP/SL/timeout puros, sin pasar por la ejecución. Miden
+    la calidad de la señal *en sí*, aislada de sizing, trailing y salidas por
+    régimen.
+
+    Se declara aquí, y no se importa de ``app.engine.evaluation``, para que la
+    capa de ML no dependa del motor de estrategias: el composition root adapta
+    el ``PerformanceTracker`` a esta forma.
+    """
+
+    strategy: str
+    evaluated: int
+    win_rate: float
+    profit_factor: float
+    expectancy_r: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe dict."""
+        return {
+            "strategy": self.strategy,
+            "evaluated": self.evaluated,
+            "win_rate": round(self.win_rate, 4),
+            "profit_factor": round(self.profit_factor, 4),
+            "expectancy_r": round(self.expectancy_r, 4),
+        }
+
+    def score(self) -> float:
+        """0-100 score comparable with the executed-trade composite score."""
+        raw = (
+            50.0
+            + 30.0 * clamp(self.expectancy_r, -1.0, 1.0)
+            + 12.0 * clamp(self.profit_factor - 1.0, -1.0, 1.5)
+            + 16.0 * (self.win_rate - 0.5)
+        )
+        return clamp(raw, 0.0, 100.0)
+
+
 @dataclass(frozen=True, slots=True)
 class StrategyScore:
     """Evidence-based score for a single strategy."""
@@ -87,17 +128,27 @@ class StrategyIntelligence:
     def label_trades(
         trades: Sequence[TradeRecord], *, key: str = "strategy", default: str = "portfolio"
     ) -> list[LabeledTrade]:
-        """Attach a strategy label to each trade from its context snapshot.
+        """Attach a strategy label to each trade.
 
-        El ``TradeRecord`` no fija una estrategia (la decisión es de consenso);
-        se usa ``context_snapshot[key]`` si está presente, con un valor por
-        defecto en caso contrario. Cuando la ejecución rellene el snapshot con la
-        estrategia dominante, esto queda cableado sin cambios.
+        Orden de preferencia:
+
+        1. ``trade.strategy`` — la atribución de primera clase que la ejecución
+           rellena desde la decisión de origen (estrategia dominante del
+           consenso). Es la fuente correcta desde que existe.
+        2. ``context_snapshot[key]`` — compatibilidad con el journal escrito
+           antes de que existiera el campo.
+        3. ``default`` (``"portfolio"``) — sólo para operaciones que no se
+           pueden atribuir a ninguna estrategia (p. ej. posiciones adoptadas del
+           broker al arrancar).
+
+        Mientras (1) y (2) no existían, **todas** las operaciones caían en (3):
+        el Meta Strategy Manager veía una única entrada agregada ``portfolio``
+        en vez de una por estrategia, y por tanto no gobernaba nada útil.
         """
         labeled: list[LabeledTrade] = []
         for trade in trades:
-            name = str(trade.context_snapshot.get(key, default))
-            labeled.append((name, trade))
+            name = trade.strategy.strip() or str(trade.context_snapshot.get(key, "")).strip()
+            labeled.append((name or default, trade))
         return labeled
 
 

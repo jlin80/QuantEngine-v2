@@ -12,6 +12,7 @@ from app.core.events.events import SystemStarted, SystemStopping
 from app.core.lifecycle import Service
 from app.dashboard.api.service import ApiService
 from app.engine.evaluation import PerformanceTracker
+from app.engine.meta_governance import MetaGovernanceApplier
 from app.engine.state_manager import HistoryWriter
 from app.engine.strategy_engine import StrategyEngine
 from app.execution.api import ExecutionCore
@@ -34,6 +35,7 @@ from app.production.kill_switch import KillSwitchController
 from app.production.recovery import RecoveryService
 from app.production.safe_mode import SafeModeController, SafeModeObservation
 from app.research.api import ResearchLab
+from app.research.budget import evaluate_budget
 from app.research.notifications import ResearchNotifier
 from app.scheduler.scheduler import AsyncScheduler
 
@@ -107,6 +109,12 @@ class QuantEngine:
         # tareas (entrenamiento/deriva/meta) las dispara el scheduler.
         if container.contains(MLNotifier):
             self._services.append(container.resolve(MLNotifier))
+        # Aplicador del gobierno del Meta Strategy Manager: sí es un servicio,
+        # porque se suscribe al bus. Traduce los pesos/activaciones del MSM a
+        # configuración del Strategy Engine, auditando cada cambio. Sólo mueve
+        # configuración: no opera, no toca código y no puede habilitar live.
+        if container.contains(MetaGovernanceApplier):
+            self._services.append(container.resolve(MetaGovernanceApplier))
         # Quant Research Lab (Fase 10): sólo el notificador es un servicio (se
         # suscribe al bus). El ResearchLab es una fachada sin ciclo de vida; sus
         # ciclos (generación/validación/shadow) los dispara el scheduler o el
@@ -223,6 +231,43 @@ class QuantEngine:
                 "daily_execution_report", daily_execution_report, interval_seconds=86_400
             )
 
+            # Experimentos con fecha de corte por estrategia (Bloque 2). El job
+            # abre los experimentos pendientes y adjudica los vencidos: mide la
+            # expectativa de la estrategia dentro de la ventana y, si sigue en
+            # negativo con muestra suficiente, la marca como candidata a
+            # desactivación y avisa por Discord. **Nunca desactiva nada**:
+            # apagar una estrategia es mover `strategies_enabled` a mano.
+            experiments_cfg = self._settings.execution.experiments
+            if experiments_cfg.enabled:
+                experiment_interval = max(60.0, experiments_cfg.check_interval_seconds)
+
+                async def strategy_experiment_check() -> None:
+                    await core.engine.run_strategy_experiments()
+
+                scheduler.add_job(
+                    "strategy_experiment_check",
+                    strategy_experiment_check,
+                    interval_seconds=experiment_interval,
+                    run_immediately=True,
+                )
+
+            # Falsación del cambio de holding por estrategia (Bloque 7.1). Mide
+            # la predicción del Bloque 1 en su ventana y notifica el veredicto
+            # **acierte o falle**: "se desplegó sin errores" no es evidencia.
+            falsification_cfg = self._settings.execution.falsification
+            if falsification_cfg.enabled:
+                falsification_interval = max(60.0, falsification_cfg.check_interval_seconds)
+
+                async def holding_falsification_check() -> None:
+                    await core.engine.run_holding_falsification()
+
+                scheduler.add_job(
+                    "holding_falsification_check",
+                    holding_falsification_check,
+                    interval_seconds=falsification_interval,
+                    run_immediately=True,
+                )
+
         # Aprendizaje continuo del ML (Fase 7): entrenamiento nocturno, chequeo
         # de deriva y gobierno de estrategias. El ML asesora, nunca opera: estos
         # jobs sólo producen modelos/recomendaciones y publican eventos; jamás
@@ -242,6 +287,25 @@ class QuantEngine:
 
             scheduler.add_job("ml_nightly_training", ml_nightly_training, interval_seconds=86_400)
             scheduler.add_job("ml_drift_check", ml_drift_check, interval_seconds=21_600)
+
+            # Segunda capa sobre el gate de validación (Bloque 5): un modelo
+            # bueno deja de ser representativo en cuanto cambian las reglas de
+            # ejecución bajo las que se entrenó, y sus métricas no lo delatan.
+            # Sólo alerta y sugiere reentrenar: nunca desactiva ni autoactiva.
+            # El aviso lleva latch (una vez por situación, no por vuelta).
+            rules_cfg = self._settings.ml.execution_rules_check
+            if rules_cfg.enabled:
+                rules_interval = max(60.0, rules_cfg.check_interval_seconds)
+
+                async def ml_execution_rules_check() -> None:
+                    await ml_engine.run_execution_rules_check()
+
+                scheduler.add_job(
+                    "ml_execution_rules_check",
+                    ml_execution_rules_check,
+                    interval_seconds=rules_interval,
+                    run_immediately=True,
+                )
             scheduler.add_job(
                 "ml_meta_evaluation", ml_meta_evaluation, interval_seconds=meta_interval
             )
@@ -253,6 +317,10 @@ class QuantEngine:
         # promueve y no habilita live; la promoción sigue exigiendo aprobación
         # humana. Está detrás de `auto_cycle` porque los backtests compiten por
         # CPU con el motor que está operando.
+        # `auto_cycle` sigue en False por defecto: activarlo es una decisión
+        # explícita del operador tras ver la propuesta de presupuesto
+        # (`docs/research.md`). El presupuesto en sí (ventana, topes, timeout)
+        # ya está aplicado en `_run_research_cycle`.
         if self._container.contains(ResearchLab) and self._settings.research.auto_cycle:
             research = self._container.resolve(ResearchLab)
             research_interval = max(3_600.0, self._settings.research.cycle_interval_seconds)
@@ -260,9 +328,7 @@ class QuantEngine:
             async def research_cycle() -> None:
                 await self._run_research_cycle(research)
 
-            scheduler.add_job(
-                "research_cycle", research_cycle, interval_seconds=research_interval
-            )
+            scheduler.add_job("research_cycle", research_cycle, interval_seconds=research_interval)
 
         # Producción (Fase 9): vigilancia de safe mode, corte programado del
         # kill switch, snapshot de estado y re-evaluación del Live Gate. Ningún
@@ -401,12 +467,50 @@ class QuantEngine:
 
         Un símbolo sin histórico suficiente se salta con un aviso; un fallo en
         uno no puede impedir que se procesen los demás.
+
+        Corre bajo un **presupuesto de CPU explícito** (ventana horaria, tope de
+        símbolos y genomas, timeout duro): comparte VPS con el motor que está
+        operando, y el bucle de gestión de posiciones es el único que no puede
+        llegar tarde.
         """
         settings = self._settings.research
+        decision = evaluate_budget(
+            settings.budget,
+            cpu_pct=self._current_cpu_pct(),
+            open_positions=self._open_position_count(),
+        )
+        if not decision.allowed:
+            self._log.info("Ciclo de research pospuesto: %s", decision.reason)
+            return
+
         symbols = settings.cycle_symbols or list(self._settings.market.symbols)
         if not symbols:
             self._log.warning("Ciclo de research sin símbolos configurados; se omite")
             return
+        # El tope de símbolos acota el trabajo total por ejecución; el de
+        # genomas acota la población del generador, que es la variable que más
+        # multiplica el número de backtests.
+        symbols = symbols[: decision.max_symbols]
+
+        try:
+            # Timeout DURO sobre el ciclo completo: un ciclo colgado no puede
+            # quedarse consumiendo CPU hasta el siguiente disparo.
+            await asyncio.wait_for(
+                self._research_cycle_body(research, symbols, decision.max_generated),
+                timeout=decision.timeout_seconds,
+            )
+        except TimeoutError:
+            self._log.warning(
+                "Ciclo de research cancelado por timeout (%.0fs). Los candidatos ya "
+                "registrados se conservan; el resto se retomará en el próximo ciclo.",
+                decision.timeout_seconds,
+            )
+
+    async def _research_cycle_body(
+        self, research: ResearchLab, symbols: list[str], max_generated: int
+    ) -> None:
+        """Generate and validate one batch per symbol (bajo el timeout duro)."""
+        settings = self._settings.research
         market = self._container.resolve(MarketDataService)
         timeframe = Timeframe(settings.cycle_timeframe)
         for raw_symbol in symbols:
@@ -425,6 +529,7 @@ class QuantEngine:
                     timeframe.value,
                     candles,
                     research.make_config(symbol),
+                    count=max_generated,
                 )
             except Exception:
                 # El laboratorio nunca puede tumbar el motor que está operando.
@@ -436,6 +541,23 @@ class QuantEngine:
                 summary.get("generated", 0),
                 summary.get("qualified", 0),
             )
+
+    def _current_cpu_pct(self) -> float | None:
+        """Host CPU usage, or ``None`` when it cannot be measured.
+
+        Un sensor mudo no bloquea el laboratorio, igual que Safe Mode no degrada
+        la operativa por una lectura que falta.
+        """
+        if not self._container.contains(HealthMonitor):
+            return None
+        snapshot = self._container.resolve(HealthMonitor).last_snapshot
+        return None if snapshot is None else snapshot.cpu_percent
+
+    def _open_position_count(self) -> int:
+        """Open positions right now (0 if the execution layer is not wired)."""
+        if not self._container.contains(ExecutionCore):
+            return 0
+        return len(self._container.resolve(ExecutionCore).positions.open_positions)
 
     async def _observe_vitals(self) -> SafeModeObservation:
         """Collect the vital signs Safe Mode watches.

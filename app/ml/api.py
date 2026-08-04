@@ -23,13 +23,15 @@ from app.core.events.bus import EventBus
 from app.core.exceptions import InsufficientDataError, MLError
 from app.execution.models.trades import TradeRecord
 from app.ml.auto_ml import AutoML, AutoMLResult
-from app.ml.datasets import Dataset, DatasetBuilder
+from app.ml.datasets import SIGNAL_LABEL, Dataset, DatasetBuilder, era_summary
 from app.ml.drift import DriftDetector, DriftReport
 from app.ml.events import (
     DriftDetected,
+    MetaStrategyDecision,
     ModelActivated,
     ModelApproved,
     ModelRejected,
+    ModelRequiresRetraining,
     ModelTrainingFailed,
     ModelTrainingFinished,
     ModelTrainingStarted,
@@ -43,15 +45,34 @@ from app.ml.inference import InferenceService
 from app.ml.meta import MetaReport, MetaStrategyManager
 from app.ml.models.factory import build_model
 from app.ml.monitoring import ModelPerformanceMonitor
+from app.ml.monitoring.execution_rules import (
+    ExecutionRulesCheck,
+    changed_rule_groups,
+    execution_rules_hash,
+    execution_rules_snapshot,
+)
 from app.ml.optimization import ParameterRecommender
 from app.ml.prediction import Prediction
 from app.ml.registry import ModelRecord, ModelRegistry
 from app.ml.reporting import MLReporter
-from app.ml.services import AIAdvisor, RiskAdvisor, StrategyIntelligence, StrategyScore
+from app.ml.services import (
+    AIAdvisor,
+    RiskAdvisor,
+    StrategyIntelligence,
+    StrategyScore,
+    VirtualStrategyStats,
+)
 from app.ml.training import Trainer, TrainingResult
 
 TradesProvider = Callable[[], Sequence[TradeRecord]]
 """Devuelve el historial de operaciones (normalmente el Trade Journal)."""
+
+VirtualStatsProvider = Callable[[], Mapping[str, VirtualStrategyStats]]
+"""Rendimiento por estrategia del evaluador continuo (Fase 4).
+
+Se inyecta como callable para que la capa de ML no dependa del motor de
+estrategias: el composition root adapta el ``PerformanceTracker``.
+"""
 
 
 class MLEngine:
@@ -60,7 +81,12 @@ class MLEngine:
     Args:
         settings: Configuración raíz (usa ``ml`` y ``execution``).
         bus: Event Bus para publicar hitos (opcional).
-        trades_provider: Fuente del historial de operaciones (journal).
+        trades_provider: Fuente del historial de operaciones (journal, Fase 5)
+            — mide lo que la ejecución **capturó**.
+        virtual_stats_provider: Fuente de las métricas por estrategia del
+            evaluador continuo (Fase 4) — mide la calidad de la señal *en sí*.
+            El Meta Strategy Manager las usa como prior mientras la muestra
+            ejecutada de una estrategia sea escasa.
         persist: Si el registro y los experimentos escriben a disco.
     """
 
@@ -70,18 +96,20 @@ class MLEngine:
         *,
         bus: EventBus | None = None,
         trades_provider: TradesProvider | None = None,
+        virtual_stats_provider: VirtualStatsProvider | None = None,
         persist: bool = True,
     ) -> None:
         self._settings = settings
         self._ml = settings.ml
         self._bus = bus
         self._trades_provider: TradesProvider = trades_provider or (lambda: [])
+        self._virtual_stats_provider: VirtualStatsProvider = virtual_stats_provider or (lambda: {})
         self._log = logging.getLogger("app.ml")
 
         self._engineer = FeatureEngineer()
         self._feature_store = FeatureStore()
         self._feature_store.register_engineer(self._engineer)
-        self._builder = DatasetBuilder(self._engineer)
+        self._builder = DatasetBuilder(self._engineer, self._ml.data_quality)
         self._trainer = Trainer(self._ml.training)
         self._registry = ModelRegistry(self._ml.registry_dir if persist else None)
         self._automl = AutoML(self._trainer, self._ml.model, seed=self._ml.training.random_seed)
@@ -97,6 +125,9 @@ class MLEngine:
         self._reporter = MLReporter()
         self._reference_dataset: Dataset | None = None
         self._last_drift: DriftReport | None = None
+        # Latch del aviso de reglas de ejecución (ver
+        # `run_execution_rules_check`): evita repetir el mismo aviso cada hora.
+        self._rules_alert_signature: tuple[str, str, str] | None = None
 
     # ------------------------------------------------------------------
     # Componentes (para wiring/tests)
@@ -137,8 +168,37 @@ class MLEngine:
     # ------------------------------------------------------------------
 
     def build_dataset(self, *, label: str = "win") -> Dataset:
-        """Build a training dataset from the journalled trades."""
+        """Build a training dataset from the journalled trades.
+
+        El dataset ya viene saneado por era de ejecución: las operaciones de
+        eras con bugs conocidos pesan menos o quedan fuera, para que el modelo
+        no aprenda "esta señal es mala" cuando lo cierto es "la ejecución la
+        saboteó". La procedencia completa va en ``dataset.metadata``.
+
+        Args:
+            label: ``win`` (calidad de ejecución, por defecto) o
+                ``signal_quality`` (calidad de la señal en sí).
+        """
         return self._builder.build(self._trades_provider(), label=label)
+
+    def build_signal_dataset(self) -> Dataset:
+        """Dataset etiquetado por **calidad de señal**, no de ejecución.
+
+        Excluye las operaciones cuyo cierre lo decidió la ejecución (régimen,
+        tiempo, kill switch, manual): esas nunca pusieron a prueba su tesis, así
+        que su resultado no dice nada sobre la señal. Es la contraparte del
+        dataset por defecto, no su sustituto — juntos separan "¿esta estrategia
+        tiene edge?" de "¿la ejecución está capturando ese edge?".
+        """
+        return self._builder.build(self._trades_provider(), label=SIGNAL_LABEL)
+
+    def data_quality_report(self) -> dict[str, Any]:
+        """Qué datos entran al entrenamiento y por qué (auditoría del Bloque 4)."""
+        trades = list(self._trades_provider())
+        return {
+            "settings": self._ml.data_quality.model_dump(mode="json"),
+            "breakdown": era_summary(trades, self._ml.data_quality),
+        }
 
     def labeled_trades(self) -> list[tuple[str, TradeRecord]]:
         """The journalled trades tagged with their originating strategy."""
@@ -214,7 +274,12 @@ class MLEngine:
     def register_model(
         self, result: TrainingResult, *, author: str = "system", result_note: str = ""
     ) -> ModelRecord:
-        """Register a trained model version in the registry (never overwrites)."""
+        """Register a trained model version in the registry (never overwrites).
+
+        Congela con el modelo la huella de las reglas de ejecución vigentes: sin
+        ella no se puede detectar después que el modelo dejó de representar cómo
+        opera el motor (sus métricas de validación no cambian por eso).
+        """
         return self._registry.register(
             result.model,
             metrics=to_metric_dict(result.metrics()),
@@ -222,7 +287,106 @@ class MLEngine:
             feature_names=result.feature_names,
             author=author,
             result=result_note,
+            execution_rules_hash=execution_rules_hash(self._settings.execution),
+            execution_rules=execution_rules_snapshot(self._settings.execution),
         )
+
+    # ------------------------------------------------------------------
+    # Vigencia del modelo frente a las reglas de ejecución (Bloque 5)
+    # ------------------------------------------------------------------
+
+    def check_execution_rules(self) -> ExecutionRulesCheck:
+        """Compare the active model against the execution rules in force.
+
+        Segunda capa sobre el gate de validación: aquel evita activar un modelo
+        malo, esto detecta que un modelo **bueno** dejó de ser representativo
+        porque cambiaron las reglas bajo las que se entrenó (holding, sizing,
+        filtros de riesgo, trailing).
+
+        No desactiva nada ni dispara un reentrenamiento: sólo diagnostica. El ML
+        asesora y nunca decide por sí solo.
+        """
+        current_snapshot = execution_rules_snapshot(self._settings.execution)
+        current = execution_rules_hash(self._settings.execution)
+        record = self._registry.active_record()
+        if record is None:
+            return ExecutionRulesCheck(
+                status="no_model",
+                current_hash=current,
+                detail="No hay modelo activo que validar.",
+            )
+        if not record.execution_rules_hash:
+            return ExecutionRulesCheck(
+                status="unknown",
+                current_hash=current,
+                model_id=record.id,
+                model_version=record.version,
+                detail=(
+                    "El modelo activo se registró antes de que se guardara la huella "
+                    "de reglas de ejecución; no se puede afirmar que siga siendo "
+                    "representativo. Se recomienda reentrenar para fijar la huella."
+                ),
+            )
+        if record.execution_rules_hash == current:
+            return ExecutionRulesCheck(
+                status="ok",
+                current_hash=current,
+                model_hash=record.execution_rules_hash,
+                model_id=record.id,
+                model_version=record.version,
+                detail="El modelo activo se entrenó con las reglas de ejecución vigentes.",
+            )
+        changed = changed_rule_groups(record.execution_rules, current_snapshot)
+        return ExecutionRulesCheck(
+            status="stale",
+            current_hash=current,
+            model_hash=record.execution_rules_hash,
+            model_id=record.id,
+            model_version=record.version,
+            changed=changed,
+            detail=(
+                f"Las reglas de ejecución cambiaron ({', '.join(changed) or 'sin detalle'}) "
+                f"desde que se entrenó el modelo activo v{record.version}. Sigue asesorando "
+                f"con la estadística de un motor que ya no existe: **requiere "
+                f"reentrenamiento**. No se ha desactivado nada."
+            ),
+        )
+
+    async def run_execution_rules_check(self) -> dict[str, Any]:
+        """Scheduled check; alerts on Discord when the active model is stale.
+
+        Sólo alerta y sugiere reentrenar — nunca autoactiva ni desactiva.
+
+        **Avisa una vez por situación, no una vez por vuelta.** El estado
+        ``stale``/``unknown`` es persistente por naturaleza: dura hasta que un
+        humano reentrena. Sin latch, un job horario convierte un aviso útil en
+        ruido de fondo que se acaba silenciando — que es justo lo contrario de
+        lo que se pretende. El latch se rearma cuando cambia la situación (otro
+        modelo activo, otras reglas, o vuelta a ``ok``), de modo que un problema
+        *nuevo* siempre vuelve a anunciarse.
+        """
+        if not self._ml.execution_rules_check.enabled:
+            return {"status": "disabled", "needs_retraining": False}
+        check = self.check_execution_rules()
+        # Identidad de la situación, no del mensaje: mismo modelo + mismas
+        # reglas + mismo estado = mismo aviso.
+        signature = (check.status, check.model_id, check.current_hash)
+        if check.status in ("stale", "unknown"):
+            if signature != self._rules_alert_signature:
+                self._rules_alert_signature = signature
+                await self._publish(
+                    ModelRequiresRetraining(
+                        source="ml",
+                        model_id=check.model_id,
+                        model_version=check.model_version,
+                        reason=check.status,
+                        changed=tuple(check.changed),
+                        detail=check.detail,
+                    )
+                )
+        else:
+            self._rules_alert_signature = None
+        return check.to_dict()
 
     def activate_model(self, model_id: str) -> ModelRecord:
         """Make a registered model the active advisory model."""
@@ -300,9 +464,22 @@ class MLEngine:
                 return round(self._ml.meta.min_weight + span * (score.score / 100.0), 4)
         return 1.0
 
+    def virtual_stats(self) -> Mapping[str, VirtualStrategyStats]:
+        """Per-strategy virtual performance from the continuous evaluator."""
+        return self._virtual_stats_provider()
+
     def evaluate_meta(self, labeled: Sequence[tuple[str, TradeRecord]] | None = None) -> MetaReport:
-        """Run a meta-strategy governance cycle (adjusts weights/activation)."""
-        return self._meta.evaluate(labeled if labeled is not None else self.labeled_trades())
+        """Run a meta-strategy governance cycle (adjusts weights/activation).
+
+        Combina las dos fuentes de evidencia por estrategia: el Trade Journal
+        (lo ejecutado) y el evaluador continuo (la señal en sí). La segunda sólo
+        pesa mientras la primera no tenga muestra suficiente, y nunca puede por
+        sí sola desactivar una estrategia.
+        """
+        return self._meta.evaluate(
+            labeled if labeled is not None else self.labeled_trades(),
+            self.virtual_stats(),
+        )
 
     def recommend_parameters(self) -> dict[str, Any]:
         """Evidence-based parameter recommendations per strategy."""
@@ -415,6 +592,25 @@ class MLEngine:
                     source="ml", weights=report.weights, reason="evaluación periódica"
                 )
             )
+        # Las decisiones de activación viajan una a una: el aplicador necesita
+        # saber *qué* estrategia se desactiva y por qué, no sólo el mapa de
+        # pesos. Sin esto el `disable` del MSM no llegaba a ninguna parte.
+        for decision in report.decisions:
+            if decision.get("action") not in ("disable", "enable"):
+                continue
+            await self._publish(
+                MetaStrategyDecision(
+                    source="ml",
+                    strategy=str(decision["strategy"]),
+                    action=str(decision["action"]),
+                    detail=str(decision.get("detail", "")),
+                    metrics={
+                        k: float(v)
+                        for k, v in dict(decision.get("metrics", {})).items()
+                        if isinstance(v, int | float)
+                    },
+                )
+            )
         self._experiments.save("meta", "governance", report.to_dict())
         return report.to_dict()
 
@@ -434,6 +630,9 @@ class MLEngine:
             "features": self._feature_store.stats,
             "experiments": self._experiments.count(),
             "auto_activate": self._ml.auto_activate,
+            # Qué historial entra al entrenamiento y qué queda fuera: sin esto,
+            # auditar el ML obliga a releer el journal a mano.
+            "data_quality": self.data_quality_report()["breakdown"],
         }
 
     def report(self) -> dict[str, Any]:

@@ -123,6 +123,8 @@ class PositionManager:
         take_profit: float | None,
         decision_id: str | None = None,
         regime: str = "unknown",
+        strategy: str = "",
+        strategy_category: str = "",
         score: float = 0.0,
         confidence: float = 0.0,
         entry_reasons: tuple[str, ...] = (),
@@ -137,6 +139,8 @@ class PositionManager:
             take_profit: Objetivo inicial.
             decision_id: Decisión de origen.
             regime: Régimen al abrir.
+            strategy: Estrategia dominante de la decisión.
+            strategy_category: Categoría de esa estrategia.
             score: Score de la decisión.
             confidence: Confianza de la decisión.
             entry_reasons: Razones de entrada.
@@ -161,6 +165,8 @@ class PositionManager:
             commission_paid=fill.commission,
             decision_id=decision_id,
             regime=regime,
+            strategy=strategy,
+            strategy_category=strategy_category,
             score=score,
             confidence=confidence,
             entry_reasons=entry_reasons,

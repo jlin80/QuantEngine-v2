@@ -11,6 +11,7 @@ from app.cache.service import CacheService
 from app.config.settings import ExecutionSettings
 from app.execution.commission import CommissionEngine
 from app.execution.execution_engine import ExecutionEngine
+from app.execution.falsification import HoldingChangeFalsifier
 from app.execution.journal import TradeJournal
 from app.execution.latency import LatencyEngine
 from app.execution.order_manager import OrderManager
@@ -21,6 +22,7 @@ from app.execution.position_manager import PositionManager
 from app.execution.risk_manager import RiskManager
 from app.execution.sizing import PositionSizer
 from app.execution.slippage import SlippageEngine
+from app.execution.strategy_experiments import StrategyExperimentManager
 from app.market.cache import MarketCache
 from app.market.models import Candle, Ticker
 from app.market.services import MarketDataService, MarketStateStore
@@ -86,4 +88,8 @@ def make_engine(
         PerformanceEngine(cfg.initial_balance),
         None,
         None,
+        # Igual que el composition root: el motor siempre lleva su gestor
+        # de experimentos, que sólo propone desactivaciones.
+        StrategyExperimentManager(cfg.experiments),
+        HoldingChangeFalsifier(cfg.falsification, cfg),
     )

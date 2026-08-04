@@ -163,3 +163,20 @@ def to_metric_dict(metrics: dict[str, Any]) -> dict[str, float]:
         if isinstance(value, (bool, int | float)):
             out[key] = float(value)
     return out
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class ModelRequiresRetraining(Event):
+    """El modelo activo dejó de representar cómo opera el motor.
+
+    Lo dispara el cambio de una regla de ejecución significativa (holding,
+    sizing, filtros de riesgo, trailing) respecto a las vigentes cuando se
+    entrenó. **No desactiva el modelo ni dispara un reentrenamiento**: el ML
+    asesora y nunca decide por sí solo.
+    """
+
+    model_id: str = ""
+    model_version: str = ""
+    reason: str = "stale"  # "stale" | "unknown"
+    changed: tuple[str, ...] = ()
+    detail: str = ""

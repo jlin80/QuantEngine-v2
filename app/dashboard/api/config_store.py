@@ -29,9 +29,13 @@ WHITELIST: tuple[str, ...] = (
     "execution.risk.max_consecutive_losses",
     "execution.risk.kill_switch_drawdown_pct",
     "execution.symbols_enabled",
+    "execution.strategies_enabled",
+    "execution.falsification.enabled",
     "execution.max_holding_minutes",
     "execution.exit_on_regime_change",
     "execution.regime_change_min_holding_seconds",
+    "execution.regime_change_min_holding_by_strategy",
+    "execution.regime_change_min_holding_by_category",
     "execution.regime_exit_confirmations",
     "execution.regime_exit_family_only",
     "execution.break_even_r",
@@ -54,6 +58,9 @@ WHITELIST: tuple[str, ...] = (
     "ml.enabled",
     "ml.auto_activate",
     "ml.meta.enabled",
+    "ml.meta.apply_governance",
+    "ml.meta.disable_after_periods",
+    "ml.execution_rules_check.enabled",
     "backtesting.criteria.min_profit_factor",
     "backtesting.criteria.min_sharpe",
     "backtesting.criteria.max_drawdown_pct",
@@ -67,9 +74,12 @@ WHITELIST: tuple[str, ...] = (
 _LIVE_PREFIXES: tuple[str, ...] = (
     "execution.risk.",
     "execution.symbols_enabled",
+    "execution.strategies_enabled",
     "execution.max_holding_minutes",
     "execution.exit_on_regime_change",
     "execution.regime_change_min_holding_seconds",
+    "execution.regime_change_min_holding_by_strategy",
+    "execution.regime_change_min_holding_by_category",
     # El engine las lee en cada ciclo de gestión → aplican en caliente. Las de
     # trailing/break-even NO: el PositionManager las lee al construirse, así que
     # quedan fuera y `apply` avisará de que necesitan reinicio.
@@ -125,10 +135,7 @@ def _set_live(settings: Settings, path: str, value: Any) -> bool:
 
 def _is_live(path: str) -> bool:
     """Whether a whitelisted path is read live by the engine (hot-applies)."""
-    return any(
-        path == prefix or path.startswith(prefix)
-        for prefix in _LIVE_PREFIXES
-    )
+    return any(path == prefix or path.startswith(prefix) for prefix in _LIVE_PREFIXES)
 
 
 class RuntimeConfigStore:

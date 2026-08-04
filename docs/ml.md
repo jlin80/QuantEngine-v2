@@ -64,6 +64,95 @@ entrenamiento e inferencia produzcan el mismo vector. Las features describen el
 contexto conocido al abrir; la etiqueta binaria es el resultado (`win`,
 `rr_positive` o `not_stopped`). Nunca se usa el precio directo.
 
+## Qué datos entran al entrenamiento, y por qué
+
+> Esta sección existe para que auditar el ML no obligue a reconstruir el
+> razonamiento desde cero. Si cambias lo que entra al training set, **actualiza
+> esto en el mismo cambio.**
+
+### El problema
+
+El ML aprende del historial que genera el propio motor. Ese historial arrastra
+**bugs de ejecución ya arreglados**: el stop mal calculado (bug de
+`contract_size`, pre-27/07), el trailing que apretaba nada más abrir (pre-29/07)
+y la salida por régimen que cortaba la tesis antes de tiempo (pre-fix de
+familias de régimen).
+
+Entrenar sobre esas operaciones sin distinguirlas no le enseña al modelo *"esta
+señal es mala"*. Le enseña *"esta señal es mala **porque la ejecución la
+saboteó**"*. El modelo acaba penalizando contextos que en realidad tenían edge:
+más torpe, no más inteligente.
+
+### Defensa 1 — segmentación y ponderación por era
+
+Configurable en `ml.data_quality` (`app/ml/datasets/eras.py`). Cada operación se
+clasifica en una **era de ejecución** por su **hora de entrada** — una operación
+abierta antes de un fix corrió bajo las reglas viejas casi toda su vida, aunque
+cerrara después; es la lectura conservadora.
+
+| Era | Hasta | Peso | Por qué |
+| --- | --- | --- | --- |
+| `pre_contract_size_y_familias_regimen` | 2026-07-27 | **0.0** (excluida) | El stop estaba mal calculado, así que el R de estas operaciones no mide la señal: mide un stop equivocado. No es una muestra floja, es una **medición inválida**. Ponderarla a la baja seguiría metiendo ruido correlacionado. |
+| `pre_trailing_activate_r` | 2026-07-29 | **0.35** | El trailing apretaba el stop nada más abrir. El sesgo es real pero **acotado y direccional**, y la entrada y su contexto siguen siendo válidos: se conservan con peso reducido en vez de tirar la muestra. |
+| `post_fixes` | — | **1.0** | Historial posterior a todos los fixes conocidos. |
+
+Los pesos por fila viajan en `dataset.metadata["sample_weights"]` y se cortan
+junto con las filas en cada split (si no, cada muestra heredaría el peso de
+otra). El desglose completo — cuántas operaciones por era, cuáles se excluyeron
+y con qué motivo — está en `dataset.metadata["era_breakdown"]` y en
+`MLEngine.data_quality_report()`, y sale también en `/api/ml/status`.
+
+**Cuando se arregle el próximo bug de ejecución**, basta añadir una era a la
+configuración: no hay fechas ni nombres incrustados en el código.
+
+`ml.data_quality.enabled=false` restaura el comportamiento anterior (todo pesa
+igual). Se conserva a propósito, para poder medir el efecto del saneamiento.
+
+### Defensa 2 — dos etiquetas distintas, porque miden cosas distintas
+
+Se entrenan (y se leen) por separado:
+
+| Etiqueta | Qué mide | Qué operaciones usa |
+| --- | --- | --- |
+| `win` / `rr_positive` / `not_stopped` | **Calidad de ejecución**: qué hizo el motor con la señal, con costes y salidas incluidos. | Todas las de eras admisibles. |
+| `signal_quality` | **Calidad de la señal en sí**: ¿la tesis era buena? | Sólo aquellas cuyo cierre **resolvió la tesis**: objetivo, stop, trailing o break-even. |
+
+`signal_quality` **descarta** las operaciones que cerró la ejecución (cambio de
+régimen, tiempo, kill switch, manual). Esa operación nunca llegó a poner a
+prueba su propia tesis, así que etiquetarla como "señal mala" es exactamente el
+error que todo esto pretende evitar. Cada dataset declara qué mide en
+`metadata["label_measures"]` (`signal` | `execution`), porque confundirlas es el
+fallo, no un detalle.
+
+Juntas responden dos preguntas que no son la misma: **"¿esta estrategia tiene
+edge?"** (señal) y **"¿la ejecución está capturando ese edge?"** (ejecución).
+
+### Limitación conocida (pendiente)
+
+La fuente de verdad ideal para la calidad de señal es el **evaluador continuo**
+(Fase 4), que resuelve cada señal contra velas futuras con TP/SL/timeout puros,
+sin ejecución de por medio. Hoy no se puede unir fila a fila con el Trade
+Journal: el evaluador guarda estadística agregada por estrategia, no el
+resultado virtual de cada señal, y el `TradeRecord` lleva `decision_id` pero no
+los `signal_id` que la originaron.
+
+Por eso `signal_quality` se aproxima **desde el propio journal**, filtrando por
+motivo de salida. Es una aproximación honesta y sin lookahead, pero sigue
+midiendo operaciones ejecutadas (con sus costes y su slippage).
+
+Cerrar el hueco requiere dos cosas, ninguna hecha todavía:
+
+1. Persistir el resultado virtual por `signal_id` en el `PerformanceTracker`.
+2. Propagar los `signal_id` de la decisión hasta el `TradeRecord`.
+
+Mientras tanto, el evaluador continuo **sí** alimenta al Meta Strategy Manager
+de forma agregada por estrategia (ver ADR-087).
+
+> ⚠️ **Aviso sobre el histórico:** el evaluador continuo tenía un sesgo de
+> medición corregido el 2026-08-03 (ADR-084): resolvía las señales contra la
+> vela en curso, cuyo rango incluye precio anterior a la señal. **Las métricas
+> virtuales anteriores a esa fecha no son comparables con las posteriores.**
+
 ## Registro y puerta de validación
 
 `register_model` nunca sobrescribe (versiona por tipo). Antes de activar,

@@ -200,6 +200,30 @@ class StrategyEngine(Service):
         self._require(name).enabled = False
         self._require(name).stats.enabled = False
 
+    def set_weight(self, name: str, weight: float) -> float:
+        """Set the consensus weight of a loaded strategy.
+
+        Es el único camino por el que el Meta Strategy Manager llega a afectar
+        al consenso: gobierna **configuración**, nunca código ni órdenes. El
+        valor se refleja también en ``stats`` para que el dashboard muestre el
+        peso vigente y no el de arranque.
+
+        Args:
+            name: Estrategia cargada.
+            weight: Peso nuevo (no negativo).
+
+        Returns:
+            El peso aplicado.
+
+        Raises:
+            ConfigurationError: Si la estrategia no está cargada.
+        """
+        loaded = self._require(name)
+        applied = max(0.0, float(weight))
+        loaded.weight = applied
+        loaded.stats.weight = applied
+        return applied
+
     def _require(self, name: str) -> _LoadedStrategy:
         """Loaded strategy or ConfigurationError."""
         loaded = self._strategies.get(name)

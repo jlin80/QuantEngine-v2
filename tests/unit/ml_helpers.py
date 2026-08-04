@@ -17,14 +17,20 @@ from app.ml.evaluation.validation import CrossValidationResult
 from app.ml.interfaces.model import Model
 from app.ml.training.trainer import TrainingResult
 
-_BASE = datetime(2026, 1, 1, tzinfo=UTC)
+# Posterior a todos los fixes de ejecución conocidos: estas operaciones de
+# prueba pertenecen a la era limpia, así que el saneamiento del training set
+# (`app.ml.datasets.eras`) no las excluye. Los tests que prueban el saneamiento
+# en sí fabrican sus propias fechas a propósito.
+_BASE = datetime(2026, 8, 1, tzinfo=UTC)
 
 
 def make_trade(*, strategy: str | None = None, **overrides: Any) -> TradeRecord:
     """Build a closed :class:`TradeRecord` with sensible defaults.
 
-    Pass ``strategy=`` to tag the trade's ``context_snapshot`` with the
-    originating strategy (used by the strategy-intelligence ranking).
+    Pass ``strategy=`` to attribute the trade to its originating strategy
+    (used by the strategy-intelligence ranking). Se rellena el campo de primera
+    clase ``strategy``, que es lo que hace la ejecución real desde la
+    atribución de la decisión.
     """
     entry = overrides.pop("entry_time", _BASE)
     fields: dict[str, Any] = {
@@ -52,7 +58,7 @@ def make_trade(*, strategy: str | None = None, **overrides: Any) -> TradeRecord:
         "entry_reasons": ("trend", "momentum"),
     }
     if strategy is not None:
-        fields["context_snapshot"] = {"strategy": strategy}
+        fields["strategy"] = strategy
     fields.update(overrides)
     return TradeRecord(**fields)
 

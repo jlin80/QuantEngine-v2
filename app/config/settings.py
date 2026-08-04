@@ -232,10 +232,105 @@ class MLMetaStrategySettings(BaseModel):
     lookback_trades: int = 60  # ventana de rendimiento reciente
     disable_expectancy_r: float = -0.05  # expectativa (R) que degrada
     disable_profit_factor: float = 0.90  # PF por debajo → degradada
-    disable_after_periods: int = 3  # evaluaciones fallidas seguidas → desactivar
+    # Evaluaciones con evidencia NUEVA y degradada antes de desactivar. Una
+    # evaluación sin operaciones nuevas no cuenta: si contara, el umbral
+    # mediría horas transcurridas en vez de degradación sostenida.
+    disable_after_periods: int = 5
     min_weight: float = 0.10
     max_weight: float = 2.00
     weight_smoothing: float = 0.50  # suavizado del ajuste de peso [0-1]
+    # Aplicar de verdad el gobierno sobre el Strategy Engine (pesos del consenso
+    # y activación). **Por defecto NO**: el aplicador escucha y audita lo que
+    # habría hecho, sin tocar nada. Encenderlo es una decisión explícita tras
+    # ver qué propone el MSM — arrancar gobernando de golpe puede desactivar
+    # varias estrategias en pocas horas y dejar al consenso sin votos
+    # suficientes para superar `min_score`, es decir, sin operar.
+    # Nada de esto puede habilitar live: sólo mueve configuración.
+    apply_governance: bool = False
+
+
+class MLEraSettings(BaseModel):
+    """Una "era" del historial, delimitada por un fix de ejecución conocido.
+
+    Attributes:
+        name: Identificador de la era.
+        until: Fecha (ISO ``YYYY-MM-DD``, UTC, **exclusiva**) hasta la que llega.
+        weight: Peso de sus operaciones en el entrenamiento. ``0.0`` las excluye.
+        reason: Qué bug de ejecución contamina esta era.
+    """
+
+    name: str
+    until: str
+    weight: float = 1.0
+    reason: str = ""
+
+
+class MLDataQualitySettings(BaseModel):
+    """Saneamiento del training set: no aprender de bugs ya arreglados.
+
+    El problema que esto resuelve: si el modelo entrena sobre operaciones en las
+    que el stop estaba mal calculado, el trailing apretaba mal o la salida por
+    régimen cortaba la tesis antes de tiempo, **no aprende "esta señal es mala"
+    — aprende "esta señal es mala porque la ejecución la saboteó"**. Eso penaliza
+    contextos que sí tenían edge y hace al modelo más torpe, no más listo.
+
+    Las operaciones se clasifican por era usando su **hora de entrada**: una
+    operación abierta antes de un fix corrió bajo las reglas viejas durante casi
+    toda su vida, aunque cerrara después. Es la clasificación conservadora.
+    """
+
+    enabled: bool = True
+    # Eras en orden cronológico. Una operación pertenece a la PRIMERA era cuya
+    # fecha `until` no haya alcanzado; lo posterior a todas ellas es historial
+    # limpio y pesa `clean_weight`.
+    eras: list[MLEraSettings] = Field(
+        default_factory=lambda: [
+            MLEraSettings(
+                name="pre_contract_size_y_familias_regimen",
+                until="2026-07-27",
+                weight=0.0,
+                reason=(
+                    "Stop mal calculado (bug de contract_size) y salida por régimen "
+                    "comparando las 8 etiquetas en vez de familias. El R de estas "
+                    "operaciones no mide la señal: mide un stop equivocado. No es "
+                    "una muestra floja, es una medición inválida — se excluyen."
+                ),
+            ),
+            MLEraSettings(
+                name="pre_trailing_activate_r",
+                until="2026-07-29",
+                weight=0.35,
+                reason=(
+                    "El trailing apretaba el stop nada más abrir (sin gate de +1R), "
+                    "liquidando posiciones por ruido. El sesgo es real pero acotado "
+                    "y direccional: se conservan con peso reducido en vez de tirar "
+                    "la muestra, porque la entrada y su contexto siguen siendo "
+                    "válidos."
+                ),
+            ),
+        ]
+    )
+    clean_weight: float = 1.0
+    # Etiqueta de CALIDAD DE SEÑAL: excluye las operaciones cuyo cierre lo
+    # decidió la ejecución (régimen, tiempo, kill switch, manual...). Esa
+    # operación nunca llegó a poner a prueba su propia tesis, así que etiquetarla
+    # como "señal mala" es exactamente el error que este bloque evita.
+    signal_label_exit_reasons: list[str] = Field(
+        default_factory=lambda: ["take_profit", "stop_loss", "trailing_stop", "break_even"]
+    )
+
+
+class MLExecutionRulesCheckSettings(BaseModel):
+    """Gate de vigencia del modelo frente a las reglas de ejecución.
+
+    Comprueba que el modelo activo se entrenó con las reglas vigentes
+    (holding, sizing, filtros de riesgo, trailing) y avisa si no. **Avisa una
+    vez por situación**, no una por vuelta: el estado dura hasta que un humano
+    reentrena, y repetirlo cada hora lo convierte en ruido que se silencia.
+    """
+
+    enabled: bool = True
+    check_interval_seconds: float = 3600.0
 
 
 class MLSettings(BaseModel):
@@ -264,6 +359,10 @@ class MLSettings(BaseModel):
     drift: MLDriftSettings = Field(default_factory=MLDriftSettings)
     advisor: MLAdvisorSettings = Field(default_factory=MLAdvisorSettings)
     meta: MLMetaStrategySettings = Field(default_factory=MLMetaStrategySettings)
+    data_quality: MLDataQualitySettings = Field(default_factory=MLDataQualitySettings)
+    execution_rules_check: MLExecutionRulesCheckSettings = Field(
+        default_factory=MLExecutionRulesCheckSettings
+    )
 
 
 class RiskSettings(BaseModel):
@@ -652,6 +751,12 @@ class HealthSettings(BaseModel):
     cpu_warn_pct: float = 85.0
     memory_warn_pct: float = 85.0
     disk_warn_pct: float = 90.0
+    # Desviación tolerada entre el reloj efectivo del proceso y el de pared.
+    # En vivo debe ser 0: cualquier valor apreciable significa que un reloj
+    # simulado de backtest se filtró fuera de su contexto, y con el reloj mal
+    # el validador de mercado descarta todos los ticks y el motor deja de
+    # operar en silencio. Por eso el umbral es bajo y el estado UNHEALTHY.
+    max_clock_skew_seconds: float = 5.0
 
 
 class WatchdogSettings(BaseModel):
@@ -757,6 +862,76 @@ class ExecutionRiskSettings(BaseModel):
     kill_switch_drawdown_pct: float = 20.0
 
 
+class StrategyExperimentSettings(BaseModel):
+    """Experimentos con fecha de corte por estrategia (decisión asistida).
+
+    Una estrategia con R negativo persistente no debería depender de que el
+    operador se acuerde de revisarla. Se abre un experimento con **fecha de
+    corte**: al vencer, se mide su expectativa con las operaciones cerradas
+    *desde que empezó el experimento* y, si sigue en negativo con muestra
+    suficiente, el sistema la marca como **candidata a desactivación** y avisa
+    por Discord con los números.
+
+    Regla dura: esto **nunca** desactiva nada. Sólo propone. Apagar una
+    estrategia es mover ``execution.strategies_enabled`` a mano.
+    """
+
+    enabled: bool = True
+    # Estrategias bajo observación. El experimento arranca la primera vez que
+    # el job corre con la estrategia en esta lista, y su inicio se persiste,
+    # así que un reinicio del motor no reinicia el reloj.
+    watching: list[str] = Field(default_factory=lambda: ["atr_expansion", "mean_reversion"])
+    # Ventana del experimento. La tarea pedía 48-72h tras el cambio de holding
+    # del Bloque 1; se toma el extremo largo para no juzgar con muestra corta.
+    deadline_hours: float = 72.0
+    # Operaciones cerradas mínimas dentro de la ventana para emitir veredicto.
+    # Por debajo de esto el veredicto es "muestra insuficiente" y la ventana se
+    # extiende: juzgar con 3 operaciones sería ruido, no evidencia.
+    min_trades: int = 20
+    # Cuánto se extiende la ventana cuando la muestra no alcanza.
+    extension_hours: float = 24.0
+    # Expectativa (en R) por debajo de la cual se propone la desactivación.
+    max_expectancy_r: float = 0.0
+    # Cadencia del chequeo. Barato: sólo lee el Trade Journal en memoria.
+    check_interval_seconds: float = 3600.0
+    state_path: Path = _PROJECT_ROOT / "data" / "execution" / "strategy_experiments.jsonl"
+    persist: bool = True
+
+
+class FalsificationSettings(BaseModel):
+    """Falsación automática del cambio de holding por estrategia (Bloque 7.1).
+
+    "Se desplegó sin errores" no es evidencia de que el cambio funcione. El
+    Bloque 1 hizo una predicción concreta y comprobable, y esto la mide sola en
+    la ventana posterior al cambio:
+
+    - ``take_profit`` debe **subir del 0 %**: si ninguna operación llega al
+      objetivo, el holding sigue cortando la tesis antes de tiempo.
+    - ``regime_change`` debe **bajar del 80 %**: era el síntoma original.
+    - La **duración mediana** debe acercarse a la esperada por estrategia.
+
+    El veredicto se notifica por Discord, falle o acierte. Un cambio que no se
+    verifica no se distingue de uno que no se hizo.
+    """
+
+    enabled: bool = True
+    # Ventana de medición tras el cambio. La tarea pedía 24-48h; se toma el
+    # extremo largo para no juzgar con muestra corta.
+    window_hours: float = 48.0
+    # Operaciones cerradas mínimas para emitir veredicto. Por debajo, la ventana
+    # se extiende en vez de concluir con ruido.
+    min_trades: int = 20
+    extension_hours: float = 24.0
+    # Criterios de éxito, tal como los enunció el bloque.
+    min_take_profit_pct: float = 0.0  # estrictamente mayor que esto
+    max_regime_change_pct: float = 80.0  # estrictamente menor que esto
+    # Tolerancia de la duración mediana frente a la esperada por estrategia.
+    duration_tolerance: float = 0.5  # ±50 % del umbral de holding aplicable
+    check_interval_seconds: float = 3600.0
+    state_path: Path = _PROJECT_ROOT / "data" / "execution" / "falsification.jsonl"
+    persist: bool = True
+
+
 class ExecutionSettings(BaseModel):
     """Motor de ejecución y paper trading (Fase 5).
 
@@ -797,12 +972,60 @@ class ExecutionSettings(BaseModel):
     # el régimen "parpadea" entre etiquetas vela a vela (más en cripto, velas
     # 1m ruidosas) y corta la posición casi al entrar, antes de que se mueva.
     regime_change_min_holding_seconds: float = 180.0
+    # Holding mínimo POR ESTRATEGIA. Un valor global es un promedio que no le
+    # sirve a nadie: `order_block` necesita ~30 min para resolver su tesis y
+    # `bos` la resuelve en ~2 min. Con un único número, o se corta al primero
+    # antes de tiempo o se deja al segundo colgado sin salida por régimen.
+    # Los valores de arranque son la duración media medida por el evaluador
+    # continuo (señales virtuales), redondeada. Las claves se comparan en
+    # minúsculas. Lo no listado cae a la categoría y luego al valor global.
+    regime_change_min_holding_by_strategy: dict[str, float] = Field(
+        default_factory=lambda: {
+            "order_block": 1950.0,
+            "fair_value_gap": 880.0,
+            "volume_profile": 900.0,
+            "mean_reversion": 770.0,
+            "atr_expansion": 150.0,
+            "bos": 135.0,
+            # `choch` NO lleva valor propio a propósito: su duración medida
+            # (~4 s) era un artefacto del evaluador continuo, que resolvía las
+            # señales contra la vela EN CURSO —cuyo rango incluye precio
+            # anterior a la señal—. Corregido en esta misma entrega
+            # (`PerformanceTracker.evaluate_open` ya sólo mira velas que
+            # empiezan después de la entrada), pero hasta que haya muestra
+            # nueva y limpia se queda en el fallback por categoría.
+        }
+    )
+    # Segundo escalón del fallback: holding mínimo por categoría de estrategia
+    # (la que declara cada plugin: smc / breakout / trend / mean_reversion /
+    # orderflow / volume / volatility / momentum). Cubre a las estrategias sin
+    # historial propio suficiente sin dejarlas en el valor global genérico.
+    regime_change_min_holding_by_category: dict[str, float] = Field(
+        default_factory=lambda: {
+            "smc": 900.0,
+            "volume": 900.0,
+            "mean_reversion": 770.0,
+            "trend": 600.0,
+            "breakout": 300.0,
+            "momentum": 300.0,
+            "orderflow": 180.0,
+            "volatility": 150.0,
+        }
+    )
     # Toggle de operativa por símbolo: {"XAUUSDM": false} deja de abrir posiciones
     # en ese símbolo sin sacarlo del feed de datos (sigue alimentando estrategias,
     # backtests y ML). Lo no listado se opera. Las claves se comparan en MAYÚSCULAS.
     # Pensado para símbolos cuyo lote mínimo no cabe en el equity actual (el oro
     # necesita ~20k con el tope de exposición al 20%).
     symbols_enabled: dict[str, bool] = Field(default_factory=dict)
+    # Mismo toggle, pero por ESTRATEGIA: {"atr_expansion": false} deja de abrir
+    # posiciones atribuidas a esa estrategia sin sacarla del motor — sigue
+    # emitiendo señales, votando en el consenso y alimentando evaluación y ML,
+    # así que se puede medir si habría mejorado sin haber perdido su historial.
+    # Lo no listado se opera. Las claves se comparan en MINÚSCULAS.
+    # Nadie lo modifica automáticamente: el experimento del Bloque 2 sólo
+    # *propone* candidatas y avisa por Discord; apagarlas es decisión humana.
+    strategies_enabled: dict[str, bool] = Field(default_factory=dict)
     report_interval_seconds: float = 3600.0  # resumen periódico a Discord
     journal_path: Path = _PROJECT_ROOT / "data" / "execution" / "journal.jsonl"
     persist_journal: bool = True
@@ -811,6 +1034,8 @@ class ExecutionSettings(BaseModel):
     latency: LatencySettings = Field(default_factory=LatencySettings)
     sizing: SizingSettings = Field(default_factory=SizingSettings)
     risk: ExecutionRiskSettings = Field(default_factory=ExecutionRiskSettings)
+    experiments: StrategyExperimentSettings = Field(default_factory=StrategyExperimentSettings)
+    falsification: FalsificationSettings = Field(default_factory=FalsificationSettings)
 
     @field_validator("mode")
     @classmethod
@@ -824,10 +1049,31 @@ class ExecutionSettings(BaseModel):
         """
         normalized = value.strip().lower()
         if normalized not in ("paper", "demo", "live"):
-            raise ValueError(
-                f"execution.mode debe ser 'paper', 'demo' o 'live', no {value!r}"
-            )
+            raise ValueError(f"execution.mode debe ser 'paper', 'demo' o 'live', no {value!r}")
         return normalized
+
+    def min_holding_seconds_for(self, strategy: str, category: str = "") -> float:
+        """Minimum holding time before a regime change may close a position.
+
+        Fallback en tres escalones: valor propio de la estrategia → valor de su
+        categoría → valor global. Una estrategia nueva, o una posición sin
+        atribución (adoptada del broker al arrancar), cae al global y se
+        comporta exactamente como antes de este cambio.
+
+        Args:
+            strategy: Nombre de la estrategia dominante ("" si se desconoce).
+            category: Categoría de esa estrategia ("" si se desconoce).
+
+        Returns:
+            Segundos mínimos de holding aplicables a esa posición.
+        """
+        by_strategy = self.regime_change_min_holding_by_strategy.get(strategy.strip().lower())
+        if by_strategy is not None:
+            return float(by_strategy)
+        by_category = self.regime_change_min_holding_by_category.get(category.strip().lower())
+        if by_category is not None:
+            return float(by_category)
+        return self.regime_change_min_holding_seconds
 
     @property
     def is_live(self) -> bool:
@@ -1199,6 +1445,45 @@ class PromotionSettings(BaseModel):
     min_improvement: float = 0.05  # mejora mínima del objetivo vs la vigente
 
 
+class ResearchBudgetSettings(BaseModel):
+    """Presupuesto de CPU del ciclo autónomo del Research Lab (Fase 10).
+
+    El laboratorio corre en la misma VPS que el motor que está operando (paper,
+    pero con datos y notificaciones reales). Un ciclo de generación son cientos
+    de backtests: sin un techo explícito puede robarle CPU al bucle de gestión
+    de posiciones, que es el que no puede llegar tarde.
+
+    Tres límites, los tres duros:
+
+    1. **Ventana horaria** de baja actividad — fuera de ella el job no arranca.
+    2. **Tope de trabajo por ejecución** — símbolos y genomas por lote.
+    3. **Timeout duro** — el ciclo se cancela al vencer, pase lo que pase.
+
+    Más dos vetos de cortesía: no arrancar con la CPU ya alta, ni con posiciones
+    abiertas (el laboratorio puede esperar; una posición viva, no).
+    """
+
+    enabled: bool = True
+    # Ventana UTC de baja actividad. Por defecto 01:00-05:00 UTC: fuera de la
+    # sesión americana (cierra 22:00) y antes de que arranque Europa (07:00).
+    # Si start > end la ventana cruza medianoche.
+    window_start_hour_utc: int = 1
+    window_end_hour_utc: int = 5
+    # Techo de trabajo por ejecución. `max_generated_per_run` acota la población
+    # del generador: es la variable que más multiplica el número de backtests.
+    max_symbols_per_run: int = 2
+    max_generated_per_run: int = 12
+    # Timeout duro del ciclo completo. Al vencer se cancela: un ciclo colgado no
+    # puede quedarse consumiendo CPU hasta el siguiente disparo.
+    run_timeout_seconds: float = 900.0
+    # Workers del cluster de simulación durante el ciclo autónomo. Se deja por
+    # debajo de `simulation.max_workers` para no saturar una VPS de 2 vCPU.
+    max_workers: int = 2
+    # Vetos de cortesía.
+    skip_if_cpu_pct_above: float = 70.0
+    skip_if_positions_open: bool = True
+
+
 class ResearchSettings(BaseModel):
     """Quant Research Lab (Fase 10): investiga, valida y promueve estrategias.
 
@@ -1239,6 +1524,7 @@ class ResearchSettings(BaseModel):
     paper: PaperValidationSettings = Field(default_factory=PaperValidationSettings)
     shadow: ShadowModeSettings = Field(default_factory=ShadowModeSettings)
     promotion: PromotionSettings = Field(default_factory=PromotionSettings)
+    budget: ResearchBudgetSettings = Field(default_factory=ResearchBudgetSettings)
 
 
 class Settings(BaseSettings):

@@ -5,6 +5,7 @@ import contextlib
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from app.core.container import Container
 from app.core.events.base import Event
@@ -69,11 +70,38 @@ async def events_stream(websocket: WebSocket) -> None:
             queue.put_nowait(event)
 
     subscription = bus.subscribe(forward)
-    try:
+
+    async def pump() -> None:
+        """Push queued events until the client goes away."""
         while True:
             event = await queue.get()
+            if websocket.client_state is not WebSocketState.CONNECTED:
+                return
             await websocket.send_json(event.to_dict())
+
+    # El envío va en una tarea aparte y la corrutina del endpoint se queda
+    # escuchando al cliente. Es la única señal **fiable** de que se fue: este
+    # canal es de sólo lectura para el cliente, así que `receive` sólo retorna
+    # cuando llega el `websocket.disconnect`.
+    #
+    # Antes el endpoint era el bucle de envío y sólo salía con
+    # `WebSocketDisconnect`. Cuando el cliente desaparece sin cierre limpio
+    # (pestaña cerrada, red caída, dashboard reiniciado) `send_json` **no
+    # lanza**: asyncio ve el transporte con `_conn_lost`, descarta el envío en
+    # silencio y vuelve. El bucle seguía consumiendo eventos y "enviándolos" a
+    # un socket muerto indefinidamente — un WARNING de asyncio por cada evento
+    # del motor, y una suscripción al bus que nunca se liberaba. Cada recarga
+    # del dashboard dejaba otro zombi sumando ruido.
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
     except WebSocketDisconnect:
         _log.debug("WebSocket client disconnected")
     finally:
+        pump_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await pump_task
         bus.unsubscribe(subscription)

@@ -110,12 +110,8 @@ def test_sizing_returns_lots_not_units_with_contract_size():
     sizer = PositionSizer(
         SizingSettings(method="fixed_risk", risk_per_trade_pct=1.0, max_position_pct=1000.0)
     )
-    spec = InstrumentSpec(
-        symbol="XAUUSD", contract_size=100.0, volume_min=0.01, volume_step=0.01
-    )
-    result = sizer.calculate(
-        equity=100_000.0, price=4_000.0, stop_distance=4.0, spec=spec
-    )
+    spec = InstrumentSpec(symbol="XAUUSD", contract_size=100.0, volume_min=0.01, volume_step=0.01)
+    result = sizer.calculate(equity=100_000.0, price=4_000.0, stop_distance=4.0, spec=spec)
 
     # 1% de 100.000 = 1.000 arriesgados / 4 = 250 onzas = 2.5 lotes.
     assert result.units == 250.0
@@ -130,9 +126,7 @@ def test_sizing_rejects_when_min_lot_exceeds_risk_budget():
     sizer = PositionSizer(
         SizingSettings(method="fixed_risk", risk_per_trade_pct=0.5, max_position_pct=1000.0)
     )
-    spec = InstrumentSpec(
-        symbol="XAUUSD", contract_size=100.0, volume_min=0.01, volume_step=0.01
-    )
+    spec = InstrumentSpec(symbol="XAUUSD", contract_size=100.0, volume_min=0.01, volume_step=0.01)
     result = sizer.calculate(equity=164.0, price=4_089.0, stop_distance=6.13, spec=spec)
 
     assert result.quantity == 0.0

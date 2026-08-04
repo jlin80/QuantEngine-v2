@@ -25,6 +25,7 @@ from app.engine.events import DecisionGenerated
 from app.engine.market_context import MarketContextEngine
 from app.execution import events as ev
 from app.execution.commission import CommissionEngine
+from app.execution.falsification import FalsificationVerdict, HoldingChangeFalsifier
 from app.execution.journal import TradeJournal
 from app.execution.models import (
     ExitReason,
@@ -46,6 +47,7 @@ from app.execution.position_manager import PositionManager
 from app.execution.risk_manager import RiskManager, RiskQuery
 from app.execution.sizing import PositionSizer
 from app.execution.slippage import SlippageContext
+from app.execution.strategy_experiments import ExperimentVerdict, StrategyExperimentManager
 from app.market.models import Ticker, Timeframe
 from app.market.services import MarketDataService
 from app.utils.time import utc_now
@@ -112,6 +114,11 @@ class ExecutionEngine(Service):
         performance: Performance Engine (para Kelly y reportes).
         bus: Event Bus (``None`` en tests puros).
         context: Market Context Engine (opcional; enriquece ATR/régimen).
+        experiments: Gestor de experimentos con fecha de corte por estrategia
+            (opcional). Sólo *propone* desactivaciones; nunca las aplica.
+        falsifier: Falsador del cambio de holding por estrategia (opcional).
+            Mide la predicción del Bloque 1 y publica el veredicto, acierte o
+            falle; no cambia ninguna configuración.
     """
 
     def __init__(
@@ -129,6 +136,8 @@ class ExecutionEngine(Service):
         performance: PerformanceEngine,
         bus: EventBus | None = None,
         context: MarketContextEngine | None = None,
+        experiments: StrategyExperimentManager | None = None,
+        falsifier: HoldingChangeFalsifier | None = None,
     ) -> None:
         super().__init__("execution_engine")
         self._settings = settings
@@ -144,6 +153,8 @@ class ExecutionEngine(Service):
         self._performance = performance
         self._bus = bus
         self._context = context
+        self._experiments = experiments
+        self._falsifier = falsifier
         self._subscription: Subscription | None = None
         self._manage_task: asyncio.Task[None] | None = None
         self._kill_announced = False
@@ -152,6 +163,98 @@ class ExecutionEngine(Service):
         self._spec_cache: dict[str, InstrumentSpec] = {}
         self._entry_vetoes: list[Callable[[], str | None]] = []
         self._log = logging.getLogger("app.execution.engine")
+
+    # ------------------------------------------------------------------
+    # Experimentos con fecha de corte por estrategia (Bloque 2)
+    # ------------------------------------------------------------------
+
+    @property
+    def experiments(self) -> StrategyExperimentManager | None:
+        """Gestor de experimentos por estrategia (``None`` si está apagado)."""
+        return self._experiments
+
+    async def run_strategy_experiments(self) -> list[ExperimentVerdict]:
+        """Open pending experiments and adjudicate the expired ones.
+
+        Lo dispara el scheduler. **Nunca desactiva una estrategia**: publica el
+        veredicto como evento y Discord lo convierte en aviso con los números.
+        Apagarla sigue siendo mover ``execution.strategies_enabled`` a mano.
+
+        Returns:
+            Los veredictos emitidos en esta pasada (vacío si ninguno venció).
+        """
+        if self._experiments is None:
+            return []
+        for opened in self._experiments.open_pending():
+            await self._publish(
+                ev.StrategyExperimentOpened(
+                    source="execution_engine",
+                    strategy=opened.strategy,
+                    deadline=opened.deadline.isoformat(),
+                    min_trades=self._settings.experiments.min_trades,
+                    max_expectancy_r=self._settings.experiments.max_expectancy_r,
+                )
+            )
+        verdicts = self._experiments.evaluate(self._journal.all())
+        for verdict in verdicts:
+            self._log.info(
+                "Veredicto de experimento %s: %s (%s)",
+                verdict.strategy,
+                verdict.outcome,
+                verdict.detail,
+            )
+            await self._publish(
+                ev.StrategyExperimentVerdict(
+                    source="execution_engine",
+                    strategy=verdict.strategy,
+                    outcome=verdict.outcome,
+                    trades=verdict.trades,
+                    expectancy_r=verdict.expectancy_r,
+                    win_rate=verdict.win_rate,
+                    total_r=verdict.total_r,
+                    window_hours=verdict.window_hours,
+                    detail=verdict.detail,
+                )
+            )
+        return verdicts
+
+    # ------------------------------------------------------------------
+    # Falsación del cambio de holding por estrategia (Bloque 7.1)
+    # ------------------------------------------------------------------
+
+    @property
+    def falsifier(self) -> HoldingChangeFalsifier | None:
+        """Falsador del cambio de holding (``None`` si está apagado)."""
+        return self._falsifier
+
+    async def run_holding_falsification(self) -> FalsificationVerdict | None:
+        """Open the measurement window and emit its verdict when due.
+
+        Lo dispara el scheduler. Publica el veredicto **acierte o falle**: una
+        predicción que sólo se reporta cuando se cumple no es una falsación.
+        No cambia ninguna configuración.
+        """
+        if self._falsifier is None:
+            return None
+        self._falsifier.start()
+        verdict = self._falsifier.evaluate(self._journal.all())
+        if verdict is None:
+            return None
+        self._log.info("Falsación del holding: %s — %s", verdict.outcome, verdict.detail)
+        await self._publish(
+            ev.HoldingChangeFalsified(
+                source="execution_engine",
+                outcome=verdict.outcome,
+                trades=verdict.trades,
+                window_hours=verdict.window_hours,
+                take_profit_pct=verdict.take_profit_pct,
+                regime_change_pct=verdict.regime_change_pct,
+                median_holding_seconds=verdict.median_holding_seconds,
+                expected_holding_seconds=verdict.expected_holding_seconds,
+                detail=verdict.detail,
+            )
+        )
+        return verdict
 
     # ------------------------------------------------------------------
     # Vetos de entrada (hook genérico; Safe Mode lo usa en Fase 9)
@@ -339,6 +442,14 @@ class ExecutionEngine(Service):
         if not self._settings.symbols_enabled.get(symbol, True):
             self._log.debug("Símbolo %s desactivado para operar (toggle)", symbol)
             return None
+        # Toggle por estrategia, con la misma semántica: sólo bloquea la
+        # APERTURA. La estrategia sigue emitiendo señales y votando en el
+        # consenso, así que su historial no se interrumpe y se puede medir qué
+        # habría hecho. Sin atribución no se bloquea nada.
+        strategy = decision.strategy.strip().lower()
+        if strategy and not self._settings.strategies_enabled.get(strategy, True):
+            self._log.debug("Estrategia %s desactivada para operar (toggle)", strategy)
+            return None
         # Vetos externos (Safe Mode en Fase 9). Se evalúan antes que nada: si el
         # sistema está degradado no tiene sentido ni mirar el mercado.
         veto = self._entry_veto()
@@ -446,6 +557,8 @@ class ExecutionEngine(Service):
             take_profit=take_profit,
             decision_id=decision.decision_id,
             regime=view.regime,
+            strategy=decision.strategy,
+            strategy_category=decision.strategy_category,
             score=decision.score,
             confidence=decision.confidence,
             entry_reasons=(decision.summary,) if decision.summary else (),
@@ -561,9 +674,7 @@ class ExecutionEngine(Service):
                 continue
             await self._settle_external_close(position)
 
-    def _infer_external_exit(
-        self, position: Position, exit_price: float
-    ) -> tuple[ExitReason, str]:
+    def _infer_external_exit(self, position: Position, exit_price: float) -> tuple[ExitReason, str]:
         """Deduce por qué el broker cerró una posición fuera del bot.
 
         Compara el precio de salida con el stop y el objetivo que el bot dejó
@@ -700,12 +811,21 @@ class ExecutionEngine(Service):
         2. Se exigen ``regime_exit_confirmations`` lecturas adversas
            **consecutivas**: el régimen en 1m parpadea y una sola lectura no
            basta. El contador se reinicia en cuanto vuelve a ser favorable.
+        3. El holding mínimo se resuelve **por estrategia** (con fallback a su
+           categoría y luego al global): `order_block` necesita ~30 min para
+           resolver su tesis y `bos` ~2 min. Un umbral único cortaba al primero
+           antes de tiempo — la causa de que la ejecución diera -0.15R con el
+           evaluador virtual en +0.26R.
         """
         if not self._settings.exit_on_regime_change or self._context is None:
             return False
         if position.regime in ("", "unknown"):
             return False
-        if position.holding_seconds() < self._settings.regime_change_min_holding_seconds:
+        min_holding = self._settings.min_holding_seconds_for(
+            position.strategy, position.strategy_category
+        )
+        position.metadata["min_holding_seconds"] = min_holding
+        if position.holding_seconds() < min_holding:
             return False
 
         view = await self._market_view(position.symbol)
@@ -995,6 +1115,8 @@ class ExecutionEngine(Service):
             atr=position.metadata.get("atr"),
             volatility=str(position.metadata.get("volatility", "normal")),
             regime=position.regime,
+            strategy=position.strategy,
+            strategy_category=position.strategy_category,
             score=position.score,
             confidence=position.confidence,
             exit_reason=position.exit_reason or ExitReason.MANUAL,
@@ -1012,6 +1134,10 @@ class ExecutionEngine(Service):
                 "break_even_active": position.break_even_active,
                 "trailing_active": position.trailing_active,
                 "holding_seconds": round(position.holding_seconds(), 1),
+                # Umbral que realmente se le aplicó a ESTA posición: sin él no
+                # se puede auditar si una salida por régimen respetó el holding
+                # por estrategia o cayó al fallback global.
+                "min_holding_seconds": position.metadata.get("min_holding_seconds"),
             },
         )
 
@@ -1025,7 +1151,11 @@ class ExecutionEngine(Service):
         """Publish an order rejection plus its risk explanation."""
         self._log.warning(
             "Order rejected %s %s — %s: %s (%s)",
-            symbol, side.value, rule, detail, reason.value,
+            symbol,
+            side.value,
+            rule,
+            detail,
+            reason.value,
         )
         request = OrderRequest(symbol=symbol, side=side, quantity=0.0, reason=detail)
         order = self._orders.create(request)

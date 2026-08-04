@@ -71,9 +71,7 @@ def select_broker(
         from app.brokers.mt5.broker import MT5Broker
 
         _log.info("Broker de ejecución: MT5 (cuenta DEMO)")
-        return MT5Broker(
-            mt5_connection, deviation_points=deviation_points, magic=magic
-        )
+        return MT5Broker(mt5_connection, deviation_points=deviation_points, magic=magic)
     raise ConfigurationError(
         "No existe adaptador de broker de dinero real: 'live' sigue prohibido. El "
         "motor no arranca en modo live.",

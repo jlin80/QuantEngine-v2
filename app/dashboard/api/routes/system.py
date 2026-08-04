@@ -7,7 +7,6 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.core.container import Container
 from app.dashboard.api.audit import audit_log
-from app.engine.engine import QuantEngine
 from app.execution.api import ExecutionCore
 from app.monitoring.health import HealthMonitor
 
@@ -77,6 +76,12 @@ async def system_restart(request: Request, body: dict[str, Any]) -> dict[str, An
         raise HTTPException(
             status_code=400, detail="Falta la confirmación explícita ({'confirm': true})"
         )
+
+    # Import diferido a propósito: `app.engine.engine` importa la app del
+    # dashboard, que importa este módulo. Al nivel superior el ciclo es real y
+    # rompe cualquier proceso que importe `app.engine.engine` primero (lo hacía
+    # fallar según el orden de importación, no según el código).
+    from app.engine.engine import QuantEngine
 
     container: Container | None = request.app.state.container
     if container is None or not container.contains(QuantEngine):

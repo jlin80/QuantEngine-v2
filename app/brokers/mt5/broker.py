@@ -221,9 +221,7 @@ class MT5Broker:
                 # mano por el operador se dejan en paz.
                 continue
             raw_time = getattr(p, "time", None)
-            opened_at = (
-                datetime.fromtimestamp(int(raw_time), tz=UTC) if raw_time else None
-            )
+            opened_at = datetime.fromtimestamp(int(raw_time), tz=UTC) if raw_time else None
             adopted.append(
                 BrokerPosition(
                     ticket=int(p.ticket),

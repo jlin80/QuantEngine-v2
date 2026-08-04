@@ -132,8 +132,10 @@ def test_trailing_does_not_tighten_the_initial_stop_on_open():
 def test_trailing_starts_only_after_activate_r():
     """El trailing arranca al alcanzar +1R, no antes."""
     pm = PositionManager(
-        break_even_r=0.0, trailing_enabled=True,
-        trailing_atr_multiple=2.0, trailing_activate_r=1.0,
+        break_even_r=0.0,
+        trailing_enabled=True,
+        trailing_atr_multiple=2.0,
+        trailing_activate_r=1.0,
     )
     pos = pm.open(_fill(price=100.0, qty=1.0), stop_loss=98.0, take_profit=110.0, atr=0.5)
 
@@ -150,8 +152,10 @@ def test_trailing_starts_only_after_activate_r():
 def test_trailing_never_locks_a_loss_once_active():
     """Una vez activo, el trailing solo puede mejorar el stop."""
     pm = PositionManager(
-        break_even_r=0.0, trailing_enabled=True,
-        trailing_atr_multiple=2.0, trailing_activate_r=1.0,
+        break_even_r=0.0,
+        trailing_enabled=True,
+        trailing_atr_multiple=2.0,
+        trailing_activate_r=1.0,
     )
     pos = pm.open(_fill(price=100.0, qty=1.0), stop_loss=98.0, take_profit=110.0, atr=0.5)
     pm.update_mark(pos, 104.0)
