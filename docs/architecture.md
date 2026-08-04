@@ -2260,3 +2260,61 @@ tenerla escrita antes de seguir usando el backtest para decidir.
 mover el timeframe del detector; hay que **dar efecto al regimen en la
 decision** - un filtro de sesgo que impida abrir contra la estructura del marco
 superior. Eso es funcionalidad nueva, no un barrido de configuracion.
+
+
+## El filtro de sesgo multi-timeframe NO esta justificado (medido, 2026-08-04)
+
+Antes de implementar el filtro de sesgo se midio su efecto sobre las 1209
+operaciones reales: para cada entrada se calculo el sesgo del marco superior
+(EMA20 sobre la vela CERRADA anterior, sin lookahead) y se comparo la
+expectativa de las entradas a favor frente a las entradas en contra.
+
+| Simbolo | Sesgo | A favor | exp | En contra | exp |
+| --- | --- | --- | --- | --- | --- |
+| BTCUSDm | 1h | 46.3 % | -0.102R | 53.7 % | **-0.069R** |
+| BTCUSDm | 15m | 50.0 % | -0.106R | 50.0 % | **-0.062R** |
+| ETHUSDm | 1h | 46.3 % | **-0.082R** | 53.7 % | -0.156R |
+| ETHUSDm | 15m | 48.9 % | -0.156R | 51.1 % | **-0.089R** |
+
+**En 3 de las 4 combinaciones, las entradas EN CONTRA del marco superior lo
+hacen MEJOR que las alineadas.** Y la unica en la que el sesgo ayuda (ETH 1h) se
+contradice con su propio simbolo en 15m.
+
+Es la misma firma que el ranking entre estrategias: cambia de signo segun el
+corte, o sea, **ruido**. El filtro bloquearia ~50 % de las entradas (de ~100
+operaciones diarias a ~50) sin evidencia de que bloquee las malas — y en la
+mayoria de los cortes eliminaria la mitad mejor.
+
+**Decision: no se implementa.** La hipotesis multi-timeframe era razonable y la
+propuse yo; los datos no la respaldan con esta definicion de sesgo. Queda la
+puerta abierta a otra definicion de estructura superior, pero la carga de la
+prueba ya no esta del lado de "probemos a ver".
+
+## Cuanta confianza hay en que no hay edge (bootstrap + Monte Carlo)
+
+Remuestreo bootstrap (20.000 iteraciones) sobre la expectativa por operacion:
+
+| Muestra | n | Expectativa | IC 95 % | P(expectativa > 0) |
+| --- | --- | --- | --- | --- |
+| Todo el historial | 1209 | -0.078R | [-0.117, -0.039] | **0.01 %** |
+| post_fixes (>=07-29) | 787 | -0.062R | [-0.113, -0.011] | **0.97 %** |
+| post-Bloque 1 (08-04) | 134 | -0.101R | [-0.206, +0.006] | 3.23 % |
+
+**La expectativa negativa no es mala suerte.** Con 1209 operaciones, el
+intervalo de confianza al 95 % no toca el cero ni de lejos. Solo la submuestra
+de 134 operaciones lo roza, y precisamente por ser pequena.
+
+Proyeccion Monte Carlo de 1000 operaciones futuras con el sizing actual (0.5 %
+de riesgo por operacion), asumiendo que la distribucion no cambia:
+
+- Equity mediana: **x0.673** (p5 x0.564, p95 x0.805)
+- Probabilidad de perder la mitad del capital: 0.4 %
+
+El sizing conservador evita el desastre: el sistema **no revienta, se desangra**.
+Perderia en torno a un tercio del capital en 1000 operaciones — unas dos
+semanas al ritmo actual.
+
+**Que aporta el Monte Carlo y que no.** No mejora el bot: es una herramienta de
+validacion y de riesgo, no de descubrimiento. No puede crear edge donde no lo
+hay. Lo que si ha hecho es cerrar definitivamente la pregunta *"esto es varianza
+o es real?"* - es real - y cuantificar el coste de seguir operando sin cambios.
