@@ -47,6 +47,10 @@ class OrderRequest:
         stop_loss: Stop de protección de la posición resultante.
         take_profit: Objetivo de la posición resultante.
         reduce_only: Si solo puede reducir/cerrar posición.
+        contract_size: Unidades del subyacente por lote del símbolo. Viaja con
+            la orden porque ``quantity`` son **lotes**: sin esto, quien calcula
+            dinero aguas abajo (comisión, PnL) trataría 0.01 lotes de oro como
+            0.01 onzas en vez de 1, subestimando 100x.
         decision_id: Decisión que la originó (trazabilidad).
         signal_ids: Señales que el consenso consideró en esa decisión. Se
             arrastran para poder unir la operación resultante con el resultado
@@ -66,6 +70,7 @@ class OrderRequest:
     stop_loss: float | None = None
     take_profit: float | None = None
     reduce_only: bool = False
+    contract_size: float = 1.0
     decision_id: str | None = None
     signal_ids: tuple[str, ...] = ()
     reason: str = ""
@@ -86,6 +91,7 @@ class OrderRequest:
             "stop_loss": self.stop_loss,
             "take_profit": self.take_profit,
             "reduce_only": self.reduce_only,
+            "contract_size": self.contract_size,
             "decision_id": self.decision_id,
             "signal_ids": list(self.signal_ids),
             "reason": self.reason,

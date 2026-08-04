@@ -33,7 +33,10 @@ class TradeRecord:
         position_id: Posición de origen.
         symbol: Activo.
         side: Dirección (LONG/SHORT).
-        quantity: Cantidad operada.
+        quantity: Cantidad operada, en **lotes**.
+        contract_size: Unidades del subyacente por lote. Se registra porque sin
+            el no se puede reinterpretar el PnL de una operacion antigua: en oro
+            (100) el dinero es 100x lo que sugiere `quantity` a solas.
         entry_time: Hora de entrada.
         exit_time: Hora de salida.
         entry_price: Precio de entrada.
@@ -72,6 +75,7 @@ class TradeRecord:
     symbol: str
     side: PositionSide
     quantity: float
+    contract_size: float = 1.0
     entry_time: datetime
     exit_time: datetime
     entry_price: float
@@ -137,6 +141,7 @@ class TradeRecord:
             symbol=str(data["symbol"]),
             side=PositionSide(data["side"]),
             quantity=float(data["quantity"]),
+            contract_size=float(data.get("contract_size", 1.0)),
             entry_time=datetime.fromisoformat(str(data["entry_time"])),
             exit_time=datetime.fromisoformat(str(data["exit_time"])),
             entry_price=float(data["entry_price"]),
@@ -176,6 +181,7 @@ class TradeRecord:
             "symbol": self.symbol,
             "side": self.side.value,
             "quantity": self.quantity,
+            "contract_size": self.contract_size,
             "entry_time": _iso(self.entry_time),
             "exit_time": _iso(self.exit_time),
             "duration_seconds": self.duration_seconds,

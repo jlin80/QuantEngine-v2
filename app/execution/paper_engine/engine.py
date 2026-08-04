@@ -122,7 +122,10 @@ class PaperBroker:
 
         quantity = self._fill_quantity(request.quantity) if allow_partial else request.quantity
         maker = request.order_type == OrderType.LIMIT
-        commission = self._commission.calculate(request.symbol, quantity, price, maker=maker).amount
+        # Comision sobre UNIDADES: `quantity` son lotes y un lote de oro son
+        # 100 onzas. Con `contract_size=1` (cripto/indices) no cambia nada.
+        units = quantity * request.contract_size
+        commission = self._commission.calculate(request.symbol, units, price, maker=maker).amount
 
         fill = Fill(
             request_id=request.request_id,

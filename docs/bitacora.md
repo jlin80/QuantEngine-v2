@@ -1441,3 +1441,45 @@ abrir contra la estructura del marco superior. Es funcionalidad nueva, no un
 barrido de configuracion, y por eso no la he metido sin consultar.
 
 **Tests.** 9 nuevos. Suite: **978 en verde** en 3.14 y en 3.12.10.
+
+
+## 2026-08-04 - El fix del contract_size estaba a medias: el PnL del oro salia 100x menor
+
+**Categoria:** fix · **Tags:** `oro` `contract_size` `pnl` `riesgo` `latente`
+
+**Como aparecio.** Preguntando por que el oro habia podido operar con 200-500 $
+de balance si su lote minimo son ~4.078 $ de nocional. La respuesta: **no
+cabia**. Antes del fix del 27/07 el motor calculaba el riesgo como si 0.01 lotes
+fueran 0.01 onzas en vez de 1, asi que creia arriesgar 0.06 $ cuando arriesgaba
+6 $ — el 3 % de la cuenta. Tomaba 100x el riesgo que creia tomar.
+
+**Y tirando del hilo, el fix del 27/07 estaba incompleto.** Se arreglo el
+sizing, pero el calculo de dinero siguio usando `quantity` (lotes):
+
+- `Position.unrealized_pnl`, `notional`, `cost_basis`
+- `PositionManager.close` (PnL realizado) y `open_risk`
+- `Position.initial_risk`
+- la comision del paper engine
+
+Latente 8 dias porque en BTC/ETH/USTEC `contract_size=1` y ahi lotes == unidades:
+sale bien por casualidad. Solo se manifiesta en oro, apagado desde ese mismo dia.
+
+**Lo grave no era el PnL mal escrito**: `initial_risk` y `open_risk` alimentan el
+freno de perdida diaria y el riesgo por operacion. Con el oro activo, las
+perdidas se contarian 100x mas pequenas y **ninguna salvaguarda lo veria venir**.
+Es decir, el bug habria mordido exactamente al reactivar el oro.
+
+**Arreglo (ADR-099).** `Position.contract_size` + propiedad `units`; todo el
+dinero pasa por `units`. El `contract_size` viaja por `OrderRequest`, se
+persiste en el snapshot de recuperacion —si no, una posicion de oro restaurada
+volveria a perderlo, igual que paso con `strategy`— y queda registrado en el
+`TradeRecord` para poder reinterpretar operaciones antiguas.
+
+**Tests.** 13 nuevos, incluidos los de que `contract_size=1` no cambia nada (es
+donde el bug estaba escondido) y los de compatibilidad con journal y snapshots
+anteriores. Suite: **991 en verde** en 3.14 y en 3.12.10. Arranque real del
+motor verificado: healthy, parada limpia, guard anti-live intacto.
+
+**No se reescribe el historial.** Las 194 operaciones de oro del 23-27/07 siguen
+con el PnL mal escrito: pertenecen a la era `pre_contract_size`, ya excluida del
+entrenamiento con peso 0.0.

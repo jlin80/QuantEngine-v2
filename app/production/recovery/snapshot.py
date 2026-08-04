@@ -40,6 +40,9 @@ def position_to_state(position: Position) -> dict[str, Any]:
         "side": position.side.value,
         "quantity": position.quantity,
         "initial_quantity": position.initial_quantity,
+        # Sin esto, una posicion de oro restaurada tras un reinicio perderia su
+        # contract_size y su PnL volveria a calcularse 100x menor.
+        "contract_size": position.contract_size,
         "entry_price": position.entry_price,
         "initial_stop": position.initial_stop,
         "stop_loss": position.stop_loss,
@@ -88,6 +91,7 @@ def position_from_state(data: dict[str, Any]) -> Position:
         side=PositionSide(data["side"]),
         quantity=float(data["quantity"]),
         initial_quantity=float(data["initial_quantity"]),
+        contract_size=float(data.get("contract_size", 1.0)),
         entry_price=float(data["entry_price"]),
         initial_stop=_opt_float(data.get("initial_stop")),
         stop_loss=_opt_float(data.get("stop_loss")),
@@ -132,6 +136,7 @@ def trade_from_dict(data: dict[str, Any]) -> TradeRecord:
         symbol=str(data["symbol"]),
         side=PositionSide(data["side"]),
         quantity=float(data["quantity"]),
+        contract_size=float(data.get("contract_size", 1.0)),
         entry_time=datetime.fromisoformat(str(data["entry_time"])),
         exit_time=datetime.fromisoformat(str(data["exit_time"])),
         entry_price=float(data["entry_price"]),
@@ -154,6 +159,7 @@ def trade_from_dict(data: dict[str, Any]) -> TradeRecord:
         entry_reasons=tuple(data.get("entry_reasons", ())),
         exit_reasons=tuple(data.get("exit_reasons", ())),
         decision_id=data.get("decision_id"),
+        signal_ids=tuple(str(x) for x in data.get("signal_ids", ())),
         context_snapshot=dict(data.get("context_snapshot", {})),
         recorded_at=datetime.fromisoformat(str(data["recorded_at"])),
     )

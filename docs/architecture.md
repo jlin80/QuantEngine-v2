@@ -2318,3 +2318,49 @@ semanas al ritmo actual.
 validacion y de riesgo, no de descubrimiento. No puede crear edge donde no lo
 hay. Lo que si ha hecho es cerrar definitivamente la pregunta *"esto es varianza
 o es real?"* - es real - y cuantificar el coste de seguir operando sin cambios.
+
+
+## ADR-099 · El dinero se calcula sobre unidades, nunca sobre lotes
+
+**Contexto.** El 2026-07-27 se corrigio el `contract_size` en el **sizing**: sin
+esa conversion, un lote de XAUUSD (`contract_size=100`) se enviaba 100x mas
+grande de lo que el motor creia. El fix quedo a medias: el **calculo de dinero**
+siguio multiplicando por `quantity`, que son **lotes**.
+
+Consecuencia, medida:
+
+```
+0.01 lotes de oro = 1 onza, nocional 4.078 $
+el precio se mueve 6 $/oz  ->  PnL REAL      = 6.00 $
+                               PnL registrado = 0.06 $   (100x menor)
+```
+
+El bug estuvo **latente 8 dias** porque en BTC/ETH/USTEC `contract_size=1` y
+ahi lotes y unidades coinciden: el calculo sale bien por casualidad. Solo se
+manifiesta con `contract_size != 1`, es decir **solo en oro**, que se apago ese
+mismo dia — precisamente porque al medir bien dejo de caber en la cuenta.
+
+**Por que era grave, y no solo un numero mal escrito.** `Position.initial_risk`
+y `PositionManager.open_risk()` usaban la misma `quantity`, asi que el **freno
+de perdida diaria y el riesgo por operacion contarian las perdidas de oro 100x
+mas pequenas**. Con el oro activo, ninguna salvaguarda lo habria visto venir.
+
+**Decision.** `Position` lleva `contract_size` y expone `units`
+(`quantity x contract_size`). Todo calculo de dinero —nocional, cost basis, PnL
+realizado y flotante, riesgo inicial y agregado— pasa por `units`. El
+`contract_size` viaja por `OrderRequest` (para la comision del paper engine),
+se persiste en el snapshot de recuperacion y se registra en el `TradeRecord`.
+
+**Por que en el `TradeRecord` tambien.** Sin el, una operacion antigua no se
+puede reinterpretar: `quantity` a solas no dice cuanto dinero movio.
+
+**Por que `contract_size` viaja y no se consulta.** El `PaperBroker` no conoce
+el `InstrumentSpec`; darle acceso al registro de instrumentos seria acoplarlo a
+algo que no le corresponde. Mismo patron que `signal_ids` en ADR-094: un campo
+del contrato, no una dependencia nueva.
+
+**Consecuencias.** Los defaults son `1.0` en todas partes, asi que el journal,
+los snapshots y el codigo que no lo pase se comportan exactamente como antes —
+hay tests que lo fijan. El historial de oro anterior (194 operaciones del 23 al
+27/07) sigue teniendo el PnL mal escrito y **no se reescribe**: pertenece a la
+era `pre_contract_size`, ya excluida del entrenamiento con peso 0.0.

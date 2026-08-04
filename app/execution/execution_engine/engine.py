@@ -515,6 +515,7 @@ class ExecutionEngine(Service):
 
         equity = self._portfolio.equity(self._positions.open_positions)
         win_rate, reward_risk = self._perf_inputs()
+        spec = self._instrument_spec(symbol)
         sizing = self._sizer.calculate(
             equity=equity,
             price=reference,
@@ -522,7 +523,7 @@ class ExecutionEngine(Service):
             confidence=decision.confidence,
             win_rate=win_rate,
             reward_risk=reward_risk,
-            spec=self._instrument_spec(symbol),
+            spec=spec,
         )
         if sizing.quantity <= 0:
             await self._reject(symbol, side, RejectReason.INVALID_QUANTITY, "sizing", sizing.reason)
@@ -554,6 +555,7 @@ class ExecutionEngine(Service):
             take_profit=take_profit,
             decision_id=decision.decision_id,
             signal_ids=decision.signal_ids,
+            contract_size=spec.contract_size if spec is not None else 1.0,
             reason=decision.summary,
         )
         order = self._orders.create(request)
@@ -592,6 +594,7 @@ class ExecutionEngine(Service):
             take_profit=take_profit,
             decision_id=decision.decision_id,
             signal_ids=decision.signal_ids,
+            contract_size=spec.contract_size if spec is not None else 1.0,
             regime=view.regime,
             strategy=decision.strategy,
             strategy_category=decision.strategy_category,
@@ -916,6 +919,7 @@ class ExecutionEngine(Service):
             quantity=position.quantity,
             order_type=OrderType.MARKET,
             reduce_only=True,
+            contract_size=position.contract_size,
             reason=reason.value,
         )
         order = self._orders.create(request)
@@ -1160,6 +1164,7 @@ class ExecutionEngine(Service):
             exit_reasons=position.exit_reasons,
             decision_id=position.decision_id,
             signal_ids=position.signal_ids,
+            contract_size=position.contract_size,
             # Contexto de SALIDA: sin esto no se puede auditar por qué se cerró
             # (el journal sólo guardaba el régimen de entrada, así que era
             # imposible medir si las salidas por régimen estaban justificadas).

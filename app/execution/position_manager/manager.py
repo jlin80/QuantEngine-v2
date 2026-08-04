@@ -108,7 +108,7 @@ class PositionManager:
         total = 0.0
         for p in self._open.values():
             if p.stop_loss is not None:
-                total += abs(p.mark_price - p.stop_loss) * p.quantity
+                total += abs(p.mark_price - p.stop_loss) * p.units
         return total
 
     # ------------------------------------------------------------------
@@ -123,6 +123,7 @@ class PositionManager:
         take_profit: float | None,
         decision_id: str | None = None,
         signal_ids: tuple[str, ...] = (),
+        contract_size: float = 1.0,
         regime: str = "unknown",
         strategy: str = "",
         strategy_category: str = "",
@@ -140,6 +141,7 @@ class PositionManager:
             take_profit: Objetivo inicial.
             decision_id: Decisión de origen.
             signal_ids: Señales que originaron esa decisión.
+            contract_size: Unidades del subyacente por lote (100 en XAU).
             regime: Régimen al abrir.
             strategy: Estrategia dominante de la decisión.
             strategy_category: Categoría de esa estrategia.
@@ -158,6 +160,7 @@ class PositionManager:
             side=side,
             quantity=fill.quantity,
             initial_quantity=fill.quantity,
+            contract_size=contract_size,
             entry_price=fill.price,
             initial_stop=stop_loss,
             stop_loss=stop_loss,
@@ -194,6 +197,7 @@ class PositionManager:
         take_profit: float | None,
         broker_ref: str,
         opened_at: datetime | None = None,
+        contract_size: float = 1.0,
     ) -> Position:
         """Registra una posición ya abierta en el broker, sin fill propio.
 
@@ -210,6 +214,7 @@ class PositionManager:
             stop_loss: Stop puesto en el broker.
             take_profit: Objetivo puesto en el broker.
             broker_ref: Ticket del broker (clave de la reconciliación).
+            contract_size: Unidades del subyacente por lote (100 en XAU).
             opened_at: Apertura real; por defecto, ahora.
 
         Returns:
@@ -220,6 +225,7 @@ class PositionManager:
             side=side,
             quantity=quantity,
             initial_quantity=quantity,
+            contract_size=contract_size,
             entry_price=entry_price,
             initial_stop=stop_loss,
             stop_loss=stop_loss,
@@ -356,9 +362,10 @@ class PositionManager:
         Returns:
             El PnL bruto del cierre (sin comisiones).
         """
-        gross_pnl = (
-            (exit_price - position.entry_price) * position.quantity * position.direction_sign
-        )
+        # `units`, no `quantity`: esta ultima son LOTES, y un lote de oro son
+        # 100 onzas. Calcular el PnL sobre lotes lo subestimaba 100x en
+        # cualquier simbolo con `contract_size != 1`.
+        gross_pnl = (exit_price - position.entry_price) * position.units * position.direction_sign
         position.update_mark(exit_price)
         position.commission_paid += close_commission
         position.realized_pnl = gross_pnl - position.commission_paid

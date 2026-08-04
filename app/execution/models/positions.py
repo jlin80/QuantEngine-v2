@@ -32,8 +32,12 @@ class Position:
         position_id: Identificador de la posición.
         symbol: Símbolo.
         side: LONG o SHORT.
-        quantity: Cantidad actual (se reduce con parciales).
-        initial_quantity: Cantidad al abrir.
+        quantity: Cantidad actual **en lotes** (se reduce con parciales).
+        initial_quantity: Cantidad al abrir, en lotes.
+        contract_size: Unidades del subyacente por lote (1 en cripto, 100 en
+            XAU). Todo cálculo de dinero —nocional, PnL y riesgo— tiene que
+            pasar por :attr:`units`, no por ``quantity``: son lotes, y un lote
+            de oro son 100 onzas. Sin esto, el PnL del oro se subestimaba 100×.
         entry_price: Precio medio de entrada.
         initial_stop: Stop inicial (base para medir el riesgo en R).
         stop_loss: Stop actual (puede moverse: BE/trailing).
@@ -68,6 +72,7 @@ class Position:
     side: PositionSide
     quantity: float
     initial_quantity: float
+    contract_size: float = 1.0
     entry_price: float
     initial_stop: float | None = None
     stop_loss: float | None = None
@@ -116,14 +121,29 @@ class Position:
         return 1 if self.is_long else -1
 
     @property
+    def units(self) -> float:
+        """Unidades del subyacente abiertas (``quantity × contract_size``).
+
+        Es la magnitud con la que se mide el dinero. ``quantity`` son **lotes**,
+        que es lo que entiende el bróker, y confundirlas es lo que hacía que el
+        PnL del oro saliera 100 veces menor de lo real.
+        """
+        return self.quantity * self.contract_size
+
+    @property
+    def initial_units(self) -> float:
+        """Unidades del subyacente al abrir."""
+        return self.initial_quantity * self.contract_size
+
+    @property
     def notional(self) -> float:
         """Nominal value at the mark price."""
-        return self.quantity * self.mark_price
+        return self.units * self.mark_price
 
     @property
     def cost_basis(self) -> float:
         """Nominal value at the entry price."""
-        return self.quantity * self.entry_price
+        return self.units * self.entry_price
 
     @property
     def risk_per_unit(self) -> float:
@@ -134,8 +154,8 @@ class Position:
 
     @property
     def initial_risk(self) -> float:
-        """Currency risked at open (initial_quantity × risk_per_unit)."""
-        return self.risk_per_unit * self.initial_quantity
+        """Currency risked at open (unidades iniciales × riesgo por unidad)."""
+        return self.risk_per_unit * self.initial_units
 
     def unrealized_pnl(self, mark: float | None = None) -> float:
         """Floating PnL at a mark price.
@@ -147,7 +167,7 @@ class Position:
             PnL flotante de la cantidad abierta.
         """
         price = self.mark_price if mark is None else mark
-        return (price - self.entry_price) * self.quantity * self.direction_sign
+        return (price - self.entry_price) * self.units * self.direction_sign
 
     def r_multiple(self, mark: float | None = None) -> float:
         """Floating result expressed in R (0 if risk is undefined)."""
