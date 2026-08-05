@@ -2254,3 +2254,63 @@ fuera, con un test que comprueba que el modo resuelto sigue siendo `paper`.
 sentencias, 3.495 sin cubrir). Los modulos nuevos van del 76% al 100%; el mas
 bajo es `regime_forecast/service.py` (76%), donde lo no cubierto es el bucle
 asincrono y el manejo de excepciones del servicio, no la logica de pronostico.
+
+
+## 2026-08-05 - Despliegue de Edge Intelligence a qevps (y el deploy que no existia)
+
+**Categoria:** ops · **Tags:** `despliegue` `qevps` `git` `edge-intelligence`
+
+**Lo primero que aparecio no fue un problema de codigo, sino de proceso: el
+deploy no existia.** El directorio de produccion (`C:\Users\MT5\QuantEngineV2`)
+**no era un repositorio git**, el CI declara en su propia cabecera que "nunca
+hace push ni deploy", y los dos scripts que parecen de despliegue
+(`deploy_dashboard.ps1`, `restart_engine.ps1`) solo reinician servicios: ninguno
+trae codigo. Las marcas de tiempo decian que el codigo llegaba por copia manual
+no versionada — es decir, nadie podia responder con certeza que version corria
+en produccion.
+
+**Lo que se hizo, en este orden.**
+1. **Backup completo** antes de tocar nada:
+   `C:\Users\MT5\qe_predeploy_20260805_104633` (782 ficheros, sin `.venv`,
+   `data` ni `logs`).
+2. **`git init` en produccion** + remoto + fetch. `git init` no toca ficheros:
+   sirvio primero para **medir la deriva** contra el ultimo commit conocido
+   (`066e0ba`) antes de sobrescribir nada.
+3. **Resultado de la deriva — la comprobacion que mas importaba**: el codigo de
+   `app/` en produccion coincidia **exactamente** con el repo. Las unicas
+   diferencias eran ocho ficheros de test que nunca se habian copiado y una
+   linea del `.gitignore`. No habia nada hand-editado en produccion que el
+   despliegue fuera a revertir en silencio.
+4. Verificado que **nada bajo `data/`, `logs/` ni `.env` esta trackeado**, asi
+   que el checkout no podia pisar datos ni configuracion.
+5. Motor parado con el procedimiento del propio proyecto (tarea primero, luego
+   watchdogs, luego motores; 0 y 0 antes de continuar).
+6. `git checkout -f -B feat/bloques-8-13 origin/feat/bloques-8-13` → `73474b3`.
+7. Arranque y verificacion.
+
+**Cambio permanente de infraestructura: produccion ya es un clon del repo.** A
+partir de ahora el despliegue es `git pull` + `restart_engine.ps1`, y
+`git log -1` responde que version corre. Era lo que faltaba para que el deploy
+fuera repetible y auditable.
+
+**Verificacion post-despliegue.**
+- 1 watchdog, 1 motor (lo correcto), `/api/health` → `ok`, entorno `paper`.
+- Los seis servicios nuevos arrancados: `edge_research`, `factor_capture`,
+  `edge_attribution`, `regime_forecast`, `correlation`, `data_quality`.
+- **Los 13 endpoints nuevos responden 200.**
+- `benchmark/status` → `live_enabled: false`. Guard anti-live intacto.
+- Sin ERROR ni Traceback en el log de arranque.
+- **El motor no esta ciego**: 1273 mensajes procesados, 0 rechazados, 0
+  descartados, 0 reconexiones, cola a 0, DB escribiendo. Es la comprobacion que
+  el incidente del 04/08 hizo obligatoria.
+
+**Cambio de comportamiento que conviene tener presente.** El `.env` de
+produccion no fija `QE_QUANT__FILTERS__ENABLED`, asi que usa la lista por
+defecto — que ahora incluye `microstructure` y `position_quality`. Ambos son
+fail-open y con MT5 no deberian bloquear nada (el primero no tiene libro que
+medir; el segundo opera por debajo de su minimo de dimensiones observables),
+pero la cadena de decision en vivo tiene dos filtros mas que ayer.
+
+**Aviso menor, no causado por el despliegue.** Un timeout puntual de Redis al
+arrancar, con degradacion a memoria como esta disenado. Redis sigue vivo
+(PID 3228) y es el unico aviso de este tipo en 24 h de log.
