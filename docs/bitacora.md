@@ -2249,3 +2249,8 @@ datos que no tomaba este bloque.
 fuera, con un test que comprueba que el modo resuelto sigue siendo `paper`.
 
 **ADRs nuevos:** 100 a 114. **Tests nuevos:** 304.
+
+**Cobertura medida al cierre.** `pytest --cov=app`: **86% global** (24.443
+sentencias, 3.495 sin cubrir). Los modulos nuevos van del 76% al 100%; el mas
+bajo es `regime_forecast/service.py` (76%), donde lo no cubierto es el bucle
+asincrono y el manejo de excepciones del servicio, no la logica de pronostico.

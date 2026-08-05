@@ -147,3 +147,38 @@ watchdog, notificaciones Discord, API FastAPI, Docker, CI, tests.
   institucional, detección avanzada de anomalías, Execution Cost Analysis,
   portfolio multi-activo con asignación dinámica, API pública de plugins,
   usuarios/roles, app móvil, Kubernetes para HA.
+
+## Edge Intelligence (bloques 1-15) — transversal, completada 2026-08-05
+No es una fase nueva: es una capa de **medicion** que atraviesa las fases 2-10.
+Ninguno de sus bloques opera, y ninguno toca el guard anti-live.
+
+- **Medir el edge**: Edge Research (decay, half-life, estabilidad, persistencia,
+  metricas rodantes) y Edge Attribution (asociacion historica por bucket, con el
+  residuo siempre reportado). ADR-100/101.
+- **Medir el mercado**: Microstructure Engine (nueve metricas del libro
+  incremental; **inerte con MT5**, que no publica libro), Regime Forecast
+  (frecuencia condicional validada con Brier contra el trivial) y Correlation
+  Intelligence (lead-lag, correlacion dinamica, vida media del residuo).
+  ADR-102/103/104.
+- **Medir la ejecucion**: Execution Optimizer (IOC/LIMIT/MARKET con el coste de
+  no ejecutar), Position Quality (veto que nunca bloquea por ignorancia), Cost
+  Attribution (el coste oculto como residuo) y Live Shadow Benchmark (linea
+  base, no medicion, mientras no exista carril live). ADR-105/106/108/114.
+- **Medir el conjunto**: Portfolio Intelligence (de donde sale el PnL, con la
+  muestra pegada a cada contribucion). ADR-107.
+- **Medir el sistema**: Data Quality y Meta Risk, compuestos por producto en un
+  unico multiplicador de exposicion que el sizing aplica de verdad.
+  ADR-110/111.
+- **Medir el ML**: Confidence Calibration (correccion acotada que no se aplica
+  sola) y Feature Importance (permutacion, no SHAP). ADR-109/112.
+- **Medir lo que no se opero**: Why Not Trade Engine, con el desglose de cada
+  umbral y cada filtro. ADR-113.
+
+**Pendiente de la capa** (declarado, no olvidado):
+- El **Execution Optimizer cotiza pero no rutea**: el Execution Engine sigue
+  mandando MARKET. Cablear la eleccion toca la Fase 5.
+- El **veto de calidad de posicion opera con la mitad de su informacion**: coste
+  esperado y riesgo propuesto no se conocen cuando corre la cadena de filtros.
+- El **Bloque 3 entero esta inerte** mientras la fuente de datos sea MT5. Solo
+  cobra valor si se decide alimentar los indicadores desde un feed nativo.
+- El factor `ml` de la atribucion queda declarado y sin proveedor cableado.
