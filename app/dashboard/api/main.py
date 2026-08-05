@@ -6,19 +6,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__
 from app.config.settings import Settings
 from app.core.container import Container
+from app.dashboard.api.routes.attribution import router as attribution_router
 from app.dashboard.api.routes.audit import router as audit_router
 from app.dashboard.api.routes.backtesting import router as backtesting_router
+from app.dashboard.api.routes.benchmark import router as benchmark_router
 from app.dashboard.api.routes.config import router as config_router
 from app.dashboard.api.routes.control import router as control_router
+from app.dashboard.api.routes.correlation import router as correlation_router
+from app.dashboard.api.routes.costs import router as costs_router
+from app.dashboard.api.routes.edge import router as edge_router
 from app.dashboard.api.routes.engine import router as engine_router
 from app.dashboard.api.routes.execution import router as execution_router
+from app.dashboard.api.routes.forecast import router as forecast_router
 from app.dashboard.api.routes.health import router as health_router
 from app.dashboard.api.routes.integrations import router as integrations_router
 from app.dashboard.api.routes.logs import router as logs_router
 from app.dashboard.api.routes.market import router as market_router
 from app.dashboard.api.routes.metrics import router as metrics_router
+from app.dashboard.api.routes.microstructure import router as microstructure_router
 from app.dashboard.api.routes.ml import router as ml_router
+from app.dashboard.api.routes.optimizer import router as optimizer_router
+from app.dashboard.api.routes.portfolio import router as portfolio_router
 from app.dashboard.api.routes.production import router as production_router
+from app.dashboard.api.routes.quality import router as quality_router
+from app.dashboard.api.routes.rejections import router as rejections_router
 from app.dashboard.api.routes.reports import router as reports_router
 from app.dashboard.api.routes.research import router as research_router
 from app.dashboard.api.routes.security import router as security_router
@@ -67,6 +78,17 @@ def create_app(settings: Settings, container: Container | None = None) -> FastAP
     app.include_router(system_router, prefix="/api")
     app.include_router(market_router, prefix="/api")
     app.include_router(engine_router, prefix="/api")
+    app.include_router(edge_router, prefix="/api")
+    app.include_router(attribution_router, prefix="/api")
+    app.include_router(microstructure_router, prefix="/api")
+    app.include_router(forecast_router, prefix="/api")
+    app.include_router(correlation_router, prefix="/api")
+    app.include_router(optimizer_router, prefix="/api")
+    app.include_router(portfolio_router, prefix="/api")
+    app.include_router(costs_router, prefix="/api")
+    app.include_router(quality_router, prefix="/api")
+    app.include_router(rejections_router, prefix="/api")
+    app.include_router(benchmark_router, prefix="/api")
     app.include_router(execution_router, prefix="/api")
     app.include_router(ml_router, prefix="/api")
     app.include_router(backtesting_router, prefix="/api")

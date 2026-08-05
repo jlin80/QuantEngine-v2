@@ -44,6 +44,7 @@ class _VirtualTrade:
     risk: float
     opened_at: datetime
     deadline: datetime
+    confidence: float
 
 
 @dataclass(kw_only=True, slots=True)
@@ -190,6 +191,7 @@ class PerformanceTracker(Service):
             target=signal.take_profit,
             risk=risk,
             opened_at=signal.timestamp,
+            confidence=signal.confidence,
             deadline=signal.timestamp + timedelta(minutes=self._settings.max_holding_minutes),
         )
 
@@ -295,6 +297,7 @@ class PerformanceTracker(Service):
                     false_signal=false_signal,
                     opened_at=trade.opened_at,
                     closed_at=closed_at,
+                    confidence=trade.confidence,
                 )
             )
         perf = self._perf(trade.strategy)

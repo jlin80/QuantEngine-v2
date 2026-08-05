@@ -15,6 +15,7 @@ from app.engine.models import (
     MarketContext,
     VolatilityState,
 )
+from app.engine.position_quality import PositionQualityEngine
 from app.utils.time import utc_now
 
 
@@ -146,9 +147,15 @@ class CorrelationFilter(SignalFilter):
     """Bloquea si ya hay una decisión aceptada reciente en el mismo grupo.
 
     Args:
-        groups: Grupos de símbolos correlacionados.
+        groups: Grupos de símbolos correlacionados, declarados a mano.
         window_minutes: Ventana de exclusión.
         recent_decisions: Lector de decisiones recientes.
+        measured: Lector de correlación **medida** (Bloque 5). Los grupos
+            manuales envejecen: dos símbolos pueden dejar de moverse juntos, o
+            empezar a hacerlo, sin que nadie toque el fichero. Esto añade lo que
+            el mercado está haciendo de verdad **sin sustituir** a la regla
+            manual — se unen, no compiten. ``None`` deja el filtro exactamente
+            como estaba antes de este bloque.
     """
 
     def __init__(
@@ -156,18 +163,23 @@ class CorrelationFilter(SignalFilter):
         groups: list[list[str]],
         window_minutes: float,
         recent_decisions: Callable[[], list[Decision]],
+        measured: Callable[[str], set[str]] | None = None,
     ) -> None:
         super().__init__("correlation")
         self._groups = [{symbol.upper() for symbol in group} for group in groups]
         self._window = window_minutes * 60.0
         self._recent = recent_decisions
+        self._measured = measured
 
     def _group_of(self, symbol: str) -> set[str] | None:
-        """Correlation group containing a symbol."""
+        """Correlation group of a symbol: manual groups plus measured ones."""
+        found: set[str] = set()
         for group in self._groups:
             if symbol.upper() in group:
-                return group
-        return None
+                found |= group
+        if self._measured is not None:
+            found |= {other.upper() for other in self._measured(symbol)}
+        return found or None
 
     def check(self, context: MarketContext, consensus: ConsensusResult) -> FilterResult:
         """Pass unless a correlated symbol was recently accepted."""
@@ -189,6 +201,83 @@ class CorrelationFilter(SignalFilter):
                     f"{decision.symbol} hace {age:.0f}s",
                 )
         return FilterResult(name=self.name, passed=True)
+
+
+class MicrostructureFilter(SignalFilter):
+    """Veta cuando el libro está hostil para ejecutar (Bloque 3).
+
+    **Fail-open a propósito.** Si no hay medición de microestructura —porque el
+    proveedor no publica libro, que es el caso de MT5 en la demo— el filtro
+    deja pasar. Un filtro que bloquea por ausencia de datos apagaría el motor
+    entero con el bróker actual, y lo haría de la forma más difícil de
+    diagnosticar: sin errores, sólo sin operaciones.
+
+    Args:
+        max_pressure: Presión de ejecución por encima de la cual se veta.
+        pressure_reader: Lector de la presión actual del símbolo (``None`` = no
+            observable).
+    """
+
+    def __init__(self, max_pressure: float, pressure_reader: Callable[[str], float | None]) -> None:
+        super().__init__("microstructure")
+        self._max = max_pressure
+        self._reader = pressure_reader
+
+    def check(self, context: MarketContext, consensus: ConsensusResult) -> FilterResult:
+        """Pass unless the book is measurably hostile right now."""
+        pressure = self._reader(context.symbol)
+        if pressure is None or pressure <= self._max:
+            return FilterResult(name=self.name, passed=True)
+        return FilterResult(
+            name=self.name,
+            passed=False,
+            reason=f"presión de ejecución {pressure:.2f} > máximo {self._max}",
+        )
+
+
+class PositionQualityFilter(SignalFilter):
+    """Veta cuando la posición que saldría de la decisión es mala (Bloque 7).
+
+    Vive como filtro —y no dentro del score— por dos razones. La primera es
+    conceptual: el score mide la oportunidad, esto mide la posición, y una
+    señal excelente puede producir una posición pésima. La segunda es práctica:
+    como filtro, el veto **aparece en la explicación de la decisión** con su
+    motivo, que es la única forma de auditar después por qué no se operó.
+
+    Args:
+        engine: Motor de calidad.
+        inputs: Lector de las magnitudes que el filtro no ve por sí mismo
+            (coste esperado, R esperada, riesgo propuesto y su techo). Devuelve
+            un dict con lo que sepa; lo que falte queda como no observable.
+    """
+
+    def __init__(
+        self,
+        engine: PositionQualityEngine,
+        inputs: Callable[[str], dict[str, float | None]] | None = None,
+    ) -> None:
+        super().__init__("position_quality")
+        self._engine = engine
+        self._inputs = inputs
+
+    def check(self, context: MarketContext, consensus: ConsensusResult) -> FilterResult:
+        """Pass unless the resulting position would be of poor quality."""
+        extra = self._inputs(context.symbol) if self._inputs is not None else {}
+        assessment = self._engine.assess(
+            context,
+            consensus,
+            expected_cost_bps=extra.get("expected_cost_bps"),
+            expected_r=extra.get("expected_r"),
+            risk_pct=extra.get("risk_pct"),
+            max_risk_pct=extra.get("max_risk_pct"),
+        )
+        if not assessment.blocked:
+            return FilterResult(name=self.name, passed=True)
+        return FilterResult(
+            name=self.name,
+            passed=False,
+            reason="; ".join(assessment.reasons),
+        )
 
 
 class FilterChain:
@@ -216,6 +305,11 @@ def build_filter_chain(
     *,
     drawdown_reader: Callable[[], float],
     recent_decisions: Callable[[], list[Decision]],
+    microstructure: tuple[float, Callable[[str], float | None]] | None = None,
+    measured_correlation: Callable[[str], set[str]] | None = None,
+    position_quality: (
+        tuple[PositionQualityEngine, Callable[[str], dict[str, float | None]] | None] | None
+    ) = None,
 ) -> FilterChain:
     """Build the chain from configuration.
 
@@ -223,6 +317,14 @@ def build_filter_chain(
         settings: Filtros habilitados y parámetros.
         drawdown_reader: Lector del drawdown diario actual.
         recent_decisions: Lector de decisiones recientes (correlación).
+        microstructure: ``(umbral, lector de presión)`` del Bloque 3. ``None``
+            deja el filtro fuera de la cadena — no es lo mismo que dejarlo
+            dentro y que siempre pase: fuera, ni siquiera aparece en la
+            explicación de la decisión.
+        measured_correlation: Lector de correlación medida (Bloque 5). Se une a
+            los grupos manuales; ``None`` deja el filtro como antes.
+        position_quality: ``(motor, lector de entradas)`` del Bloque 7. ``None``
+            deja el veto de calidad fuera de la cadena.
 
     Returns:
         Cadena con los filtros habilitados, en orden de configuración.
@@ -238,7 +340,12 @@ def build_filter_chain(
             settings.correlation_groups,
             settings.correlation_window_minutes,
             recent_decisions,
+            measured_correlation,
         ),
     }
+    if microstructure is not None:
+        registry["microstructure"] = lambda: MicrostructureFilter(*microstructure)
+    if position_quality is not None:
+        registry["position_quality"] = lambda: PositionQualityFilter(*position_quality)
     filters = [registry[name]() for name in settings.enabled if name in registry]
     return FilterChain(filters)

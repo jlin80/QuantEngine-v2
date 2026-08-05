@@ -139,6 +139,7 @@ class ExecutionEngine(Service):
         context: MarketContextEngine | None = None,
         experiments: StrategyExperimentManager | None = None,
         falsifier: HoldingChangeFalsifier | None = None,
+        risk_multiplier_reader: Callable[[], float] | None = None,
     ) -> None:
         super().__init__("execution_engine")
         self._settings = settings
@@ -156,6 +157,10 @@ class ExecutionEngine(Service):
         self._context = context
         self._experiments = experiments
         self._falsifier = falsifier
+        # Reductor externo de exposicion (Bloque 11: calidad del dato). Se lee
+        # en cada entrada, no se cachea: la calidad del dato cambia en segundos
+        # y una lectura vieja es justo la que no protege.
+        self._risk_multiplier_reader = risk_multiplier_reader
         self._subscription: Subscription | None = None
         self._manage_task: asyncio.Task[None] | None = None
         self._manage_passes = 0
@@ -524,6 +529,9 @@ class ExecutionEngine(Service):
             win_rate=win_rate,
             reward_risk=reward_risk,
             spec=spec,
+            risk_multiplier=(
+                1.0 if self._risk_multiplier_reader is None else self._risk_multiplier_reader()
+            ),
         )
         if sizing.quantity <= 0:
             await self._reject(symbol, side, RejectReason.INVALID_QUANTITY, "sizing", sizing.reason)

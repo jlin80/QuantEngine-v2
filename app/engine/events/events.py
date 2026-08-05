@@ -127,3 +127,63 @@ class StrategyUnloaded(Event):
     """Una estrategia fue retirada del engine."""
 
     strategy: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class EdgeReportGenerated(Event):
+    """El Edge Research Engine cerró un ciclo de medición (Bloque 1).
+
+    Lleva el recuento y los nombres, no el informe entero: el bus transporta
+    avisos, y el informe completo vive en el histórico y en la API.
+    """
+
+    strategies: int
+    degrading: tuple[str, ...]
+    generated_at: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class EdgeDecayDetected(Event):
+    """El edge de una estrategia pasó a deteriorarse (transición, no estado).
+
+    Se publica sólo al entrar en ``degrading``. Reanunciarlo en cada ciclo
+    convertiría la alarma en ruido de fondo.
+    """
+
+    strategy: str
+    edge_decay: float
+    half_life_trades: float | None
+    expectancy_r: float | None
+    health_score: float | None
+    reasons: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class AttributionReportGenerated(Event):
+    """El Edge Attribution Engine cerró un ciclo de atribución (Bloque 2).
+
+    ``matched`` frente a ``trades`` es la cifra que hay que mirar: dice de qué
+    fracción de las operaciones habla realmente el informe.
+    """
+
+    trades: int
+    matched: int
+    factors: int
+    top_factor: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class RegimeForecastUpdated(Event):
+    """Pronóstico de régimen actualizado para un símbolo (Bloque 4).
+
+    ``skill`` viaja con el pronóstico: quien lo lea sabe de inmediato si este
+    motor ha demostrado valer más que el pronóstico trivial. ``None`` mientras
+    no haya pronósticos resueltos con los que medirlo.
+    """
+
+    symbol: str
+    condition: str
+    most_likely: str
+    probability: float
+    confidence: float
+    skill: float | None = None

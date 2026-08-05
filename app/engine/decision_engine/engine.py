@@ -17,12 +17,15 @@ from app.engine.events import ConsensusReached, DecisionGenerated, FilterTrigger
 from app.engine.filters import FilterChain
 from app.engine.market_context import MarketContextEngine
 from app.engine.models import (
+    ConsensusResult,
     Decision,
     DecisionAction,
     Direction,
+    FilterResult,
     Regime,
     SignalStatus,
 )
+from app.engine.rejections import GateResult, RejectionRecord, RejectionStore
 from app.engine.signal_engine import SignalEngine
 from app.engine.state_manager import HistoryWriter, SignalHistoryStore
 from app.utils.time import utc_now
@@ -54,6 +57,7 @@ class DecisionEngine:
         settings: QuantConsensusSettings,
         bus: EventBus | None = None,
         writer: HistoryWriter | None = None,
+        rejections: RejectionStore | None = None,
     ) -> None:
         self._signals = signals
         self._context_engine = context_engine
@@ -64,6 +68,11 @@ class DecisionEngine:
         self._settings = settings
         self._bus = bus
         self._writer = writer
+        # Registro estructurado de rechazos (Bloque 14). Se cablea aqui y no en
+        # el bus porque los resultados de cada filtro y el deficit de cada
+        # umbral solo existen en este punto: el evento de decision no los lleva,
+        # y reconstruirlos desde fuera seria adivinarlos.
+        self._rejections = rejections
         self._log = logging.getLogger("app.engine.decision")
 
     async def evaluate(self, symbol: str) -> Decision:
@@ -82,6 +91,10 @@ class DecisionEngine:
         regime = context.regime.primary.value if context.regime else Regime.UNKNOWN.value
 
         if not active:
+            # Sin senales no hay oportunidad que rechazar: se cuenta, no se
+            # guarda fila (ver `note_no_opportunity`).
+            if self._rejections is not None:
+                self._rejections.note_no_opportunity()
             decision = Decision(
                 symbol=symbol,
                 timestamp=now,
@@ -199,11 +212,119 @@ class DecisionEngine:
             },
             context_summary=context.summary(),
         )
+        # Bloque 14: el desglose se arma aqui, con los mismos numeros que
+        # produjeron la decision. Se registra tanto si se acepto como si no —
+        # sin los aceptados no hay denominador, y "este filtro bloqueo 40 veces"
+        # no significa nada sin saber sobre cuantas oportunidades.
+        if self._rejections is not None:
+            self._rejections.record(
+                RejectionRecord(
+                    decision_id=decision.decision_id,
+                    symbol=symbol,
+                    at=now,
+                    initial_score=consensus.score,
+                    confidence=confidence,
+                    direction=consensus.direction.value,
+                    gates=self._gates(consensus, confidence, len(active), filter_results),
+                    evidence={
+                        "context": context.summary(),
+                        "confidence_breakdown": breakdown,
+                        "strategies": sorted({s.strategy_name for s in active}),
+                        "accepted": accepted,
+                    },
+                )
+            )
         status = SignalStatus.ACCEPTED if accepted else SignalStatus.REJECTED
         reason_summary = tuple(rejections) if rejections else ("decisión aceptada",)
         self._signals.consume(symbol, status, reason_summary)
         await self._finish(decision)
         return decision
+
+    def _gates(
+        self,
+        consensus: ConsensusResult,
+        confidence: float,
+        active_signals: int,
+        filter_results: list[FilterResult],
+    ) -> tuple[GateResult, ...]:
+        """Build the structured breakdown of every threshold and filter.
+
+        Los umbrales llevan valor y minimo —de ahi sale un deficit medible—; los
+        filtros son binarios y se registran como tales. Modelar un filtro como
+        si aplicara una penalizacion parcial seria inventarse una aritmetica que
+        este motor no tiene.
+        """
+        settings = self._settings
+        gates: list[GateResult] = [
+            GateResult(
+                name="direction",
+                kind="filter",
+                passed=consensus.direction is not Direction.NEUTRAL,
+                reason=(
+                    ""
+                    if consensus.direction is not Direction.NEUTRAL
+                    else "el consenso no produjo una direccion dominante"
+                ),
+            ),
+            GateResult(
+                name="min_signals",
+                kind="threshold",
+                passed=active_signals >= settings.min_signals,
+                value=float(active_signals),
+                required=float(settings.min_signals),
+                reason=(
+                    ""
+                    if active_signals >= settings.min_signals
+                    else f"senales {active_signals} < minimo {settings.min_signals}"
+                ),
+            ),
+            GateResult(
+                name="min_score",
+                kind="threshold",
+                passed=consensus.score >= settings.min_score,
+                value=consensus.score,
+                required=settings.min_score,
+                reason=(
+                    ""
+                    if consensus.score >= settings.min_score
+                    else f"score {consensus.score:.1f} < minimo {settings.min_score:.0f}"
+                ),
+            ),
+            GateResult(
+                name="min_confidence",
+                kind="threshold",
+                passed=confidence >= settings.min_confidence,
+                value=confidence,
+                required=settings.min_confidence,
+                reason=(
+                    ""
+                    if confidence >= settings.min_confidence
+                    else f"confianza {confidence:.2f} < minima {settings.min_confidence:.2f}"
+                ),
+            ),
+            GateResult(
+                name="min_agreement",
+                kind="threshold",
+                passed=consensus.agreement >= settings.min_agreement,
+                value=consensus.agreement,
+                required=settings.min_agreement,
+                reason=(
+                    ""
+                    if consensus.agreement >= settings.min_agreement
+                    else f"acuerdo {consensus.agreement:.2f} < minimo {settings.min_agreement:.2f}"
+                ),
+            ),
+        ]
+        gates.extend(
+            GateResult(
+                name=result.name,
+                kind="filter",
+                passed=result.passed,
+                reason=result.reason,
+            )
+            for result in filter_results
+        )
+        return tuple(gates)
 
     async def _finish(self, decision: Decision) -> None:
         """Record, persist and announce a decision."""

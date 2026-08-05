@@ -333,6 +333,44 @@ class MLExecutionRulesCheckSettings(BaseModel):
     check_interval_seconds: float = 3600.0
 
 
+class MLCalibrationSettings(BaseModel):
+    """Confidence Calibration Engine (Bloque 10): confianza declarada vs real.
+
+    La correccion esta acotada a proposito: sin techo, una racha de 60
+    operaciones puede producir un factor de 0.4 que apagaria medio sistema
+    (ADR-109).
+    """
+
+    enabled: bool = True
+    window: int = 5_000
+    bins: int = 10
+    min_sample: int = 100
+    # Un tramo con tres observaciones da una tasa de 0.0 o 0.67 y arrastra el
+    # ECE con ruido que no significa nada.
+    min_bin_sample: int = 10
+    min_correction: float = 0.7
+    max_correction: float = 1.3
+
+
+class MLImportanceSettings(BaseModel):
+    """Feature Importance Tracker (Bloque 13): importancia por permutacion.
+
+    No se usa SHAP y esta razonado en ADR-112: exigiria una dependencia binaria
+    pesada que solo cubriria parte del catalogo de modelos, y habria que caer a
+    otra metrica para el resto — dos numeros distintos llamados igual.
+    """
+
+    enabled: bool = True
+    # Repeticiones por feature: con un solo barajado, features irrelevantes
+    # salen "importantes" por puro azar del reparto.
+    repeats: int = 5
+    min_sample: int = 50
+    history_limit: int = 50
+    # Semilla fija: sin ella, dos mediciones del mismo modelo dan numeros
+    # distintos y el "cambio" mediria el ruido del metodo.
+    seed: int = 20260805
+
+
 class MLSettings(BaseModel):
     """Machine Learning, IA y aprendizaje continuo (Fase 7).
 
@@ -354,6 +392,8 @@ class MLSettings(BaseModel):
         default=["logistic_regression", "decision_tree", "random_forest", "extra_trees"]
     )
     training: MLTrainingSettings = Field(default_factory=MLTrainingSettings)
+    calibration: MLCalibrationSettings = Field(default_factory=MLCalibrationSettings)
+    importance: MLImportanceSettings = Field(default_factory=MLImportanceSettings)
     model: MLModelSettings = Field(default_factory=MLModelSettings)
     validation: MLValidationSettings = Field(default_factory=MLValidationSettings)
     drift: MLDriftSettings = Field(default_factory=MLDriftSettings)
@@ -723,6 +763,12 @@ class QuantFiltersSettings(BaseModel):
             "news",
             "drawdown",
             "correlation",
+            # Bloque 3. Fail-open: sin libro del proveedor no mide y deja pasar,
+            # asi que activarlo por defecto no cambia nada con MT5.
+            "microstructure",
+            # Bloque 7. Fail-open por debajo del minimo de dimensiones
+            # observables: no bloquea por ignorancia.
+            "position_quality",
         ]
     )
     allowed_sessions: list[str] = Field(default=["asia", "europe", "america"])
@@ -768,6 +814,374 @@ class QuantEvaluationSettings(BaseModel):
     outcomes_flush_size: int = 50
 
 
+class QuantEdgeHealthWeights(BaseModel):
+    """Pesos del resumen 0-100 de salud del edge.
+
+    Son un juicio, no una medida: por eso son configurables y por eso el
+    informe conserva siempre las métricas individuales y las razones.
+    """
+
+    expectancy: float = 0.4
+    stability: float = 0.2
+    persistence: float = 0.2
+    decay: float = 0.2
+
+
+class QuantEdgeResearchSettings(BaseModel):
+    """Edge Research Engine (Bloque 1): salud del edge por estrategia.
+
+    Mide sobre una **ventana rodante**, no sobre el acumulado: el acumulado no
+    olvida, y una estrategia que dejó de funcionar hace semanas sigue
+    presentando buen aspecto durante mucho tiempo.
+
+    Este motor no opera ni desactiva nada por sí solo: produce evidencia.
+    """
+
+    enabled: bool = True
+    cycle_interval_seconds: float = 900.0
+    # Ventana rodante por estrategia. 300 resoluciones cubren varios días de
+    # scalping sin arrastrar régimenes ya extintos.
+    rolling_window: int = 300
+    blocks: int = 6
+    min_sample: int = 30
+    seen_limit: int = 50_000
+    # Umbrales de clasificación. `degrading` exige DOS motivos concurrentes:
+    # una sola métrica fuera de rango es ruido con muestras de este tamaño.
+    decay_threshold: float = 0.05
+    min_stability: float = 0.35
+    min_persistence: float = 0.5
+    degrading_reasons: int = 2
+    # Suelo del multiplicador expuesto al Meta Strategy Manager: aunque la
+    # salud sea 0, este motor nunca puede anular una estrategia por sí mismo.
+    factor_floor: float = 0.5
+    health_weights: QuantEdgeHealthWeights = Field(default_factory=QuantEdgeHealthWeights)
+    history_path: Path = _PROJECT_ROOT / "data" / "performance" / "edge_reports.jsonl"
+    persist_history: bool = True
+    history_memory_limit: int = 200
+
+
+class QuantAttributionSettings(BaseModel):
+    """Edge Attribution Engine (Bloque 2): por qué ganó o perdió cada operación.
+
+    Mide **asociación histórica, no causa**: agrupa cada factor en buckets y
+    compara la R media de cada bucket con la global. Los factores están
+    correlacionados entre sí, así que sus aportes no son aditivos — por eso el
+    informe reporta siempre el residuo.
+    """
+
+    enabled: bool = True
+    cycle_interval_seconds: float = 900.0
+    # Muestra mínima del join operación↔foto de factores. Por debajo no se
+    # publica explicación: sólo el desglose de por qué no la hay.
+    min_sample: int = 40
+    # Un bucket con dos operaciones produce un lift enorme y sin significado, y
+    # en un dashboard esa fila sube arriba del todo justo por ser ruido.
+    min_bucket: int = 8
+    max_trades: int = 5_000
+    label_factors: tuple[str, ...] = (
+        "strategy",
+        "strategy_category",
+        "regime",
+        "volatility",
+        "session",
+    )
+    snapshots_path: Path = _PROJECT_ROOT / "data" / "performance" / "factor_snapshots.jsonl"
+    persist_snapshots: bool = True
+    snapshots_flush_size: int = 25
+
+
+class QuantMicrostructureSettings(BaseModel):
+    """Microstructure Engine (Bloque 3): dinámica interna del libro.
+
+    **Exige libro de órdenes incremental.** MT5 no lo publica, así que con el
+    bróker de la demo el motor reporta `observable=False` y todas las métricas
+    en `None`. Ver ADR-102 y `docs/orderflow_nativo.md`.
+    """
+
+    enabled: bool = True
+    window_seconds: float = 60.0
+    min_updates: int = 20
+    min_elapsed_seconds: float = 1.0
+    max_events_per_symbol: int = 20_000
+    depth_levels: int = 5
+    # Nocional de referencia del impacto estimado. No es el tamaño real de la
+    # orden: es una vara de medir fija para que la serie sea comparable en el
+    # tiempo aunque el sizing cambie.
+    impact_notional: float = 10_000.0
+    # Reposición considerada "sana" (1.0 = el libro repone lo que se le come).
+    resiliency_reference: float = 1.0
+    # Veto por presión de ejecución. Fail-open por diseño: sin libro no hay
+    # medición, y un filtro que bloquea por falta de datos apagaría el motor
+    # entero con el bróker actual.
+    max_execution_pressure: float = 0.85
+
+
+class QuantRegimeForecastSettings(BaseModel):
+    """Regime Forecast Engine (Bloque 4): probabilidad del próximo desenlace.
+
+    Método: frecuencia condicional empírica. Con la muestra de este proyecto,
+    un modelo más rico produciría parámetros peor estimados y un número más
+    difícil de auditar. Lo que hace útil al bloque no es el pronóstico sino su
+    validación contra el pronóstico trivial (ADR-103).
+    """
+
+    enabled: bool = True
+    horizon_bars: int = 20
+    min_sample: int = 50
+    # Muestra a la que la confianza satura. Mide cuánta evidencia hay detrás,
+    # NO si el pronóstico acierta — eso lo dice el Brier score.
+    confidence_sample: int = 500
+    # Suavizado de Laplace: sin él, un desenlace nunca visto tendría
+    # probabilidad 0 y el motor afirmaría que algo es imposible por no haberlo
+    # visto en unos cientos de observaciones.
+    smoothing: float = 1.0
+    validation_window: int = 2_000
+    max_pending: int = 500
+
+
+class QuantCorrelationSettings(BaseModel):
+    """Correlation Intelligence (Bloque 5): relaciones entre activos.
+
+    Todo se mide sobre **rendimientos**, no precios: dos precios que suben dan
+    correlación alta aunque no tengan nada que ver, porque la tendencia común
+    domina el cálculo.
+    """
+
+    enabled: bool = True
+    cycle_interval_seconds: float = 900.0
+    window: int = 500
+    min_sample: int = 100
+    # Vida media de la correlación dinámica, en observaciones. Frente a una
+    # ventana fija, evita el borde duro: una observación no pasa de pesar todo
+    # a pesar nada por haber salido de la ventana.
+    ewma_halflife: float = 50.0
+    max_lag: int = 10
+    # Umbral para que el filtro considere dos símbolos correlacionados.
+    min_correlation: float = 0.7
+    # Un lag "ganador" con correlación de 0.05 es ruido con signo: sumarlo al
+    # ranking de liderazgo lo convertiría en una lotería.
+    min_lead_correlation: float = 0.3
+
+
+class ExecutionOptimizerSettings(BaseModel):
+    """Execution Optimizer (Bloque 6): IOC vs LIMIT vs MARKET.
+
+    El parámetro que gobierna todo es `miss_cost_bps`: cuánto cuesta **no**
+    entrar. Sin él, LIMIT gana siempre —es el más barato cuando se llena— y el
+    optimizador se convierte en una máquina de no operar. Es una política, no
+    una medida (ADR-105).
+    """
+
+    enabled: bool = True
+    # Probabilidad base de llenado. Se corrige con el desequilibrio del libro
+    # sólo cuando ese libro es observable (Bloque 3).
+    limit_fill_base: float = 0.55
+    ioc_fill_base: float = 0.8
+    imbalance_coeff: float = 0.3
+    miss_cost_bps: float = 12.0
+    quality_reference_bps: float = 20.0
+
+
+class QuantPositionQualitySettings(BaseModel):
+    """Position Quality Engine (Bloque 7): puede vetar operaciones.
+
+    Puntúa la **posición** que saldría de la decisión, no la señal. Es un veto
+    independiente del score y por eso vive en su propio motor (ADR-106).
+    """
+
+    enabled: bool = True
+    min_score: float = 45.0
+    # Fail-open por debajo de este mínimo de evidencia: bloquear con dos
+    # dimensiones observables sería bloquear por ignorancia.
+    min_dimensions: int = 4
+    weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "setup": 1.5,
+            "execution": 1.0,
+            "risk": 1.0,
+            "liquidity": 1.2,
+            "context": 1.0,
+            "cost": 1.2,
+        }
+    )
+    # Suelos por dimensión: promediar deja que una liquidez pésima se esconda
+    # detrás de un setup excelente, y esa es justo la posición que duele.
+    dimension_floors: dict[str, float] = Field(
+        default_factory=lambda: {"liquidity": 0.2, "cost": 0.15}
+    )
+    block_on_floor_breach: bool = True
+    max_cost_bps: float = 30.0
+
+
+class PortfolioIntelligenceSettings(BaseModel):
+    """Portfolio Intelligence (Bloque 8): desglose del PnL realizado.
+
+    Mide de donde SALIO el dinero, no donde esta el riesgo ahora: son preguntas
+    distintas y este modulo solo responde la primera (ADR-107).
+    """
+
+    enabled: bool = True
+    min_sample: int = 50
+    max_trades: int = 20_000
+
+
+class CostAttributionSettings(BaseModel):
+    """Cost Attribution Engine (Bloque 9): reparto del bruto entre costes.
+
+    El coste oculto es un **residuo**: si crece, significa que el sistema no
+    esta midiendo algun coste, no que exista un concepto llamado oculto
+    (ADR-108).
+    """
+
+    enabled: bool = True
+    max_trades: int = 20_000
+    # Fraccion del bruto por encima de la cual el residuo sin explicar deja de
+    # ser ruido de redondeo y pasa a ser una alarma de contabilidad incompleta.
+    hidden_alert_ratio: float = 0.1
+
+
+class DataQualitySettings(BaseModel):
+    """Data Quality Engine (Bloque 11): salud del dato -> multiplicador de riesgo.
+
+    Reduce exposicion, nunca apaga: apagar por una metrica de calidad convierte
+    un problema de datos en una parada total, y las paradas totales las decide
+    el kill switch, que tiene auditoria propia (ADR-110).
+    """
+
+    enabled: bool = True
+    cycle_interval_seconds: float = 60.0
+    # Por debajo de este score se empieza a reducir exposicion.
+    degraded_score: float = 70.0
+    # Suelo del multiplicador: nunca llega a 0.
+    risk_floor: float = 0.3
+    signal_floor: float = 0.8
+    # Senales CRITICAS con su suelo. Una sola de estas por los suelos degrada
+    # aunque la media salve: promediar deja que un motor ciego (missing_data=0)
+    # o un reloj filtrado (clock_drift=0) queden escondidos detras de siete
+    # senales sanas — que es exactamente el fallo del 04/08.
+    critical_signals: dict[str, float] = Field(
+        default_factory=lambda: {
+            "clock_drift": 0.5,
+            "missing_data": 0.5,
+            # `tick_quality` es critica porque el fallo del 04/08 fue
+            # literalmente esto: el validador descartaba el 100% de los ticks y
+            # la media de las demas senales lo habria tapado.
+            "tick_quality": 0.5,
+            "feed_quality": 0.5,
+        }
+    )
+    max_timestamp_drift_seconds: float = 5.0
+    max_clock_skew_seconds: float = 5.0
+    max_exchange_lag_ms: float = 2_000.0
+    weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "feed_quality": 1.5,
+            "packet_loss": 1.0,
+            "tick_quality": 1.2,
+            "orderbook_quality": 0.8,
+            "missing_data": 1.5,
+            "timestamp_drift": 1.0,
+            # El reloj pesa mas que nada: es la senal del incidente que dejo al
+            # motor ciego cuatro dias sin un solo error en el log (ADR-091).
+            "clock_drift": 2.0,
+            "exchange_lag": 1.0,
+        }
+    )
+
+
+class MetaRiskSettings(BaseModel):
+    """Meta Risk Engine (Bloque 12): la salud de la maquina, no del mercado.
+
+    Compone con la calidad del dato (Bloque 11) por PRODUCTO, no por minimo: un
+    feed mediocre en una maquina saturada es peor que cualquiera de las dos
+    cosas por separado (ADR-111).
+    """
+
+    enabled: bool = True
+    cycle_interval_seconds: float = 60.0
+    degraded_score: float = 70.0
+    risk_floor: float = 0.3
+    signal_floor: float = 0.8
+    max_cpu_percent: float = 90.0
+    max_memory_percent: float = 90.0
+    # Por debajo de esta fraccion del limite, el recurso se considera sano del
+    # todo. Sin zona de confort, una CPU al 20% frente a un techo del 90% daba
+    # una senal de 0.78 y la maquina parecia siempre a medio gas — con lo que
+    # la degradacion real no destacaba sobre el fondo.
+    comfort_fraction: float = 0.5
+    max_event_loop_lag_ms: float = 250.0
+    max_event_bus_queue: int = 10_000
+    tracked_components: list[str] = Field(
+        default_factory=lambda: ["redis", "broker", "mt5", "exchange", "api", "scheduler", "cache"]
+    )
+    # Traduccion del estado del watchdog a senal 0-1. Un estado desconocido no
+    # aparece aqui: se trata como NO observable, no como medio roto.
+    status_scores: dict[str, float] = Field(
+        default_factory=lambda: {"healthy": 1.0, "degraded": 0.5, "down": 0.0}
+    )
+    # Componentes cuya caida degrada por si sola, sin esperar a la media.
+    critical_components: dict[str, float] = Field(
+        default_factory=lambda: {
+            "broker": 0.5,
+            "event_loop": 0.5,
+            # La CPU saturada es el degradador silencioso clasico: no impide
+            # operar, impide operar A TIEMPO, y eso se lee como slippage.
+            "cpu": 0.5,
+        }
+    )
+    weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "cpu": 1.5,
+            "memory": 1.0,
+            "event_loop": 1.5,
+            "event_bus": 1.0,
+            "redis": 0.8,
+            "broker": 2.0,
+            "mt5": 1.5,
+            "exchange": 1.0,
+            "api": 0.5,
+            "scheduler": 0.8,
+            "cache": 0.5,
+            "data_quality": 1.5,
+        }
+    )
+
+
+class QuantRejectionsSettings(BaseModel):
+    """Why Not Trade Engine (Bloque 14): registro estructurado de rechazos.
+
+    El motor ya explicaba sus rechazos en texto. El texto sirve para leer UNA
+    decision y para nada mas: no se puede agregar ni contar. Esto lo convierte
+    en datos (ADR-113).
+    """
+
+    enabled: bool = True
+    persist: bool = True
+    path: Path = _PROJECT_ROOT / "data" / "engine" / "rejections.jsonl"
+    flush_size: int = 50
+    memory_limit: int = 2_000
+
+
+class ShadowBenchmarkSettings(BaseModel):
+    """Live Shadow Benchmark (Bloque 15): paper vs live vs fill ideal.
+
+    Live trading permanece DESHABILITADO: este bloque no lo habilita ni lo
+    prepara para habilitarse. El carril live se declara ausente, con su motivo,
+    y el gap medido se etiqueta como linea base y no como medicion (ADR-114).
+    """
+
+    enabled: bool = True
+    max_trades: int = 20_000
+    # Por debajo de esta muestra no se emite ninguna recomendacion: una
+    # recomendacion es una llamada a la accion, y emitirla sobre diez
+    # operaciones es peor que callarse.
+    min_sample: int = 100
+    high_gap_bps: float = 15.0
+    # Fraccion de la R media que se lleva la ejecucion antes de considerarlo un
+    # problema de ejecucion y no de senal.
+    high_edge_share: float = 0.3
+
+
 class QuantSettings(BaseModel):
     """Quant Core (Fase 3): estrategias, consenso, contexto y decisión."""
 
@@ -799,6 +1213,17 @@ class QuantSettings(BaseModel):
     filters: QuantFiltersSettings = Field(default_factory=QuantFiltersSettings)
     history: QuantHistorySettings = Field(default_factory=QuantHistorySettings)
     evaluation: QuantEvaluationSettings = Field(default_factory=QuantEvaluationSettings)
+    edge_research: QuantEdgeResearchSettings = Field(default_factory=QuantEdgeResearchSettings)
+    attribution: QuantAttributionSettings = Field(default_factory=QuantAttributionSettings)
+    rejections: QuantRejectionsSettings = Field(default_factory=QuantRejectionsSettings)
+    microstructure: QuantMicrostructureSettings = Field(default_factory=QuantMicrostructureSettings)
+    regime_forecast: QuantRegimeForecastSettings = Field(
+        default_factory=QuantRegimeForecastSettings
+    )
+    correlation: QuantCorrelationSettings = Field(default_factory=QuantCorrelationSettings)
+    position_quality: QuantPositionQualitySettings = Field(
+        default_factory=QuantPositionQualitySettings
+    )
 
     def strategy_settings(self, name: str) -> QuantStrategySettings:
         """Config de una estrategia (defaults si no está declarada)."""
@@ -1134,6 +1559,7 @@ class ExecutionSettings(BaseModel):
     commission: CommissionSettings = Field(default_factory=CommissionSettings)
     slippage: SlippageSettings = Field(default_factory=SlippageSettings)
     latency: LatencySettings = Field(default_factory=LatencySettings)
+    optimizer: ExecutionOptimizerSettings = Field(default_factory=ExecutionOptimizerSettings)
     sizing: SizingSettings = Field(default_factory=SizingSettings)
     risk: ExecutionRiskSettings = Field(default_factory=ExecutionRiskSettings)
     experiments: StrategyExperimentSettings = Field(default_factory=StrategyExperimentSettings)
@@ -1692,6 +2118,11 @@ class Settings(BaseSettings):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     paper: PaperSettings = Field(default_factory=PaperSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    portfolio: PortfolioIntelligenceSettings = Field(default_factory=PortfolioIntelligenceSettings)
+    costs: CostAttributionSettings = Field(default_factory=CostAttributionSettings)
+    shadow_benchmark: ShadowBenchmarkSettings = Field(default_factory=ShadowBenchmarkSettings)
+    data_quality: DataQualitySettings = Field(default_factory=DataQualitySettings)
+    meta_risk: MetaRiskSettings = Field(default_factory=MetaRiskSettings)
     backtesting: BacktestingSettings = Field(default_factory=BacktestingSettings)
     health: HealthSettings = Field(default_factory=HealthSettings)
     watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)

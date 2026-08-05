@@ -4,6 +4,7 @@ from app.ml.services.advisor import AIAdvisor
 from app.ml.services.risk_advisor import RiskAdvisor, RiskAssessment
 from app.ml.services.stats import TradeStats, group_stats, session_label
 from app.ml.services.strategy_intelligence import (
+    EdgeHealthStats,
     LabeledTrade,
     StrategyIntelligence,
     StrategyScore,
@@ -12,6 +13,7 @@ from app.ml.services.strategy_intelligence import (
 
 __all__ = [
     "AIAdvisor",
+    "EdgeHealthStats",
     "LabeledTrade",
     "RiskAdvisor",
     "RiskAssessment",

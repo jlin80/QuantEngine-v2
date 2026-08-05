@@ -18,6 +18,7 @@ from typing import Any
 from app.config.settings import MLMetaStrategySettings
 from app.ml.models.math import clamp
 from app.ml.services.strategy_intelligence import (
+    EdgeHealthStats,
     LabeledTrade,
     StrategyIntelligence,
     StrategyScore,
@@ -73,6 +74,7 @@ class MetaStrategyManager:
         self,
         labeled_trades: Sequence[LabeledTrade],
         virtual: Mapping[str, VirtualStrategyStats] | None = None,
+        edge: Mapping[str, EdgeHealthStats] | None = None,
     ) -> MetaReport:
         """Score strategies and adjust their weights/activation.
 
@@ -84,15 +86,24 @@ class MetaStrategyManager:
                 Se usa como **prior** mientras la muestra ejecutada sea escasa:
                 una estrategia con 4 operaciones cerradas no da evidencia para
                 mover su peso, pero puede tener cientos de señales evaluadas.
+            edge: Salud del edge por estrategia (Edge Research Engine, Bloque 1).
+                Mide si el edge **sigue** ahí, no cuánto vale. Actúa sólo como
+                **freno del peso**: un edge deteriorado amortigua el peso
+                objetivo, nunca lo sube y nunca desactiva por sí solo. Un motor
+                que apaga estrategias con una métrica de tendencia sobre unas
+                decenas de resoluciones apaga estrategias por ruido.
 
         Returns:
             El informe del ciclo, con pesos, decisiones y auditoría.
         """
         scores = self._intelligence.rank(labeled_trades)
         virtual_stats = dict(virtual or {})
+        edge_stats = dict(edge or {})
         decisions: list[dict[str, Any]] = []
         for score in scores:
-            decisions.append(self._govern(score, virtual_stats.get(score.name)))
+            decisions.append(
+                self._govern(score, virtual_stats.get(score.name), edge_stats.get(score.name))
+            )
         self._evaluations += 1
         active = [name for name, on in self._active.items() if on]
         disabled = [name for name, on in self._active.items() if not on]
@@ -105,7 +116,10 @@ class MetaStrategyManager:
         )
 
     def _govern(
-        self, score: StrategyScore, virtual: VirtualStrategyStats | None = None
+        self,
+        score: StrategyScore,
+        virtual: VirtualStrategyStats | None = None,
+        edge: EdgeHealthStats | None = None,
     ) -> dict[str, Any]:
         """Decide activation and weight for a single strategy."""
         name = score.name
@@ -139,6 +153,11 @@ class MetaStrategyManager:
         else:
             self._active[name] = True
             target = self._target_weight(effective_score)
+            # El freno del edge se aplica al OBJETIVO, no al peso ya suavizado:
+            # así el amortiguamiento entra por el mismo suavizado que todo lo
+            # demás y no produce saltos que la auditoría no pueda explicar.
+            if edge is not None and edge.factor < 1.0:
+                target *= edge.factor
             new_weight = previous_weight + self._settings.weight_smoothing * (
                 target - previous_weight
             )
@@ -166,6 +185,9 @@ class MetaStrategyManager:
             # y con qué peso. Sin esto no se puede auditar por qué subió el peso
             # de una estrategia con 4 operaciones cerradas.
             "evidence": evidence,
+            # Salud del edge que frenó (o no) el peso objetivo. `None` cuando el
+            # Edge Research Engine no tenía muestra: sin evidencia no penaliza.
+            "edge": None if edge is None else edge.to_dict(),
         }
         if action not in ("keep", "keep_disabled"):
             self._audit.append(

@@ -40,3 +40,19 @@ class SignalDrought(Event):
     minutes: float
     clean_samples: int
     detail: str = ""
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class DataQualityDegraded(Event):
+    """La calidad del dato cambió de estado (Bloque 11).
+
+    Se publica en la **transición**, en las dos direcciones: ``degraded=True``
+    al entrar y ``degraded=False`` al recuperarse. Repetirlo cada minuto
+    convertiría la alarma en ruido; no anunciar la recuperación dejaría a quien
+    la leyó creyendo que el problema sigue.
+    """
+
+    score: float
+    risk_multiplier: float
+    degraded: bool
+    reasons: str = ""

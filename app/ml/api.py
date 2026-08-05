@@ -23,6 +23,7 @@ from app.core.events.bus import EventBus
 from app.core.exceptions import InsufficientDataError, MLError
 from app.execution.models.trades import TradeRecord
 from app.ml.auto_ml import AutoML, AutoMLResult
+from app.ml.calibration import CalibrationReport, ConfidenceCalibrationEngine
 from app.ml.datasets import (
     SIGNAL_LABEL,
     Dataset,
@@ -47,6 +48,7 @@ from app.ml.events import (
 from app.ml.experiments import MLExperimentTracker
 from app.ml.feature_store import FeatureStore
 from app.ml.features import FeatureEngineer
+from app.ml.importance import FeatureImportanceTracker, ImportanceReport
 from app.ml.inference import InferenceService
 from app.ml.meta import MetaReport, MetaStrategyManager
 from app.ml.models.factory import build_model
@@ -63,6 +65,7 @@ from app.ml.registry import ModelRecord, ModelRegistry
 from app.ml.reporting import MLReporter
 from app.ml.services import (
     AIAdvisor,
+    EdgeHealthStats,
     RiskAdvisor,
     StrategyIntelligence,
     StrategyScore,
@@ -78,6 +81,14 @@ VirtualStatsProvider = Callable[[], Mapping[str, VirtualStrategyStats]]
 
 Se inyecta como callable para que la capa de ML no dependa del motor de
 estrategias: el composition root adapta el ``PerformanceTracker``.
+"""
+
+EdgeHealthProvider = Callable[[], Mapping[str, EdgeHealthStats]]
+"""Salud del edge por estrategia (Edge Research Engine, Bloque 1).
+
+Mide si el edge **sigue** ahí, no cuánto vale. El Meta Strategy Manager la usa
+sólo como freno del peso. Mismo motivo para el callable: el composition root
+adapta el ``EdgeResearchEngine``.
 """
 
 SignalOutcomesProvider = Callable[[], Mapping[str, SignalOutcome]]
@@ -105,6 +116,10 @@ class MLEngine:
             (Bloque 8). Con ella, la etiqueta de calidad de señal sale del join
             real contra el evaluador; sin ella, de la aproximación por motivo de
             salida heredada del Bloque 4.
+        edge_health_provider: Fuente de la salud del edge por estrategia (Edge
+            Research Engine, Bloque 1). El Meta Strategy Manager la usa como
+            freno del peso cuando el edge se está deteriorando; sin ella el
+            gobierno se comporta exactamente como antes del Bloque 1.
         persist: Si el registro y los experimentos escriben a disco.
     """
 
@@ -116,6 +131,7 @@ class MLEngine:
         trades_provider: TradesProvider | None = None,
         virtual_stats_provider: VirtualStatsProvider | None = None,
         signal_outcomes_provider: SignalOutcomesProvider | None = None,
+        edge_health_provider: EdgeHealthProvider | None = None,
         persist: bool = True,
     ) -> None:
         self._settings = settings
@@ -126,6 +142,15 @@ class MLEngine:
         self._signal_outcomes_provider: SignalOutcomesProvider = signal_outcomes_provider or (
             lambda: {}
         )
+        self._edge_health_provider: EdgeHealthProvider = edge_health_provider or (lambda: {})
+        # Calibracion de la confianza (Bloque 10). Vive dentro del MLEngine
+        # porque su salida —la correccion— es realimentacion al propio ML, no
+        # una metrica mas del dashboard.
+        self._calibration = ConfidenceCalibrationEngine(settings.ml.calibration)
+        # Seguimiento de la importancia de features (Bloque 13). Vive aqui por
+        # el mismo motivo que la calibracion: su salida es realimentacion al
+        # propio ML, no una metrica suelta del dashboard.
+        self._importance = FeatureImportanceTracker(settings.ml.importance)
         self._log = logging.getLogger("app.ml")
 
         self._engineer = FeatureEngineer()
@@ -506,6 +531,59 @@ class MLEngine:
         """Per-strategy virtual performance from the continuous evaluator."""
         return self._virtual_stats_provider()
 
+    def edge_health(self) -> Mapping[str, EdgeHealthStats]:
+        """Per-strategy edge health from the Edge Research Engine."""
+        return self._edge_health_provider()
+
+    @property
+    def importance(self) -> FeatureImportanceTracker:
+        """Seguimiento de la importancia de features (Bloque 13)."""
+        return self._importance
+
+    def run_importance(self, dataset: Dataset | None = None) -> ImportanceReport:
+        """Measure how much each feature is contributing right now.
+
+        Se mide sobre el dataset **de validacion** disponible, no sobre el de
+        entrenamiento: medir sobre lo que el modelo memorizo infla la
+        importancia de las features con las que sobreajusto.
+
+        Args:
+            dataset: Dataset a usar. Sin el, se construye el actual.
+
+        Returns:
+            El informe de importancia.
+        """
+        model = self._registry.active_model()
+        if model is None:
+            # Sin modelo activo no hay importancia que medir. Se devuelve el
+            # informe vacio con su motivo, en vez de un ranking de ceros que
+            # parecería una medicion.
+            return ImportanceReport(reason="sin modelo activo")
+        data = dataset if dataset is not None else self.build_dataset()
+        return self._importance.measure(model, data.x, data.y, data.feature_names)
+
+    @property
+    def calibration(self) -> ConfidenceCalibrationEngine:
+        """Motor de calibracion de la confianza (Bloque 10)."""
+        return self._calibration
+
+    def run_calibration(self) -> CalibrationReport:
+        """Measure whether declared confidence matched what actually happened.
+
+        Alimenta el motor con cada operacion cerrada —la confianza que declaro
+        la decision y si acabo ganando— y devuelve el diagnostico. La correccion
+        resultante **no se aplica sola**: se expone para que quien la consuma
+        decida. Una capa que corrigiera en silencio su propia entrada haria
+        imposible saber si el modelo mejoro o si solo se le esta tapando el
+        error.
+
+        Returns:
+            El informe de calibracion.
+        """
+        trades = self._trades_provider()
+        self._calibration.observe_many([(t.confidence, t.pnl > 0) for t in trades])
+        return self._calibration.analyze()
+
     def evaluate_meta(self, labeled: Sequence[tuple[str, TradeRecord]] | None = None) -> MetaReport:
         """Run a meta-strategy governance cycle (adjusts weights/activation).
 
@@ -513,10 +591,15 @@ class MLEngine:
         (lo ejecutado) y el evaluador continuo (la señal en sí). La segunda sólo
         pesa mientras la primera no tenga muestra suficiente, y nunca puede por
         sí sola desactivar una estrategia.
+
+        Sobre ambas actúa la tercera, que no es evidencia de nivel sino de
+        tendencia: la salud del edge (Bloque 1) amortigua el peso objetivo de
+        una estrategia cuyo edge se deteriora, sin subirlo nunca ni desactivar.
         """
         return self._meta.evaluate(
             labeled if labeled is not None else self.labeled_trades(),
             self.virtual_stats(),
+            self.edge_health(),
         )
 
     def recommend_parameters(self) -> dict[str, Any]:

@@ -59,6 +59,43 @@ class VirtualStrategyStats:
         return clamp(raw, 0.0, 100.0)
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class EdgeHealthStats:
+    """Salud del edge de una estrategia según el Edge Research Engine (Bloque 1).
+
+    Mide algo que ni el Trade Journal ni el evaluador continuo miden: no *cuánto*
+    gana la estrategia, sino si **sigue ganando lo mismo**. Un acumulado sano
+    puede esconder un edge que murió hace semanas, porque el acumulado no olvida.
+
+    Se declara aquí, y no se importa de ``app.engine.edge_research``, por la
+    misma razón que :class:`VirtualStrategyStats`: la capa de ML no depende del
+    motor de estrategias; el composition root adapta.
+
+    Attributes:
+        strategy: Estrategia medida.
+        status: ``healthy`` / ``watch`` / ``degrading`` / ``insufficient_data``.
+        health_score: Resumen 0-100, o ``None`` si no era medible.
+        factor: Multiplicador ``[floor, 1.0]`` aplicable al peso objetivo.
+        sample: Nº de resoluciones que sostienen la medición.
+    """
+
+    strategy: str
+    status: str
+    health_score: float | None
+    factor: float
+    sample: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe dict."""
+        return {
+            "strategy": self.strategy,
+            "status": self.status,
+            "health_score": None if self.health_score is None else round(self.health_score, 1),
+            "factor": round(self.factor, 4),
+            "sample": self.sample,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class StrategyScore:
     """Evidence-based score for a single strategy."""

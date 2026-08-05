@@ -13,8 +13,12 @@ from app.core.events.bus import EventBus
 from app.core.events.events import SystemStarted, SystemStopping
 from app.core.lifecycle import Service
 from app.dashboard.api.service import ApiService
+from app.engine.attribution import EdgeAttributionEngine, FactorCapture
+from app.engine.correlation import CorrelationEngine
+from app.engine.edge_research import EdgeResearchEngine
 from app.engine.evaluation import PerformanceTracker
 from app.engine.meta_governance import MetaGovernanceApplier
+from app.engine.regime_forecast import RegimeForecastService
 from app.engine.startup_guard import verify_clean_startup
 from app.engine.state_manager import HistoryWriter
 from app.engine.strategy_engine import StrategyEngine
@@ -29,6 +33,7 @@ from app.market.services import MarketDataService
 from app.market.storage import MarketDataWriter
 from app.ml.api import MLEngine
 from app.ml.notifications import MLNotifier
+from app.monitoring.data_quality_service import DataQualityMonitor
 from app.monitoring.events import MarketDataBlind, MarketDataRecovered, SignalDrought
 from app.monitoring.health import HealthMonitor
 from app.monitoring.pipeline_watch import PipelineWatchdog
@@ -93,6 +98,22 @@ class QuantEngine:
                     container.resolve(StrategyEngine),
                 ]
             )
+        # Edge Research Engine (Bloque 1): va DESPUÉS del evaluador, porque mide
+        # sobre las resoluciones que ese escribe. Sólo observa.
+        if container.contains(EdgeResearchEngine):
+            self._services.append(container.resolve(EdgeResearchEngine))
+        # Captura de factores (Bloque 2): se suscribe al bus, asi que arranca
+        # antes que el motor que consume lo que captura.
+        if container.contains(FactorCapture):
+            self._services.append(container.resolve(FactorCapture))
+        if container.contains(EdgeAttributionEngine):
+            self._services.append(container.resolve(EdgeAttributionEngine))
+        # Pronostico de regimen (Bloque 4): siembra su muestra del historico al
+        # arrancar, asi que va despues de que el mercado este servido.
+        if container.contains(RegimeForecastService):
+            self._services.append(container.resolve(RegimeForecastService))
+        if container.contains(CorrelationEngine):
+            self._services.append(container.resolve(CorrelationEngine))
         # Producción (Fase 9): la recuperación va ANTES del Execution Engine —
         # rehidratar posiciones después de que el motor empiece a gestionarlas
         # sería una carrera contra su propio bucle.
@@ -132,6 +153,11 @@ class QuantEngine:
         # porque muestrea sus contadores.
         if container.contains(PipelineWatchdog):
             self._services.append(container.resolve(PipelineWatchdog))
+        # Calidad del dato (Bloque 11): va con la vigilancia del pipeline, y
+        # mide en cuanto arranca — un ciclo entero con el multiplicador en 1.0
+        # es un ciclo sin la proteccion que este bloque existe para dar.
+        if container.contains(DataQualityMonitor):
+            self._services.append(container.resolve(DataQualityMonitor))
         # Quant Research Lab (Fase 10): sólo el notificador es un servicio (se
         # suscribe al bus). El ResearchLab es una fachada sin ciclo de vida; sus
         # ciclos (generación/validación/shadow) los dispara el scheduler o el

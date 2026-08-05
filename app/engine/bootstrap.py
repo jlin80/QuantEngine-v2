@@ -5,6 +5,7 @@ dependencias por constructor. Este archivo es el único que conoce el grafo.
 """
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 from app.backtesting import BacktestLab
@@ -20,29 +21,40 @@ from app.dashboard.api.service import ApiService
 from app.database.engine import DatabaseManager
 from app.documentation.backends import MarkdownJournalBackend, NotionJournalBackend
 from app.documentation.service import DocumentationService
+from app.engine.attribution import EdgeAttributionEngine, FactorCapture, FactorSnapshotStore
 from app.engine.confidence import ConfidenceEngine
 from app.engine.consensus import ConsensusEngine
+from app.engine.correlation import CorrelationEngine
 from app.engine.decision_engine import DecisionEngine
+from app.engine.edge_research import EdgeReportHistory, EdgeResearchEngine
 from app.engine.evaluation import PerformanceTracker, VirtualOutcomeStore
 from app.engine.feature_store import FeatureStore
 from app.engine.filters import build_filter_chain
 from app.engine.market_context import MarketContextEngine
 from app.engine.meta_governance import MetaGovernanceApplier
+from app.engine.microstructure import MicrostructureEngine
+from app.engine.microstructure.features import register_microstructure_features
 from app.engine.models import SignalRecord
 from app.engine.plugins import PluginLoader
+from app.engine.position_quality import PositionQualityEngine
 from app.engine.quant_core import QuantCore
 from app.engine.regime_detection import RegimeDetector
+from app.engine.regime_forecast import RegimeForecastEngine, RegimeForecastService
+from app.engine.rejections import RejectionStore
 from app.engine.signal_engine import SignalEngine
 from app.engine.state_manager import HistoryWriter, SignalHistoryStore
 from app.engine.strategy_engine import StrategyEngine
 from app.engine.validators import SignalValidator
 from app.execution.api import ExecutionCore
+from app.execution.benchmark import ShadowBenchmark
 from app.execution.commission import CommissionEngine
+from app.execution.costs import CostAttributionEngine
 from app.execution.execution_engine import ExecutionEngine
 from app.execution.falsification import HoldingChangeFalsifier
 from app.execution.journal import TradeJournal
 from app.execution.latency import LatencyEngine
 from app.execution.notifications import ExecutionNotifier
+from app.execution.optimizer import ExecutionOptimizer
 from app.execution.order_manager import OrderManager
 from app.execution.performance import PerformanceEngine
 from app.execution.portfolio_manager import PortfolioManager
@@ -65,14 +77,18 @@ from app.market.validator import DataValidator
 from app.ml.api import MLEngine
 from app.ml.datasets import SignalOutcome
 from app.ml.notifications import MLNotifier
-from app.ml.services import VirtualStrategyStats
+from app.ml.services import EdgeHealthStats, VirtualStrategyStats
+from app.monitoring.data_quality import DataQualityEngine, DataQualityInputs
+from app.monitoring.data_quality_service import DataQualityMonitor
 from app.monitoring.health import HealthMonitor
+from app.monitoring.meta_risk import MetaRiskEngine, MetaRiskInputs
 from app.monitoring.pipeline_watch import PipelineWatchdog
 from app.monitoring.watchdog import Watchdog
 from app.notifications.channels.discord import DiscordWebhookChannel
 from app.notifications.channels.discord_router import build_routed_discord
 from app.notifications.models import NotificationLevel
 from app.notifications.service import NotificationService
+from app.portfolio import PortfolioIntelligence
 from app.production.api import ProductionAPI
 from app.production.audit import AuditLog, audit_log
 from app.production.backup import BackupService
@@ -333,6 +349,11 @@ def _build_market(
             continue  # timeframe desconocido: se ignora (queda logueado en docs)
     aggregator = CandleAggregator(timeframes or [Timeframe.M1])
     books = OrderBookManager(max_depth=market.orderbook_depth * 4)
+    # Microstructure Engine (Bloque 3): observa los deltas del libro y las
+    # operaciones en el mismo punto en que se aplican. Se construye aquí, con
+    # el Data Engine, porque su fuente es el feed — no la decisión.
+    microstructure = MicrostructureEngine(settings.quant.microstructure)
+    container.register_instance(MicrostructureEngine, microstructure)
     state = MarketStateStore(
         recent_trades_limit=market.recent_trades_limit,
         candle_history_limit=market.candle_history_limit,
@@ -352,8 +373,33 @@ def _build_market(
         metrics=FeedMetrics(),
         queue_size=market.collector_queue_size,
         aggregate_from_ticks=market.aggregate_from_ticks,
+        book_observer=microstructure,
     )
     container.register_instance(TickCollector, collector)
+
+    # Data Quality Engine (Bloque 11): mide la salud del dato y la traduce en un
+    # multiplicador de exposicion. La leccion del incidente del 04/08 es que el
+    # motor puede quedarse ciego sin un solo error en el log; esto lo mide.
+    metrics = collector.metrics
+    quality_engine = DataQualityEngine(
+        settings.data_quality,
+        lambda: _data_quality_inputs(metrics, books, state, list(market.symbols)),
+    )
+    container.register_instance(DataQualityEngine, quality_engine)
+
+    # Meta Risk Engine (Bloque 12): la salud de la maquina. Compone con la
+    # calidad del dato y produce el multiplicador que consume la ejecucion.
+    health = container.resolve(HealthMonitor) if container.contains(HealthMonitor) else None
+    watchdog = container.resolve(Watchdog) if container.contains(Watchdog) else None
+    meta_risk = MetaRiskEngine(
+        settings.meta_risk,
+        lambda: _meta_risk_inputs(health, watchdog, quality_engine),
+    )
+    container.register_instance(MetaRiskEngine, meta_risk)
+    container.register_instance(
+        DataQualityMonitor,
+        DataQualityMonitor(settings.data_quality, quality_engine, bus, meta_risk),
+    )
 
     ws_manager = WebSocketManager()
     container.register_instance(WebSocketManager, ws_manager)
@@ -388,9 +434,41 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
     scheduler = container.resolve(AsyncScheduler)
 
     features = FeatureStore(market_service)
+    # Bloque 3: las métricas de microestructura entran al Feature Store desde
+    # fuera, para que ni el store conozca el motor ni el motor conozca al store.
+    if container.contains(MicrostructureEngine):
+        register_microstructure_features(features, container.resolve(MicrostructureEngine))
     container.register_instance(FeatureStore, features)
 
     regime = RegimeDetector(market_service, quant.regime)
+    # Regime Forecast Engine (Bloque 4): pronostica el proximo desenlace desde
+    # la frecuencia condicional empirica, y se puntua a si mismo contra el
+    # pronostico trivial. No decide nada: publica probabilidad y skill.
+    # Correlation Intelligence (Bloque 5): mide lo que los grupos manuales del
+    # filtro de correlacion no pueden saber — que dos simbolos han dejado de
+    # moverse juntos, o han empezado. Se une a la regla manual, no la sustituye.
+    correlation_engine = CorrelationEngine(
+        quant.correlation,
+        market_service,
+        list(settings.market.symbols),
+        timeframe=Timeframe(quant.context.context_timeframe),
+    )
+    container.register_instance(CorrelationEngine, correlation_engine)
+
+    forecast_engine = RegimeForecastEngine(quant.regime_forecast)
+    container.register_instance(RegimeForecastEngine, forecast_engine)
+    container.register_instance(
+        RegimeForecastService,
+        RegimeForecastService(
+            quant.regime_forecast,
+            forecast_engine,
+            regime,
+            market_service,
+            list(settings.market.symbols),
+            timeframe=Timeframe(quant.context.context_timeframe),
+            bus=bus,
+        ),
+    )
     context_engine = MarketContextEngine(market_service, features, regime, quant.context)
     container.register_instance(MarketContextEngine, context_engine)
 
@@ -409,6 +487,37 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
     tracker = PerformanceTracker(quant.evaluation, market_service, outcomes)
     container.register_instance(PerformanceTracker, tracker)
 
+    # Edge Research Engine (Bloque 1): salud del edge por estrategia sobre una
+    # ventana rodante. Lee las resoluciones ya escritas por el evaluador — se le
+    # inyecta el `load` del store, no el store, para que el mismo motor sirva
+    # sobre el histórico de un backtest sin arrastrar servicios. No opera, no
+    # cambia pesos y no puede habilitar live: sólo produce evidencia.
+    edge_history = EdgeReportHistory(
+        quant.edge_research.history_path,
+        persist=quant.edge_research.persist_history,
+        memory_limit=quant.edge_research.history_memory_limit,
+    )
+    container.register_instance(EdgeReportHistory, edge_history)
+    edge_research = EdgeResearchEngine(
+        quant.edge_research,
+        outcomes.load,
+        edge_history,
+        bus,
+    )
+    container.register_instance(EdgeResearchEngine, edge_research)
+
+    # Captura de factores (Bloque 2): fotografía el estado de order flow, VWAP,
+    # momentum, delta/CVD y el desglose de confianza en el momento de decidir.
+    # Se engancha al bus, NO al Decision Engine: el motor de decisión está en el
+    # camino caliente y no puede pagar lecturas extra por evaluación. El precio
+    # es un desfase de hasta el TTL del Feature Store, medido en cada fila.
+    snapshots = FactorSnapshotStore(
+        quant.attribution.snapshots_path,
+        persist=quant.attribution.persist_snapshots,
+        flush_size=quant.attribution.snapshots_flush_size,
+    )
+    container.register_instance(FactorSnapshotStore, snapshots)
+
     # El sink reparte cada señal resuelta a persistencia batched Y al
     # evaluador continuo: historial en memoria, DB y métricas son un flujo.
     def _signal_sink(record: SignalRecord) -> None:
@@ -421,16 +530,50 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
     )
     container.register_instance(SignalHistoryStore, history)
 
+    capture = FactorCapture(features, history.decisions, snapshots, bus)
+    container.register_instance(FactorCapture, capture)
+
     weights = {name: config.weight for name, config in quant.strategies.items()}
     consensus = ConsensusEngine(
         quant.consensus, weights, performance_factor=history.performance_factor
     )
     confidence = ConfidenceEngine(quant.confidence)
+    # El filtro de microestructura es fail-open: sin libro del proveedor no
+    # mide y deja pasar. Se cablea sólo si el motor existe, para que en su
+    # ausencia ni siquiera aparezca en la explicación de la decisión.
+    micro_reader = (
+        (
+            quant.microstructure.max_execution_pressure,
+            _execution_pressure(container.resolve(MicrostructureEngine)),
+        )
+        if container.contains(MicrostructureEngine)
+        else None
+    )
+    quality_engine = PositionQualityEngine(quant.position_quality)
+    container.register_instance(PositionQualityEngine, quality_engine)
+
     filters = build_filter_chain(
         quant.filters,
         drawdown_reader=lambda: history.get_state("daily_drawdown_pct"),
         recent_decisions=lambda: history.decisions(limit=50),
+        microstructure=micro_reader,
+        measured_correlation=(
+            correlation_engine.correlated_with if quant.correlation.enabled else None
+        ),
+        # El lector de entradas del veto de calidad queda sin cablear todavia:
+        # el coste esperado vive en la capa de ejecucion (Bloque 6) y el riesgo
+        # propuesto en el Risk Manager, y ninguno se conoce en el momento en que
+        # corre la cadena de filtros. Sin lector, esas dimensiones quedan como
+        # NO observables y el filtro no bloquea por ellas — que es exactamente
+        # el comportamiento correcto, no una degradacion silenciosa.
+        position_quality=(quality_engine, None) if quant.position_quality.enabled else None,
     )
+
+    # Why Not Trade Engine (Bloque 14): convierte la explicacion en texto del
+    # rechazo en datos agregables. Se inyecta en el Decision Engine porque el
+    # resultado de cada filtro y el deficit de cada umbral solo existen ahi.
+    rejections = RejectionStore(quant.rejections)
+    container.register_instance(RejectionStore, rejections)
 
     validator = SignalValidator()
     signal_engine = SignalEngine(
@@ -452,6 +595,7 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
         quant.consensus,
         bus,
         history_writer,
+        rejections,
     )
     container.register_instance(DecisionEngine, decision_engine)
 
@@ -566,6 +710,61 @@ def _build_execution(container: Container, settings: Settings, bus: EventBus) ->
         persist=execution.persist_journal,
     )
     container.register_instance(TradeJournal, journal)
+
+    # Execution Optimizer (Bloque 6): compara IOC/LIMIT/MARKET antes de mandar
+    # nada. Reutiliza los motores de slippage y latencia de la Fase 5 en vez de
+    # duplicar el modelo — si optimizar y simular usaran modelos distintos, el
+    # optimizador estaria eligiendo para un mercado que el simulador no vive.
+    # Cost Attribution Engine (Bloque 9): separa el bruto de todo lo que se lo
+    # come. El coste de oportunidad se mide con las senales que nunca llegaron a
+    # operacion, asi que consume el store de resultados virtuales si existe.
+    outcome_store = (
+        container.resolve(VirtualOutcomeStore) if container.contains(VirtualOutcomeStore) else None
+    )
+    container.register_instance(
+        CostAttributionEngine,
+        CostAttributionEngine(
+            settings.costs,
+            journal.all,
+            (lambda: list(outcome_store.load())) if outcome_store is not None else None,
+        ),
+    )
+
+    # Live Shadow Benchmark (Bloque 15): compara paper contra el fill ideal y
+    # deja el carril live DECLARADO como ausente. No recibe ningun proveedor de
+    # operaciones live y no conoce ningun broker: no puede habilitar nada.
+    cost_engine = container.resolve(CostAttributionEngine)
+    container.register_instance(
+        ShadowBenchmark,
+        ShadowBenchmark(
+            settings.shadow_benchmark,
+            journal.all,
+            None,
+            lambda: cost_engine.analyze().total.opportunity,
+        ),
+    )
+
+    # Portfolio Intelligence (Bloque 8): desglosa el PnL realizado por simbolo,
+    # estrategia, sesion y regimen. Lee del Trade Journal, asi que se cablea
+    # aqui, donde el journal acaba de construirse.
+    container.register_instance(
+        PortfolioIntelligence, PortfolioIntelligence(settings.portfolio, journal.all)
+    )
+
+    optimizer = ExecutionOptimizer(execution.optimizer, slippage, latency)
+    container.register_instance(ExecutionOptimizer, optimizer)
+
+    # Edge Attribution Engine (Bloque 2): une cada operación cerrada con la foto
+    # de factores de su decisión. Va aquí porque necesita el Trade Journal; la
+    # captura vive en el Quant Core, que es donde ocurren las decisiones.
+    if container.contains(FactorSnapshotStore):
+        attribution = EdgeAttributionEngine(
+            settings.quant.attribution,
+            journal.all,
+            container.resolve(FactorSnapshotStore),
+            bus,
+        )
+        container.register_instance(EdgeAttributionEngine, attribution)
     performance = PerformanceEngine(initial_balance)
 
     context_engine = (
@@ -598,6 +797,21 @@ def _build_execution(container: Container, settings: Settings, bus: EventBus) ->
         context_engine,
         experiments,
         falsifier,
+        # Bloque 11: la calidad del dato reduce exposicion. Se pasa el LECTOR,
+        # no el valor: la calidad cambia en segundos y una lectura cacheada es
+        # justo la que no protege.
+        # Bloque 12: el multiplicador que llega a la ejecucion es el COMPUESTO
+        # (infraestructura x calidad de dato). Si el Meta Risk no esta cableado
+        # se cae al de calidad a secas, que sigue protegiendo.
+        (
+            container.resolve(MetaRiskEngine).risk_multiplier
+            if container.contains(MetaRiskEngine)
+            else (
+                container.resolve(DataQualityEngine).risk_multiplier
+                if container.contains(DataQualityEngine)
+                else None
+            )
+        ),
     )
     container.register_instance(ExecutionEngine, engine)
 
@@ -799,12 +1013,21 @@ def _build_ml(container: Container, settings: Settings, bus: EventBus) -> None:
         (lambda: _signal_outcomes(outcome_store)) if outcome_store is not None else None
     )
 
+    # Cuarta fuente (Bloque 1): la salud del edge. No mide cuánto vale una
+    # estrategia —de eso ya van las otras tres— sino si su edge SIGUE ahí. El
+    # Meta Strategy Manager la usa sólo como freno del peso.
+    edge_engine = (
+        container.resolve(EdgeResearchEngine) if container.contains(EdgeResearchEngine) else None
+    )
+    edge_health_provider = (lambda: _edge_health(edge_engine)) if edge_engine is not None else None
+
     engine = MLEngine(
         settings,
         bus=bus,
         trades_provider=trades_provider,
         virtual_stats_provider=virtual_stats_provider,
         signal_outcomes_provider=signal_outcomes_provider,
+        edge_health_provider=edge_health_provider,
     )
     container.register_instance(MLEngine, engine)
 
@@ -846,6 +1069,95 @@ def _signal_outcomes(store: VirtualOutcomeStore) -> dict[str, SignalOutcome]:
         )
         for signal_id, outcome in store.index().items()
     }
+
+
+def _edge_health(engine: EdgeResearchEngine) -> dict[str, EdgeHealthStats]:
+    """Adapt the Edge Research Engine's report to the ML layer's shape."""
+    report = engine.last_report()
+    if report is None:
+        return {}
+    return {
+        entry.strategy: EdgeHealthStats(
+            strategy=entry.strategy,
+            status=entry.status,
+            health_score=entry.health_score,
+            factor=engine.factor(entry.strategy),
+            sample=entry.sample,
+        )
+        for entry in report.strategies
+    }
+
+
+def _execution_pressure(engine: MicrostructureEngine) -> Callable[[str], float | None]:
+    """Adapt the microstructure engine to the filter's reader signature."""
+
+    def reader(symbol: str) -> float | None:
+        snapshot = engine.snapshot(symbol)
+        return snapshot.execution_pressure if snapshot.observable else None
+
+    return reader
+
+
+def _meta_risk_inputs(
+    health: HealthMonitor | None,
+    watchdog: Watchdog | None,
+    quality: DataQualityEngine,
+) -> MetaRiskInputs:
+    """Adapt health/watchdog/data-quality into what the meta risk engine reads.
+
+    Se lee el ULTIMO snapshot del health monitor, no se fuerza uno nuevo: pedir
+    una medicion sincrona desde aqui meteria `psutil` en el camino de cada
+    medicion de riesgo, y el monitor ya toma la suya en su propia cadencia.
+    """
+    snapshot = health.last_snapshot if health is not None else None
+    statuses = (
+        {name: status.value for name, status in watchdog.component_statuses.items()}
+        if watchdog is not None
+        else {}
+    )
+    return MetaRiskInputs(
+        cpu_percent=None if snapshot is None else snapshot.cpu_percent,
+        memory_percent=None if snapshot is None else snapshot.memory_percent,
+        event_loop_lag_ms=None if snapshot is None else snapshot.event_loop_lag_ms,
+        event_bus_queue=None if snapshot is None else snapshot.event_bus.get("queue_size"),
+        component_statuses=statuses,
+        data_quality_multiplier=quality.risk_multiplier(),
+    )
+
+
+def _optional_latency(value: object) -> float | None:
+    """Read an optional latency metric without turning ``None`` into 0.0."""
+    return float(value) if isinstance(value, int | float) else None
+
+
+def _data_quality_inputs(
+    metrics: FeedMetrics,
+    books: OrderBookManager,
+    state: MarketStateStore,
+    symbols: list[str],
+) -> DataQualityInputs:
+    """Adapt the Data Engine's counters to what the quality engine measures.
+
+    Se adapta aqui, en el composition root, para que el motor de calidad no
+    dependa del Data Engine: asi se puede medir calidad sobre cualquier fuente
+    de metricas, incluida una sintetica en tests.
+    """
+    book_status = books.status()
+    synced = sum(1 for row in book_status.values() if row.get("synced"))
+    with_data = sum(1 for symbol in symbols if state.ticker(symbol) is not None)
+    return DataQualityInputs(
+        messages=metrics.ws_messages.total,
+        rejected=metrics.rejected,
+        dropped=metrics.dropped,
+        reconnections=metrics.reconnections,
+        expected_symbols=len(symbols),
+        symbols_with_data=with_data,
+        books_synced=synced if book_status else None,
+        books_total=len(book_status),
+        # `ema_ms` es `None` hasta la primera muestra: se propaga tal cual para
+        # que la senal quede como no observable en vez de como latencia cero.
+        exchange_lag_ms=_optional_latency(metrics.data_latency.to_dict().get("ema_ms")),
+    )
 
 
 def _virtual_stats(tracker: PerformanceTracker) -> dict[str, VirtualStrategyStats]:

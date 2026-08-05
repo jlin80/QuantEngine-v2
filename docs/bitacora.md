@@ -1483,3 +1483,769 @@ motor verificado: healthy, parada limpia, guard anti-live intacto.
 **No se reescribe el historial.** Las 194 operaciones de oro del 23-27/07 siguen
 con el PnL mal escrito: pertenecen a la era `pre_contract_size`, ya excluida del
 entrenamiento con peso 0.0.
+
+
+## 2026-08-04 - Bloque 1 (Edge Intelligence): medir si el edge SIGUE ahi
+
+**Categoria:** feat · **Tags:** `edge` `decay` `half-life` `meta-strategy` `bloque-1`
+
+**El hueco.** Teniamos dos fuentes que responden lo mismo — el Trade Journal
+(lo ejecutado) y el evaluador continuo (la senal en si) — y ninguna que responda
+*sigue ganando lo mismo que ganaba*. Las dos agregan sin olvidar. Con cientos de
+operaciones acumuladas, una estrategia que dejo de funcionar hace tres semanas
+sigue mostrando un profit factor decente durante mucho tiempo: el peso muerto del
+historial tapa el deterioro justo cuando hay que verlo.
+
+**Que se implemento.** `app/engine/edge_research/`: ventana rodante por
+estrategia (300 resoluciones), troceada en bloques, con las diez metricas del
+bloque — edge decay, half-life, stability score, edge persistence, PF /
+expectancy / Sharpe / Sortino / drawdown rodantes y confidence drift. Ciclo cada
+15 min como `Service`, informe append-only en `data/performance/edge_reports.jsonl`,
+eventos `EdgeReportGenerated` / `EdgeDecayDetected`, endpoints `/api/edge/*` e
+integracion con el Meta Strategy Manager.
+
+**Las cuatro decisiones que importan (ADR-100).**
+- **`None` no es 0.0.** Toda metrica no medible llega como `None` hasta el JSON.
+  Colapsarla a cero es como se acaba penalizando a una estrategia por no tener
+  datos — el error contrario al que se quiere evitar.
+- **`degrading` exige dos motivos concurrentes.** Con muestras de decenas de
+  resoluciones, una metrica sola fuera de rango es ruido. Un motivo = `watch`.
+- **La alarma se emite en la transicion, no en cada ciclo.** Reanunciar el mismo
+  deterioro cada 15 minutos es como se dejan de leer las alarmas.
+- **Solo frena, nunca empuja.** El multiplicador que consume el MSM vive en
+  `[0.5, 1.0]`: amortigua el peso objetivo, nunca lo sube, y **nunca desactiva**
+  — apagar sigue exigiendo muestra ejecutada. Sin muestra suficiente vale
+  exactamente 1.0: sin evidencia no se penaliza, o toda estrategia recien
+  promovida quedaria apagada antes de demostrar nada.
+
+**Half-life es lineal a proposito**, y Sharpe/Sortino no se anualizan: ajustar
+una exponencial o anualizar sobre esta muestra seria darle a la cifra una
+precision que no tiene. Son alarmas de orden de magnitud.
+
+**Efecto lateral util:** `VirtualOutcome` gana `confidence`. Sin ella no se
+distingue una estrategia que empeora de una que ademas se cree cada vez mas
+segura, que es la sobreconfianza y la entrada natural del Bloque 10. Las filas
+anteriores quedan con `None` y fuera de esa metrica, no rellenadas.
+
+**Archivos nuevos.** `app/engine/edge_research/{__init__,metrics,models,history,engine}.py`,
+`app/dashboard/api/routes/edge.py`, `tests/unit/test_edge_research.py`,
+`tests/integration/test_edge_research_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py` (`QuantEdgeResearchSettings`),
+`app/engine/events/{events,__init__}.py`, `app/engine/evaluation/{outcomes,tracker}.py`
+(confianza en el resultado virtual), `app/engine/{bootstrap,engine}.py` (DI y
+orden de arranque: despues del evaluador, porque mide lo que ese escribe),
+`app/dashboard/api/main.py`, `app/ml/{api,services/strategy_intelligence,services/__init__,meta/manager}.py`.
+
+**Riesgos conocidos.** La ingesta relee el JSONL entero cada ciclo y deduplica
+por `signal_id` con ventana acotada (`seen_limit=50k`): coste lineal con el
+tamano del fichero, y si el store superara esa ventana la deduplicacion dejaria
+de ser total. Aceptable a esta cadencia y acotado por configuracion, pero es lo
+primero a revisar si el store crece de orden.
+
+**TODOs restantes.** El resumen 0-100 mezcla cuatro dimensiones con pesos que son
+un juicio; quedan configurables y el informe conserva siempre las metricas
+individuales. Falta panel de dashboard (hoy solo API). Bloques 2-15 pendientes.
+
+**Tests.** 31 nuevos (23 unitarios + 8 de integracion). Suite: **1022 en verde**
+en 3.14 y en 3.12.10. Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-04 - Bloque 2: explicar una operacion sin inventarse la causa
+
+**Categoria:** feat · **Tags:** `atribucion` `factores` `lift` `bloque-2`
+
+**El riesgo del bloque no era tecnico, era epistemico.** "Explicar por que gano
+o perdio cada operacion" invita a producir una descomposicion aditiva del
+resultado por factor. Seria falso: los factores estan correlacionados entre si
+y una sola operacion no contiene evidencia causal de nada. Un informe asi suena
+convincente **siempre**, incluso cuando no sabe nada, que es exactamente lo
+peor que puede hacer una herramienta de decision.
+
+**Lo que se implemento en su lugar.** `app/engine/attribution/`: asociacion
+historica por bucket. Cada factor se trocea en terciles (continuos) o por
+etiqueta (categoricos), se mide la R media de cada bucket contra la global, y
+ese `lift` es lo que se atribuye. Explicar una operacion = decir en que bucket
+cayo y cuanto ha rendido historicamente ese bucket.
+
+**Cuatro decisiones de honestidad (ADR-101).**
+- **El residuo se reporta siempre**: `R - baseline - suma(lifts)`. Un residuo
+  grande dice que la explicacion no explica, y eso es informacion.
+- **El aviso viaja en el JSON** (`caveat`), no solo en la doc: el informe se lee
+  en un dashboard, fuera de contexto.
+- **Buckets pequenos descartados**: una etiqueta con dos operaciones da un lift
+  enorme y sin significado, y en un ranking por magnitud sube arriba del todo
+  justo por ser ruido.
+- **`join_breakdown` separa los dos huecos**: "sin decision_id" (trade adoptado)
+  y "sin foto" (decision anterior al bloque). Agregarlos escondería cual duele.
+
+**Donde se captura.** Desde el Event Bus (`DecisionGenerated`), no dentro del
+Decision Engine: el camino caliente no puede pagar lecturas extra del Feature
+Store por evaluacion. El precio —desfase de hasta el TTL del store— se **mide**
+en `lag_seconds` de cada fila en vez de fingir simultaneidad.
+
+**Hueco encontrado y cerrado durante los tests.** Con `persist_snapshots=false`
+el store no retenia nada, asi que la atribucion salia vacia sin decir por que:
+un ajuste de I/O apagaba en silencio una funcionalidad entera. Ahora retiene
+siempre una ventana en memoria.
+
+**Archivos nuevos.** `app/engine/attribution/{__init__,models,store,capture,engine}.py`,
+`app/dashboard/api/routes/attribution.py`, `tests/unit/test_edge_attribution.py`,
+`tests/integration/test_edge_attribution_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py` (`QuantAttributionSettings`),
+`app/engine/events/{events,__init__}.py` (`AttributionReportGenerated`),
+`app/engine/{bootstrap,engine}.py`, `app/dashboard/api/main.py`.
+
+**Riesgos conocidos.** El buffer de decisiones es acotado: si una decision rota
+antes de llegar su evento, la foto se toma igual pero sin desglose de confianza
+ni contexto (quedan `None`/`unknown`). Los terciles se recalculan cada ciclo, asi
+que los cortes se mueven con la muestra; se guardan junto al agregado para que
+explicar use exactamente los cortes con los que se midio.
+
+**TODOs restantes.** El factor `ml` queda declarado pero sin proveedor cableado
+(el modelo activo no expone prediccion por simbolo fuera del pipeline de
+inferencia): se observa como `None`, que es distinto de observarlo en cero.
+
+**Tests.** 24 nuevos (17 unitarios + 7 integracion). Suite: **1046 en verde**.
+Ruff, Black y MyPy strict limpios. Cableado DI verificado contra
+`build_container` real.
+
+
+## 2026-08-04 - Bloque 3: microestructura completa sobre datos que hoy no llegan
+
+**Categoria:** feat · **Tags:** `microestructura` `libro` `order-flow` `bloque-3`
+
+**El hecho que gobierna el bloque.** Las nueve metricas pedidas (queue
+imbalance, queue estimation, arrival rate, cancel rate, resiliency,
+replenishment, liquidity consumption, market impact, execution pressure) salen
+todas del libro de ordenes incremental. Y con MT5 —el broker de la demo— no hay
+libro: ya estaba medido en `docs/orderflow_nativo.md` (el proveedor no expone
+`ORDERBOOK` y nunca emite `Trade`).
+
+**Decision: implementar completo y declarar la ausencia.** El motor funciona
+contra el libro que los proveedores nativos si publican (Fase 2), y cuando no
+hay datos devuelve `observable=false` con su motivo y **todas las metricas en
+`None`**. Fabricar un `queue_imbalance=0.0` seria indistinguible de un libro
+perfectamente equilibrado y alimentaria al Decision Engine con una lectura que
+nadie tomo.
+
+**Tres detalles que separan una metrica util de una que miente.**
+- **Deltas, no snapshots**: sin ver deltas y operaciones por separado, una
+  cancelacion y una ejecucion son la misma resta, y `cancel_rate` mide las dos.
+- **Un resync no es una avalancha de ordenes**: `is_snapshot` reinicia el estado
+  en vez de contarse como altas. Si no, cada perdida de conexion dispararia el
+  arrival rate justo cuando el motor se quedo ciego.
+- **Impacto: `None` antes que extrapolar** mas alla del ultimo nivel publicado.
+
+**Integracion con el Decision Engine: fail-open.** El filtro veta solo con
+presion **medida** por encima del umbral; sin medicion pasa. Un filtro que
+bloquea por falta de datos apagaria el motor con el broker actual sin un solo
+error en el log. Y si el motor no esta cableado, el filtro ni entra en la
+cadena: fuera no aparece en la explicacion de la decision, que no es lo mismo
+que aparecer diciendo "pase".
+
+**Archivos nuevos.** `app/engine/microstructure/{__init__,models,engine,features}.py`,
+`app/dashboard/api/routes/microstructure.py`, `tests/unit/test_microstructure.py`,
+`tests/integration/test_microstructure_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`, `app/engine/filters/{filters,__init__}.py`
+(`MicrostructureFilter`), `app/market/collector/collector.py` (Protocol
+`BookObserver` + hook en el camino de deltas y trades), `app/engine/bootstrap.py`,
+`app/dashboard/api/main.py`.
+
+**Riesgo conocido y honesto.** Con MT5 el bloque entero queda **inerte**: es
+codigo correcto sin datos que lo alimenten. Solo cobra valor si se decide
+alimentar los indicadores desde un feed nativo — decision abierta desde el
+informe de order flow, y que no tomo este bloque.
+
+**Tests.** 25 nuevos (14 unitarios + 11 integracion). Suite: **1071 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 4: un pronostico que se puntua a si mismo
+
+**Categoria:** feat · **Tags:** `regimen` `pronostico` `brier` `bloque-4`
+
+**La trampa del bloque.** "Pronosticar el regimen" produce facilmente cinco
+probabilidades de aspecto convincente. Detectar es observar; pronosticar es
+apostar. Un motor que apuesta y no lleva marcador es una opinion con decimales.
+
+**Metodo simple a proposito.** Frecuencia condicional empirica sobre
+`regimen|volatilidad`. Nada de HMM ni Markov ajustado: con esta muestra, un
+modelo mas rico da parametros peor estimados y un numero mas dificil de auditar.
+
+**Lo que sostiene el bloque es la validacion (ADR-103).** Todo pronostico se
+guarda, se resuelve contra lo que paso y se puntua con Brier multiclase **contra
+el pronostico trivial**. `skill = 1 - brier/baseline`, y viaja en el evento del
+bus. Si sale negativo se publica igual: es la senal de que no vale para decidir
+nada, y esconderla seria peor que no tener pronostico.
+
+**Tres decisiones de honestidad.**
+- **Sin muestra no se reparte a partes iguales**: `observable=false`. Un reparto
+  uniforme parece un pronostico y no lo es.
+- **Laplace, no ceros**: un desenlace nunca visto con probabilidad 0 afirma que
+  algo es imposible por no haberlo visto unos cientos de veces.
+- **Confianza != acierto**: la confianza mide evidencia y satura con la muestra;
+  el acierto lo dice el Brier. Son campos separados justamente por eso.
+
+**Orden del ciclo:** resolver antes de emitir. Al reves, el pronostico recien
+emitido entraria en su propia validacion.
+
+**Archivos nuevos.** `app/engine/regime_forecast/{__init__,models,engine,service}.py`,
+`app/dashboard/api/routes/forecast.py`, `tests/unit/test_regime_forecast.py`,
+`tests/integration/test_regime_forecast_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`, `app/engine/events/{events,__init__}.py`
+(`RegimeForecastUpdated`), `app/engine/{bootstrap,engine}.py`, `app/dashboard/api/main.py`.
+
+**Sesgo conocido del bootstrap.** Sembrar del historico atribuye a toda la serie
+la condicion detectada al final, porque re-detectar hacia atras exigiria datos
+que en su momento no existian. La muestra inicial es por tanto mas ruidosa que
+la que el motor acumula despues en vivo. Ademas, los umbrales de clasificacion
+de desenlaces (1.5x / 0.5x el rango previo) son un punto de partida razonable,
+no una medida calibrada por simbolo.
+
+**Tests.** 24 nuevos (16 unitarios + 8 integracion). Suite: **1095 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 5: la correlacion escrita a mano envejece; esta se mide
+
+**Categoria:** feat · **Tags:** `correlacion` `lead-lag` `cointegracion` `bloque-5`
+
+**El hueco real.** El filtro de correlacion vetaba por grupos declarados a mano
+en configuracion. Un grupo escrito hace meses no sabe que dos simbolos han
+dejado de moverse juntos — ni que dos que no estaban en el mismo grupo ahora se
+mueven como uno solo. El filtro creia estar protegiendo de una concentracion que
+ya no existia, y no veia la que si.
+
+**Implementado.** `app/engine/correlation/`: correlacion rodante y dinamica
+(EWMA), lead-lag con su convencion de signo, ratio de cobertura y vida media del
+residuo, ranking de liderazgo, correlacion por sesion y matriz de pares. Servicio
+con ciclo propio que mide **inmediatamente al arrancar** — si no, el filtro
+pasaria el primer intervalo entero sin la evidencia que este motor existe para
+darle, y nadie sabria por que.
+
+**Lo que NO se implemento, y se dice (ADR-104).** No hay test ADF de
+cointegracion. Necesita tablas de valores criticos, y fingir un p-valor seria
+peor que no darlo. Se reporta vida media del residuo: si revierte rapido, el par
+se comporta como cointegrado; si no revierte, `None`. Es lo accionable y se
+llama por su nombre.
+
+**Bug encontrado por un test, no en produccion.** El lead-lag reportaba
+liderazgo inventado entre series **simultaneas**: una serie periodica
+correlaciona igual de bien consigo misma a lag 0 y a un multiplo de su periodo,
+y sin regla de desempate ganaba el que saliera antes en la iteracion. Ahora los
+empates los gana el desplazamiento menor: ante la misma evidencia, la
+explicacion mas simple es que se mueven a la vez.
+
+**Integracion con el filtro: suma, no sustituye.** Los grupos manuales siguen
+siendo regla dura. Sin motor cableado el filtro se comporta exactamente como
+antes del bloque, y hay un test que lo fija.
+
+**Archivos nuevos.** `app/engine/correlation/{__init__,stats,engine}.py`,
+`app/dashboard/api/routes/correlation.py`, `tests/unit/test_correlation.py`,
+`tests/integration/test_correlation_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`, `app/engine/filters/filters.py`
+(`CorrelationFilter` acepta correlacion medida), `app/engine/{bootstrap,engine}.py`,
+`app/dashboard/api/main.py`.
+
+**Riesgos conocidos.** La correlacion por sesion trocea la misma ventana: con
+pocas velas por sesion, esa sesion no aparece (correcto, pero puede leerse como
+que solo existen las sesiones activas). `min_correlation` es un umbral afirmado,
+no derivado de la distribucion real de correlaciones del universo.
+
+**Tests.** 22 nuevos (16 unitarios + 6 integracion). Suite: **1117 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 6: comparar IOC/LIMIT/MARKET sin que gane el que no opera
+
+**Categoria:** feat · **Tags:** `ejecucion` `optimizador` `slippage` `bloque-6`
+
+**La trampa del bloque.** Si se suman solo los costes de ejecutar, LIMIT gana
+siempre: no paga spread —lo cobra— y no sufre slippage. Un optimizador asi es
+una maquina de no operar, y ademas lo parece hacer bien.
+
+**La pieza que lo arregla: el coste de NO ejecutar.**
+`coste_esperado = directo x P(llenado) + (1-P) x coste_de_fallar`, con el coste
+de fallar escalado por una `urgency` 0-1. Se declara como lo que es: **una
+politica, no una medida**. Nadie ha medido cuanto vale la operacion que no se
+abre; el parametro hace explicita la decision en vez de esconderla.
+
+**Error de modelado que se detecto con un test.** La primera version le daba al
+IOC el spread a favor (como pasivo) **y** alta probabilidad de llenado (como
+agresivo). Con las dos ventajas ganaba siempre — por contabilidad, no por
+merito. Un optimizador que elige por un error de contabilidad es peor que no
+tener optimizador. Ahora IOC cruza el spread y sufre slippage igual que MARKET;
+lo que lo distingue es que puede quedarse a medias.
+
+**Reutiliza los motores de la Fase 5** (slippage, latencia) en vez de duplicar
+el modelo: si optimizar y simular usaran modelos distintos, el optimizador
+estaria eligiendo para un mercado que el simulador no vive, y la discrepancia
+solo se veria en live.
+
+**Sin libro no se inventa la probabilidad de llenado.** El desequilibrio de cola
+(Bloque 3) corrige la base solo si es observable. Con MT5 se queda en la base:
+es el escenario en el que un optimizador confiado prefiere limites que nunca se
+llenan.
+
+**Limite explicito del bloque.** El optimizador **cotiza pero no rutea**: el
+Execution Engine sigue mandando MARKET. Cablear la eleccion al envio real toca
+la Fase 5 y cambia el comportamiento de ejecucion; se deja fuera a proposito y
+queda escrito como pendiente.
+
+**Archivos nuevos.** `app/execution/optimizer/{__init__,optimizer}.py`,
+`app/dashboard/api/routes/optimizer.py`, `tests/unit/test_execution_optimizer.py`,
+`tests/integration/test_execution_optimizer_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py` (`ExecutionOptimizerSettings`),
+`app/engine/bootstrap.py`, `app/dashboard/api/main.py`.
+
+**Tests.** 19 nuevos (15 unitarios + 4 integracion). Suite: **1136 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 7: la calidad de la posicion no es la calidad de la senal
+
+**Categoria:** feat · **Tags:** `calidad` `veto` `filtros` `bloque-7`
+
+**Por que es un motor aparte y no un factor mas del score.** El score mide la
+oportunidad; esto mide la **posicion** que saldria de ella. Una senal excelente
+en un mercado sin liquidez, con el coste de entrada comiendose media R, es una
+mala posicion aunque sea una buena senal. Metido en el score se diluiria en una
+media y nadie sabria que fue la calidad lo que paro la operacion.
+
+**Se materializa como filtro** para que el veto aparezca en la explicacion de la
+decision con su motivo: es la unica forma de auditar despues por que no se opero.
+
+**Tres reglas que evitan que el veto se vuelva un apagon (ADR-106).**
+- **Las dimensiones ausentes no valen cero.** Un cero dice "es malo"; la
+  ausencia dice "no se sabe". Se reportan en `missing` con su motivo.
+- **Fail-open por debajo del minimo de evidencia.** Con el broker actual —sin
+  libro, sin coste estimado en algunos simbolos— bloquear con dos dimensiones
+  observables apagaria el motor sin un solo log raro.
+- **Suelos por dimension.** Promediar deja que una liquidez pesima se esconda
+  detras de un setup excelente. Y cuando el suelo no veta, el aviso viaja igual.
+
+**El coste se juzga contra la R esperada**, no contra un techo: 8 bps son
+baratos para 3 R y carisimos para 0.2 R. Sin R estimada se cae al techo — peor,
+pero sin inventar.
+
+**Limite real del cableado, escrito por delante.** El lector de coste/R/riesgo
+**no esta cableado**: esas magnitudes viven en la ejecucion y en el Risk
+Manager, y no se conocen cuando corre la cadena de filtros. Hoy el veto opera
+con la mitad de su informacion, esas dimensiones quedan no observables y no
+bloquean. Hay un test que lo fija para que el dia que se cablee sea una decision
+y no un accidente.
+
+**Archivos nuevos.** `app/engine/position_quality/{__init__,engine}.py`,
+`tests/unit/test_position_quality.py`,
+`tests/integration/test_position_quality_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`, `app/engine/filters/{filters,__init__}.py`
+(`PositionQualityFilter`), `app/engine/bootstrap.py`.
+
+**Tests.** 19 nuevos (14 unitarios + 5 integracion). Suite: **1155 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 8: un +3% no dice de donde salio ese +3%
+
+**Categoria:** feat · **Tags:** `portfolio` `atribucion-pnl` `concentracion` `bloque-8`
+
+**La pregunta que el agregado esconde.** Si el mes cierra en +3%, ¿viene de las
+cuatro estrategias por igual o de una racha de un simbolo en una sesion que no
+se va a repetir? Cambia por completo que hacer despues, y el numero agregado no
+la contiene.
+
+**Implementado.** `app/portfolio/intelligence.py`: fuente del PnL (bruto vs
+comisiones), contribucion por simbolo, estrategia, sesion y regimen, heatmap
+(simbolo x estrategia), concentracion de Herfindahl y su lectura legible en
+"apuestas efectivas".
+
+**Cuatro decisiones que evitan que el informe mienta (ADR-107).**
+- **Cuotas sobre el PnL positivo, no sobre el neto.** Con ganancias y perdidas
+  mezcladas la suma neta se acerca a cero y las cuotas se disparan o cambian de
+  signo. Sobre el positivo, "aporto el 40% de lo que se gano" siempre significa
+  lo mismo.
+- **Un grupo que pierde no suma concentracion.** Elevar al cuadrado una cuota
+  negativa sumaria concentracion; un grupo perdedor diluye el origen del
+  beneficio, no lo concentra.
+- **Cada contribucion viaja con su muestra.** "El 80% del PnL vino de X" se lee
+  como merito cuando puede ser una muestra de nueve operaciones.
+- **Lo no atribuido tiene grupo propio**: dice cuanta parte del PnL todavia no
+  se puede explicar, en vez de repartirse o desaparecer.
+
+**Dos avisos en la propia carga util**, no solo en la doc: esto mide PnL
+realizado y no exposicion viva, y una contribucion alta puede ser racha.
+
+**Archivos nuevos.** `app/portfolio/{__init__,intelligence}.py`,
+`app/dashboard/api/routes/portfolio.py`, `tests/unit/test_portfolio_intelligence.py`,
+`tests/integration/test_portfolio_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`, `app/engine/bootstrap.py`,
+`app/dashboard/api/main.py`.
+
+**Limite declarado.** El desglose de coste solo separa comision del bruto. El
+reparto fino (fees, slippage, spread, latencia, coste oculto y de oportunidad)
+es el Bloque 9 y no se adelanta aqui.
+
+**Tests.** 17 nuevos (13 unitarios + 4 integracion). Suite: **1172 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 9: el coste oculto no es un concepto, es un agujero
+
+**Categoria:** feat · **Tags:** `costes` `slippage` `oportunidad` `bloque-9`
+
+**La decision que hace util al bloque.** El "coste oculto" se calcula como
+residuo: `bruto - neto - (comisiones + slippage + spread)`. Si crece, significa
+que el sistema **no esta midiendo** algo. Es un detector de contabilidad
+incompleta, y el informe alza una nota cuando pasa del umbral. Un modulo que
+inventara una formula para el coste oculto perderia justo esa senal.
+
+**Por eso la latencia no se estima.** El journal no la registra por operacion,
+asi que sale como `None` —no medida— y cae dentro del residuo, con su nota. Si
+se estimara, se mezclaria con el residuo y el detector dejaria de detectar.
+
+**El coste de oportunidad se mide, no se conjetura.** El evaluador continuo ya
+resuelve cada senal contra el mercado posterior: una senal con R virtual
+positiva cuyo `signal_id` no aparece en ningun trade es una oportunidad perdida
+**medida**. Solo cuentan las que habrian ganado — una senal no ejecutada que
+habria perdido es una bala esquivada, y sumarla con signo contrario dejaria el
+numero en nada.
+
+**Y no se reparte por dia**: es un coste del conjunto, y repartirlo lo contaria
+tantas veces como dias tenga el informe.
+
+**Los bps se convierten sobre unidades, no sobre lotes** (ADR-099): en oro un
+lote son 100 onzas, y medir sobre `quantity` dejaria el coste 100 veces por
+debajo. Hay un test que lo fija con `contract_size=100`.
+
+**Archivos nuevos.** `app/execution/costs/{__init__,attribution}.py`,
+`app/dashboard/api/routes/costs.py`, `tests/unit/test_cost_attribution.py`,
+`tests/integration/test_cost_attribution_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`, `app/engine/bootstrap.py`,
+`app/dashboard/api/main.py`.
+
+**Riesgos conocidos.** Slippage y spread vienen como medias de la operacion: una
+entrada con slippage alto y una salida limpia se promedian y se pierde el
+detalle por tramo. El coste de oportunidad esta en R, no en dinero, porque las
+senales no ejecutadas no tienen sizing.
+
+**Tests.** 14 nuevos (10 unitarios + 4 integracion). Suite: **1186 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 10: la confianza que nadie habia puesto a prueba
+
+**Categoria:** feat · **Tags:** `calibracion` `ece` `brier` `sobreconfianza` `bloque-10`
+
+**El problema es que no duele.** Una confianza de 0.8 que en realidad acierta el
+50% no produce ningun error, ningun log, ninguna alarma. Se mira junto al
+resultado individual, donde no hay forma de verla fallar. Solo aparece en
+agregado, y solo si alguien la mide.
+
+**Implementado.** `app/ml/calibration/`: curva de calibracion, diagrama de
+fiabilidad listo para pintar, ECE ponderado por muestra, Brier score, sesgo con
+signo, sobreconfianza e infraconfianza separadas, y un factor de correccion.
+
+**La decision que define el bloque (ADR-109): se mide y se expone, no se aplica
+sola.** Una capa que corrigiera en silencio su propia entrada haria imposible
+saber si el modelo mejoro o si solo se le esta tapando el error — y el proximo
+que mirase el ECE lo veria bien sin que nada hubiera mejorado. La correccion
+esta disponible en `MLEngine.calibration.calibrated()` y quien la consuma decide.
+
+**Y esta acotada.** Sin techo, una racha de 60 operaciones puede dar un factor
+de 0.4 que apagaria medio sistema. Es un empujon, no un volantazo.
+
+**Sin muestra, correccion 1.0**, e informe con `observable=false` y su motivo.
+Los tramos con menos de `min_bin_sample` se descartan: un bin con tres
+observaciones da 0.0 o 0.67 y arrastra el ECE con ruido puro.
+
+**Archivos nuevos.** `app/ml/calibration/{__init__,engine}.py`,
+`tests/unit/test_confidence_calibration.py`,
+`tests/integration/test_confidence_calibration_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py` (`MLCalibrationSettings`),
+`app/ml/api.py` (`MLEngine.calibration` y `run_calibration()`),
+`app/dashboard/api/routes/ml.py` (`/api/ml/calibration`).
+
+**Riesgos conocidos.** El acierto se define como `pnl > 0`, que es lo que el
+journal permite: una operacion que gana 0.1 R cuenta igual que una de 3 R, asi
+que se mide direccion y no magnitud. Y la correccion es global, no por
+estrategia ni por regimen: un sistema bien calibrado en tendencia y mal en rango
+recibe un unico factor promedio.
+
+**Tests.** 17 nuevos (13 unitarios + 4 integracion). Suite: **1203 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 11: la calidad del dato, medida y con consecuencias
+
+**Categoria:** feat · **Tags:** `calidad-dato` `riesgo` `reloj` `bloque-11`
+
+**Por que este bloque existe.** El 04/08 el motor se quedo ciego sin lanzar un
+solo error: el validador descartaba el 100% de los ticks, el bucle corria, el
+log no decia nada, y el sistema dejo de operar cuatro dias. Este bloque mide esa
+salud y la convierte en consecuencia.
+
+**Reducir, no apagar.** El multiplicador vive en `[0.3, 1.0]` y nunca llega a 0:
+apagar por una metrica de calidad convierte un problema de datos en una parada
+total, y esas las decide el kill switch, que tiene auditoria propia.
+
+**Dos fallos de diseno que encontraron los tests, no produccion.**
+1. **La media diluia lo critico.** Con `missing_data=0` o `clock_drift=0`, siete
+   senales sanas mantenian el score por encima del umbral y no pasaba nada. Ahora
+   las senales criticas degradan por si solas y el multiplicador toma el camino
+   mas severo. `tick_quality` es critica por el motivo mas concreto posible: el
+   fallo del 04/08 fue literalmente eso.
+2. **El tope de exposicion se tragaba la reduccion.** Aplicado antes de los
+   topes, reducir a la mitad una cantidad que el tope iba a recortar igualmente
+   no reducia nada — y la proteccion desaparecia justo en las operaciones mas
+   grandes. Ahora se aplica despues de los topes y antes del redondeo a lotes.
+
+**Ausencia de medicion no es calidad cero.** Sin mensajes, `feed_quality` queda
+no observable. Y sin ninguna senal observable el multiplicador se queda en 1.0:
+reducir ahi seria castigar por no haber medido.
+
+**Archivos nuevos.** `app/monitoring/{data_quality,data_quality_service}.py`,
+`app/dashboard/api/routes/quality.py`, `tests/unit/test_data_quality.py`,
+`tests/integration/test_data_quality_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`, `app/monitoring/events.py`
+(`DataQualityDegraded`), `app/execution/sizing/engine.py` (parametro
+`risk_multiplier`, retrocompatible), `app/execution/execution_engine/engine.py`
+(lector del multiplicador), `app/engine/{bootstrap,engine}.py`,
+`app/dashboard/api/main.py`.
+
+**Riesgos conocidos.** Los contadores del feed son acumulados desde el arranque,
+no de ventana movil: un episodio malo temprano sigue pesando horas despues. Y
+`max_timestamp_drift_seconds` no se alimenta todavia (el collector no expone el
+desfase por mensaje), asi que esa senal queda no observable.
+
+**Tests.** 21 nuevos (14 unitarios + 7 integracion). Suite: **1224 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 12: la maquina tambien es un riesgo, y no se ve en el PnL
+
+**Categoria:** feat · **Tags:** `meta-riesgo` `infraestructura` `cpu` `bloque-12`
+
+**Lo que hace peligroso a este riesgo.** Una VPS al 95% de CPU no impide operar:
+impide operar **a tiempo**. El motor sigue decidiendo, las ordenes salen, y la
+degradacion aparece como slippage y salidas tardias — que se leen como mala
+suerte de mercado. El dano es real y la causa es invisible desde cualquier
+metrica de trading.
+
+**Composicion por producto (ADR-111).** El multiplicador final es
+`infraestructura x calidad_de_dato`. Un feed mediocre en una maquina saturada es
+peor que cualquiera de las dos cosas por separado, y quedarse con el minimo lo
+negaria. El suelo se aplica al final.
+
+**Se miden en el mismo ciclo y en orden**: primero calidad, despues meta-riesgo,
+que la consume. Con bucles separados, el meta-riesgo compondria con una lectura
+de calidad de hasta un minuto de antiguedad.
+
+**Fallo de diseno que encontro un test.** Con rampa lineal, una CPU al 20% frente
+a un techo del 90% daba senal 0.78: la maquina sana parecia a medio gas, y como
+las senales se promedian, la degradacion real no destacaba sobre el fondo. Ahora
+hay **zona de confort**: por debajo de la mitad del limite, el recurso esta sano
+del todo.
+
+**Un componente que no reporta no es un componente caido.** Redis en local, MT5
+en cripto: quedan no observables. Penalizarlos apagaria medio sistema por
+configuracion, no por averia.
+
+**Archivos nuevos.** `app/monitoring/meta_risk.py`, `tests/unit/test_meta_risk.py`,
+`tests/integration/test_meta_risk_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py` (`MetaRiskSettings`),
+`app/monitoring/data_quality_service.py` (ciclo compartido),
+`app/engine/bootstrap.py` (la ejecucion pasa a leer el multiplicador COMPUESTO),
+`app/dashboard/api/routes/quality.py`.
+
+**Riesgos conocidos.** Se lee el ultimo snapshot del health monitor en vez de
+forzar uno: evita meter `psutil` en el camino de cada medicion, a cambio de una
+lectura de hasta un ciclo de antiguedad. Los pesos son juicios: nadie ha medido
+todavia la relacion entre CPU alta y slippage real — el Bloque 15 podria darla.
+
+**Tests.** 16 nuevos (12 unitarios + 4 integracion). Suite: **1240 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 13: importancia de features, y por que no SHAP
+
+**Categoria:** feat · **Tags:** `ml` `features` `permutacion` `bloque-13`
+
+**El enunciado pedia SHAP "si existe backend compatible". No lo hay, y se
+explica en vez de dejarlo como hueco.** SHAP exige una dependencia binaria
+pesada y esta pensado para arboles de gradiente y redes; los modelos de este
+proyecto son propios y algunos backends son opcionales. Anadirla cubriria parte
+del catalogo y habria que caer a otra metrica para el resto: dos numeros
+distintos llamados igual, que es peor que uno bien entendido.
+
+**Lo implementado: importancia por permutacion.** Se baraja una feature y se
+mide cuanto empeora el modelo. Agnostica, aplicable a todo el catalogo, y
+responde la pregunta operativa exacta: cuanto costaria perder esta feature.
+
+**La importancia nativa del modelo viaja aparte.** Mide otra cosa —cuanto usa el
+modelo una feature, no cuanto se pierde si desaparece— y promediarlas daria un
+numero que no responde a ninguna de las dos.
+
+**Tres detalles que hacen fiable la cifra (ADR-112).** Varias repeticiones (un
+solo barajado hace "importante" a una feature irrelevante por azar), semilla
+fija (sin ella el `change` mediria el ruido del metodo) y la historia se
+actualiza **despues** de comparar (si no, la medicion entraria en su propia
+referencia y el cambio saldria amortiguado).
+
+**Archivos nuevos.** `app/ml/importance/{__init__,tracker}.py`,
+`tests/unit/test_feature_importance.py`,
+`tests/integration/test_feature_importance_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py` (`MLImportanceSettings`),
+`app/ml/api.py` (`MLEngine.importance` y `run_importance()`),
+`app/dashboard/api/routes/ml.py` (`/api/ml/importance`).
+
+**Riesgos conocidos.** La permutacion es O(features x repeticiones x
+predicciones): con muchas features y datasets grandes el ciclo es caro, por eso
+se dispara bajo demanda y no en bucle. Y con features correlacionadas reparte
+mal el credito: si dos llevan la misma informacion, barajar una apenas empeora
+el modelo y ambas parecen poco importantes.
+
+**Tests.** 15 nuevos (12 unitarios + 3 integracion). Suite: **1255 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 14: la explicacion del rechazo, convertida en datos
+
+**Categoria:** feat · **Tags:** `rechazos` `explicabilidad` `filtros` `bloque-14`
+
+**El motor ya explicaba sus rechazos. En texto.** Y el texto sirve para leer UNA
+decision y para nada mas: no se puede agregar, no se puede contar, y no responde
+la pregunta que importa — *que filtro me esta costando operaciones este mes*.
+
+**Lo que NO se hizo, y por que.** El enunciado pide "penalizacion de cada
+filtro". Los filtros de este sistema no restan puntos: vetan. Modelarlos como si
+penalizaran produciria numeros con aspecto de calculo que no corresponden a
+nada. Se registra lo que ocurre de verdad: los **umbrales** llevan valor, minimo
+y deficit —esa si es una penalizacion medible—, y los **filtros** son binarios.
+
+**Se cablea en el Decision Engine, no en el bus**, porque el resultado de cada
+filtro y el deficit de cada umbral solo existen ahi: el evento de decision no
+los lleva y reconstruirlos desde fuera seria adivinarlos.
+
+**Dos decisiones sobre el volumen y el denominador.**
+- **Tambien se registran las aceptadas**: sin ellas, "este filtro bloqueo 40
+  veces" no significa nada.
+- **Las evaluaciones sin senal se cuentan, no se guardan**: dos simbolos por
+  segundo son ~170.000 filas al dia de algo que no es un rechazo, y ahogarian
+  los rechazos reales.
+
+**El resumen cuenta dos cosas distintas**: cuantas veces bloqueo cada puerta, y
+cuantas veces fue **la unica**. La segunda es la que decide si relajar un filtro:
+una puerta que siempre bloquea acompanada de otras no cuesta nada.
+
+**Archivos nuevos.** `app/engine/rejections/{__init__,models,store}.py`,
+`app/dashboard/api/routes/rejections.py`, `tests/unit/test_rejections.py`,
+`tests/integration/test_rejections_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`,
+`app/engine/decision_engine/engine.py` (desglose estructurado),
+`app/engine/bootstrap.py`, `app/dashboard/api/main.py`.
+
+**Riesgo conocido.** El registro vive en el camino de cada decision: es un append
+a memoria y un volcado por lotes, pero es trabajo en el camino caliente. Si el
+volumen de decisiones creciera un orden de magnitud habria que moverlo a un
+worker propio.
+
+**Tests.** 21 nuevos (14 unitarios + 7 integracion). Suite: **1276 en verde**.
+Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Bloque 15: el carril que no existe, y por que eso es el punto
+
+**Categoria:** feat · **Tags:** `benchmark` `live` `slippage` `bloque-15`
+
+**El problema logico del bloque, dicho por delante.** Con solo paper e ideal, el
+"gap de ejecucion" es —por construccion— el slippage y el spread que el propio
+simulador modelo. No mide nada independiente: es el modelo mirandose al espejo.
+Publicarlo como "slippage real" seria la clase de cifra que engana precisamente
+porque suena a observacion.
+
+**Decision: implementarlo como linea base y etiquetarlo como tal (ADR-114).** El
+valor del numero es futuro: el dia que exista carril live, la diferencia entre
+el gap modelado y el real dira si el simulador miente y cuanto. Hasta entonces:
+`fill_difference_bps` es **`None`** y no cero (cero afirmaria que paper y live
+coinciden, y eso no se ha observado nunca), el carril live sale con su motivo, y
+el aviso viaja en la propia carga util junto con `live_enabled: false`.
+
+**El fill ideal no es una simulacion aparte**: es el resultado real mas los
+costes que se le descontaron. Un segundo simulador introduciria una diferencia
+que vendria de la discrepancia entre modelos, no de la ejecucion.
+
+**Sin muestra, cero recomendaciones.** Una recomendacion es una llamada a la
+accion; emitirla sobre diez operaciones es peor que callarse.
+
+**La regla del proyecto intacta.** El motor no recibe proveedor de operaciones
+live, no conoce ningun broker y no tiene ruta de ejecucion. El invariante se
+expone en `status()` para poder verificarlo desde fuera, y un test de
+integracion comprueba que el guard anti-live sigue resolviendo a `paper`.
+
+**Archivos nuevos.** `app/execution/benchmark/{__init__,shadow}.py`,
+`app/dashboard/api/routes/benchmark.py`, `tests/unit/test_shadow_benchmark.py`,
+`tests/integration/test_shadow_benchmark_integration.py`.
+
+**Archivos modificados.** `app/config/settings.py`, `app/engine/bootstrap.py`,
+`app/dashboard/api/main.py`.
+
+**Tests.** 19 nuevos (14 unitarios + 5 integracion). Suite: **1295 en verde** en
+3.14 y en 3.12.10. Ruff, Black y MyPy strict limpios.
+
+
+## 2026-08-05 - Cierre de la tarea Edge Intelligence (bloques 1-15)
+
+**Categoria:** hito · **Tags:** `edge-intelligence` `cierre` `bloques-1-15`
+
+**Los 15 bloques implementados, con tests y documentacion.** De 991 tests al
+empezar a **1295**, verdes en 3.14 y en 3.12.10, con Ruff, Black y MyPy strict
+limpios en cada bloque antes de pasar al siguiente.
+
+**El hilo comun de las 15 decisiones.** Casi todos los bloques pedian producir
+un numero, y en casi todos el numero facil habria sido falso. La regla que
+gobierna el trabajo entero es la misma en los quince: **la ausencia de medicion
+no es un cero**. Aparece con distinta cara cada vez —`observable=False` en
+microestructura sin libro, `None` en la latencia no registrada, `missing` en las
+dimensiones de calidad de posicion, el carril live declarado ausente— y en todos
+los casos evita el mismo fallo: que alguien lea "0.0" y crea que se midio.
+
+**Tres bugs de diseno los encontraron los tests, no produccion.**
+1. **Lead-lag** reportaba liderazgo inventado entre series simultaneas (Bloque 5).
+2. **El IOC** ganaba siempre por un error de contabilidad, no por merito (Bloque 6).
+3. **El tope de exposicion se tragaba la reduccion de riesgo** por calidad de
+   dato, y la proteccion desaparecia justo en las operaciones mas grandes
+   (Bloque 11). En el mismo bloque, la media diluia las senales criticas y un
+   motor ciego quedaba escondido detras de siete senales sanas.
+
+**Dos cosas que el enunciado pedia y NO se hicieron, con su razon escrita.**
+- **SHAP** (Bloque 13): exigiria una dependencia binaria pesada que solo cubre
+  parte del catalogo de modelos, obligando a caer a otra metrica para el resto —
+  dos numeros distintos llamados igual. Se usa importancia por permutacion.
+- **Un test ADF de cointegracion** (Bloque 5): necesita tablas de valores
+  criticos, y fingir un p-valor seria peor que no darlo. Se reporta la vida media
+  del residuo, que es lo accionable.
+
+**Lo que queda inerte por falta de datos, y no por falta de codigo.** El Bloque 3
+entero (microestructura) no tiene con que alimentarse mientras el broker sea MT5,
+que no publica libro. Es codigo correcto esperando una decision de fuente de
+datos que no tomaba este bloque.
+
+**Live trading sigue deshabilitado.** Ningun bloque toco el guard, y el Bloque 15
+—el unico que roza el tema— expone el invariante para poder verificarlo desde
+fuera, con un test que comprueba que el modo resuelto sigue siendo `paper`.
+
+**ADRs nuevos:** 100 a 114. **Tests nuevos:** 304.

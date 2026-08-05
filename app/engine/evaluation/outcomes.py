@@ -40,6 +40,12 @@ class VirtualOutcome:
         false_signal: Si se movió en contra antes de avanzar a favor.
         opened_at: Momento de la señal.
         closed_at: Momento de la resolución.
+        confidence: Confianza que la estrategia declaró al emitir la señal.
+            Es lo que permite medir la deriva de confianza (Bloque 1): sin ella
+            no se puede distinguir una estrategia que empeora de una que además
+            se cree cada vez más segura. ``None`` en las filas escritas antes
+            del Bloque 1, que por eso quedan fuera de esa métrica en vez de
+            entrar con un valor inventado.
     """
 
     signal_id: str
@@ -54,6 +60,7 @@ class VirtualOutcome:
     false_signal: bool
     opened_at: datetime
     closed_at: datetime
+    confidence: float | None = None
 
     @property
     def holding_seconds(self) -> float:
@@ -76,6 +83,7 @@ class VirtualOutcome:
             "opened_at": self.opened_at.isoformat(),
             "closed_at": self.closed_at.isoformat(),
             "holding_seconds": self.holding_seconds,
+            "confidence": self.confidence,
         }
 
     @classmethod
@@ -93,6 +101,7 @@ class VirtualOutcome:
             ValueError: Si algún campo no se puede convertir.
         """
         target = data.get("target")
+        confidence = data.get("confidence")
         return cls(
             signal_id=str(data["signal_id"]),
             strategy=str(data.get("strategy", "")),
@@ -106,6 +115,7 @@ class VirtualOutcome:
             false_signal=bool(data.get("false_signal", False)),
             opened_at=datetime.fromisoformat(str(data["opened_at"])),
             closed_at=datetime.fromisoformat(str(data["closed_at"])),
+            confidence=None if confidence is None else float(confidence),
         )
 
 

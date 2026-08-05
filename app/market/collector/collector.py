@@ -9,7 +9,7 @@ el pipeline: validar → actualizar estado → agregar velas → reconstruir lib
 import asyncio
 import contextlib
 import logging
-from typing import Any
+from typing import Any, Protocol
 
 from app.core.events.bus import EventBus
 from app.core.events.events import PriceUpdated
@@ -48,6 +48,21 @@ from app.market.validator import DataValidator
 from app.utils.time import utc_now
 
 
+class BookObserver(Protocol):
+    """Observador de la dinámica del libro (lo implementa el Bloque 3).
+
+    Se declara aquí como Protocol para que la capa de mercado no importe el
+    motor de microestructura: el collector sólo sabe que hay algo a quien
+    avisar, y el composition root decide quién es.
+    """
+
+    def observe_delta(self, delta: OrderBookDelta, book: OrderBook | None = None) -> None:
+        """Record one incremental book update."""
+
+    def observe_trade(self, trade: Trade) -> None:
+        """Record one executed trade."""
+
+
 class TickCollector(Service):
     """Queue-decoupled processing pipeline for normalized market objects.
 
@@ -61,6 +76,7 @@ class TickCollector(Service):
         writer: Persistencia batched (``None`` = sin persistencia).
         metrics: Métricas del feed.
         queue_size: Capacidad de la cola de entrada.
+        book_observer: Observador de microestructura (Bloque 3), opcional.
     """
 
     def __init__(
@@ -76,6 +92,7 @@ class TickCollector(Service):
         metrics: FeedMetrics | None = None,
         queue_size: int = 100_000,
         aggregate_from_ticks: bool = False,
+        book_observer: "BookObserver | None" = None,
     ) -> None:
         super().__init__("collector")
         self._bus = bus
@@ -83,6 +100,10 @@ class TickCollector(Service):
         self._aggregator = aggregator
         self._aggregate_from_ticks = aggregate_from_ticks
         self._books = books
+        # Observador de microestructura (Bloque 3). Opcional y en el camino
+        # caliente: sólo se le pasan objetos ya validados, y lo que hace es
+        # aritmética sobre dicts. Si no está cableado, cero coste.
+        self._book_observer = book_observer
         self._market_state = state
         self._cache = cache
         self._writer = writer
@@ -200,6 +221,8 @@ class TickCollector(Service):
         self._metrics.tick(trade.symbol)
         self._metrics.data_latency.observe(trade.latency_ms)
         self._market_state.update_trade(trade)
+        if self._book_observer is not None:
+            self._book_observer.observe_trade(trade)
         if self._writer is not None:
             self._writer.add_trade(trade)
         await self._cache.set_last_price(trade.symbol, trade.price, "trade")
@@ -284,6 +307,8 @@ class TickCollector(Service):
             return
         if book is None:
             return
+        if self._book_observer is not None:
+            self._book_observer.observe_delta(delta, book)
         self._market_state.update_book(book)
         await self._cache.set_orderbook(book)
         await self._publish(_book_event(book))

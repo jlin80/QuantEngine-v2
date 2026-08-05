@@ -102,3 +102,47 @@ async def ml_drift_check(request: Request) -> dict[str, Any]:
 async def ml_meta_evaluate(request: Request) -> dict[str, Any]:
     """Ciclo de gobierno del Meta Strategy Manager (ajusta pesos/activación)."""
     return await _engine(request).run_meta_evaluation()
+
+
+# ---------------------------------------------------------------------------
+# Calibración de la confianza (Bloque 10)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/ml/calibration")
+async def ml_calibration(request: Request) -> dict[str, Any]:
+    """Último diagnóstico de calibración (sin recalcular)."""
+    return _engine(request).calibration.status()
+
+
+@router.post("/ml/calibration/run")
+async def ml_calibration_run(request: Request) -> dict[str, Any]:
+    """Mide si la confianza declarada se cumplió, y devuelve la corrección.
+
+    La corrección **no se aplica sola**: se expone para que quien la consuma
+    decida. Una capa que corrigiera en silencio su propia entrada haría
+    imposible saber si el modelo mejoró o si sólo se le está tapando el error.
+    """
+    return _engine(request).run_calibration().to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Importancia de features (Bloque 13)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/ml/importance")
+async def ml_importance(request: Request) -> dict[str, Any]:
+    """Última medición de importancia de features (sin recalcular)."""
+    return _engine(request).importance.status()
+
+
+@router.post("/ml/importance/run")
+async def ml_importance_run(request: Request) -> dict[str, Any]:
+    """Mide la importancia actual de cada feature y su decaimiento.
+
+    El método es **permutación**, no SHAP: agnóstico del modelo y aplicable a
+    todo el catálogo por igual (ADR-112). La importancia nativa del modelo viaja
+    aparte, en su propio campo, porque mide otra cosa.
+    """
+    return _engine(request).run_importance().to_dict()

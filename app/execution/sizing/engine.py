@@ -68,6 +68,7 @@ class PositionSizer:
         win_rate: float | None = None,
         reward_risk: float | None = None,
         spec: InstrumentSpec | None = None,
+        risk_multiplier: float = 1.0,
     ) -> SizingResult:
         """Compute the position quantity.
 
@@ -79,6 +80,13 @@ class PositionSizer:
             win_rate: Tasa de acierto histórica (para Kelly).
             reward_risk: Relación beneficio/riesgo (para Kelly).
             spec: Contrato del símbolo. Sin él se asume 1 lote = 1 unidad (paper).
+            risk_multiplier: Reductor externo de exposición, en ``(0, 1]``
+                (Bloque 11: calidad del dato). Se aplica **después** de los
+                topes y **antes** del redondeo a lotes: así reducir riesgo puede
+                dejar la operación por debajo del lote mínimo y rechazarse
+                limpio, que es el comportamiento correcto — si el dato no es
+                fiable y el tamaño reducido ya no cabe, no se opera. Nunca
+                puede aumentar el tamaño: valores por encima de 1.0 se acotan.
 
         Returns:
             Cantidad en lotes y su justificación (0 si no es posible dimensionar).
@@ -109,7 +117,13 @@ class PositionSizer:
         else:  # fixed_risk | atr (ambos = riesgo fijo sobre la distancia de stop)
             quantity, risk_amount, reason = self._risk_based(equity, stop_distance, confidence=1.0)
 
-        units = self._apply_caps(quantity, equity, price)
+        # El reductor externo entra DESPUÉS de los topes, y el orden importa:
+        # aplicado antes, un tope que ya estuviera mordiendo se lo tragaba
+        # entero —reducir a la mitad una cantidad que el tope iba a recortar
+        # igualmente no reduce nada— y la protección desaparecía justo en las
+        # operaciones más grandes, que son las que más importan. Acotado por
+        # arriba a 1.0: subir tamaño por aquí sería una puerta trasera al sizing.
+        units = self._apply_caps(quantity, equity, price) * max(0.0, min(1.0, risk_multiplier))
         if units < self._settings.min_quantity:
             return SizingResult(
                 0.0, method, risk_amount, stop_distance, 0.0, "bajo la cantidad mínima"

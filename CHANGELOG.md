@@ -41,6 +41,107 @@ versionado [SemVer](https://semver.org/lang/es/).
   redis-py) y un `noqa: BLE001` inútil en `app/market/feed/feed.py`.
 
 ### Added
+- **Edge Research Engine (Bloque 1, Edge Intelligence).** Motor nuevo
+  (`app/engine/edge_research/`) que mide la **salud** del edge de cada
+  estrategia: edge decay, half-life, stability score, edge persistence, PF /
+  expectancy / Sharpe / Sortino / drawdown rodantes y confidence drift. Mide
+  sobre ventana rodante troceada en bloques, no sobre el acumulado: el acumulado
+  no olvida, y una estrategia que dejó de funcionar sigue presentando buen
+  aspecto durante semanas. Emite `EdgeReportGenerated` y `EdgeDecayDetected`
+  (sólo en la transición a deterioro), persiste histórico append-only en
+  `data/performance/edge_reports.jsonl`, expone `/api/edge/*` y alimenta al Meta
+  Strategy Manager como **freno** del peso — nunca lo sube ni desactiva por sí
+  solo (ADR-100). No opera y no puede habilitar live.
+- **Edge Attribution Engine (Bloque 2).** `app/engine/attribution/` explica cada
+  operación cerrada por los factores presentes al decidirla — estrategia,
+  liquidez, order flow (delta/CVD/book pressure/imbalance), sesión, régimen,
+  volatilidad, VWAP, momentum, ML y confirmaciones. Mide **asociación histórica
+  por bucket, no causa**: reporta siempre el residuo, descarta buckets sin
+  muestra y lleva el aviso en el propio JSON (ADR-101). Captura desde el Event
+  Bus para no cargar el camino caliente, con el desfase medido en `lag_seconds`.
+  Endpoints `/api/attribution/*` como backend del panel del dashboard.
+- **Microstructure Engine (Bloque 3).** `app/engine/microstructure/` mide la
+  dinámica interna del libro — queue imbalance, cola por delante, arrival/cancel
+  rate, resiliencia, reposición, consumo de liquidez, impacto estimado y presión
+  de ejecución — desde los deltas incrementales y las operaciones. **Declara la
+  ausencia en vez de rellenarla**: sin libro del proveedor (el caso de MT5)
+  reporta `observable=false` con su motivo y todas las métricas en `null`
+  (ADR-102). Entra al Feature Store como features normales y al Decision Engine
+  como filtro **fail-open**. Endpoints `/api/microstructure/*`.
+- **Regime Forecast Engine (Bloque 4).** `app/engine/regime_forecast/` pronostica
+  el próximo desenlace (continuación, reversión, ruptura, compresión, expansión)
+  por frecuencia condicional empírica, y **se puntúa a sí mismo** con Brier
+  multiclase contra el pronóstico trivial. `skill` viaja en el evento del bus, y
+  se publica aunque sea negativo (ADR-103). Sin muestra declara ignorancia en vez
+  de repartir a partes iguales. Endpoints `/api/forecast/*`.
+- **Correlation Intelligence (Bloque 5).** `app/engine/correlation/` mide
+  correlación rodante y dinámica (EWMA), lead-lag, ratio de cobertura y vida
+  media del residuo, liderazgo de mercado, correlación por sesión e influencia
+  cruzada. **Sin fingir un test ADF**: reporta la vida media del residuo, que es
+  lo accionable (ADR-104). El filtro de correlación suma lo medido a los grupos
+  declarados a mano, sin sustituirlos. Endpoints `/api/correlation/*`.
+- **Execution Optimizer (Bloque 6).** `app/execution/optimizer/` compara IOC,
+  LIMIT y MARKET antes de ejecutar: slippage y latencia esperados, probabilidad
+  de llenado, coste total y score de calidad. La pieza que lo hace útil es el
+  **coste de no ejecutar** — sin él LIMIT gana siempre (ADR-105). Cotiza y
+  explica la elección con las alternativas descartadas; **todavía no rutea**.
+  Endpoint `/api/optimizer/plan`.
+- **Position Quality Engine (Bloque 7).** `app/engine/position_quality/` puntúa
+  la **posición** que saldría de una decisión (setup, ejecución, riesgo,
+  liquidez, contexto, coste) y **puede vetarla**, apareciendo en la explicación
+  de la decisión. Las dimensiones no observables se declaran en vez de contar
+  como cero, y por debajo del mínimo de evidencia no bloquea: no se veta por
+  ignorancia (ADR-106).
+- **Portfolio Intelligence (Bloque 8).** `app/portfolio/` desglosa el PnL
+  realizado por símbolo, estrategia, sesión y régimen, con heatmap
+  símbolo×estrategia, concentración de Herfindahl y "apuestas efectivas". Cuotas
+  medidas sobre el PnL positivo, grupos perdedores que no suman concentración, y
+  cada contribución con su muestra para que una racha no se lea como mérito
+  (ADR-107). Endpoints `/api/portfolio/*`.
+- **Cost Attribution Engine (Bloque 9).** `app/execution/costs/` separa el bruto
+  del neto y de cada coste: comisiones, slippage, spread, latencia (declarada
+  **no medida**), residuo y coste de oportunidad — este último medido con las
+  señales que nunca llegaron a operación (ADR-108). Informe total y diario, con
+  notas que dicen qué no se está midiendo. Endpoints `/api/costs/*`.
+- **Confidence Calibration Engine (Bloque 10).** `app/ml/calibration/` mide si la
+  confianza declarada se cumple: curva de calibración, diagrama de fiabilidad,
+  ECE, Brier, sesgo con signo y sobre/infraconfianza separadas. Devuelve una
+  corrección **acotada** que no se aplica sola (ADR-109). Expuesto en
+  `/api/ml/calibration` y en `MLEngine.calibration`.
+- **Data Quality Engine (Bloque 11).** `app/monitoring/data_quality*.py` mide
+  ocho señales de salud del dato (feed, packet loss, ticks, libro, datos
+  ausentes, deriva de timestamps, deriva de reloj, lag) y las convierte en un
+  **multiplicador de exposición** que el sizing aplica de verdad. Señales
+  críticas que degradan por sí solas, suelo que nunca llega a 0 y alarma en
+  ambas transiciones (ADR-110). Endpoints `/api/quality/*`.
+- **Meta Risk Engine (Bloque 12).** `app/monitoring/meta_risk.py` mide la salud
+  de la infraestructura (CPU, RAM, event loop, bus, Redis, bróker, MT5,
+  exchange, API, scheduler, cache) y la **compone con la calidad del dato por
+  producto** en el multiplicador que la ejecución aplica (ADR-111). Zona de
+  confort en los recursos, componentes críticos que degradan por sí solos, y los
+  no reportados declarados como no observables. Endpoints `/api/quality/meta-risk`.
+- **Feature Importance Tracker (Bloque 13).** `app/ml/importance/` mide la
+  importancia de cada feature por **permutación** (no SHAP, razonado en
+  ADR-112), con histórica, actual, cambio y decaimiento. La importancia nativa
+  del modelo viaja en su propio campo porque mide otra cosa. Endpoints
+  `/api/ml/importance`.
+- **Why Not Trade Engine (Bloque 14).** `app/engine/rejections/` registra cada
+  decisión con su desglose: score inicial y final, cada umbral con su déficit,
+  cada filtro con su veto, razón principal y evidencia. Los filtros se registran
+  como lo que son —binarios, no penalizaciones (ADR-113)— y las evaluaciones sin
+  señal se cuentan sin guardarse. Endpoints `/api/rejections/*`, con resumen que
+  separa "bloqueó" de "fue el único que bloqueó".
+- **Live Shadow Benchmark (Bloque 15).** `app/execution/benchmark/` compara paper
+  contra el fill ideal y **declara el carril live como ausente**, con su motivo.
+  `fill_difference_bps` es `null`, no cero, y el informe dice en su propia carga
+  útil que el gap medido es una **línea base** y no una medición independiente
+  (ADR-114). Live trading sigue deshabilitado: el bloque no lo habilita ni lo
+  prepara, y hay un test que lo verifica. Endpoints `/api/benchmark/*`.
+- `VirtualOutcome.confidence`: la confianza declarada por la señal viaja hasta el
+  resultado virtual, que es lo que permite medir la deriva de confianza. Las
+  filas anteriores quedan con `None` y fuera de esa métrica, no rellenadas.
+
+### Added
 - **Informe de order flow nativo (Bloque 9)** en `docs/orderflow_nativo.md`. La
   auditoría corrige el diagnóstico previo: con MT5 el order flow no está
   *aproximado*, está **ausente** (el proveedor no expone `ORDERBOOK` y nunca

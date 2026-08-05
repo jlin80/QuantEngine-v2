@@ -2364,3 +2364,708 @@ los snapshots y el codigo que no lo pase se comportan exactamente como antes —
 hay tests que lo fijan. El historial de oro anterior (194 operaciones del 23 al
 27/07) sigue teniendo el PnL mal escrito y **no se reescribe**: pertenece a la
 era `pre_contract_size`, ya excluida del entrenamiento con peso 0.0.
+
+## ADR-100 · La salud del edge se mide sobre ventana rodante, y solo frena
+
+**Contexto.** El evaluador continuo (Fase 4) y el Trade Journal (Fase 5)
+responden la misma pregunta con dos fuentes: *cuanto gana esta estrategia*.
+Ninguno responde la que importa despues de meses en paper: *sigue ganando lo
+mismo que ganaba*. Ambos agregan sin olvidar, y un acumulado no distingue una
+estrategia sana de una que murio hace tres semanas — el peso muerto de los
+primeros cientos de operaciones tapa el deterioro durante mucho tiempo.
+
+**Decision.** El Edge Research Engine (Bloque 1) mide sobre una **ventana
+rodante** por estrategia (300 resoluciones por defecto), troceada en bloques
+contiguos, y reporta tanto nivel (expectancy, PF, Sharpe, Sortino, drawdown)
+como **pendiente** (edge decay, half-life, stability, persistence, confidence
+drift). Cuatro consecuencias deliberadas:
+
+1. **`None` no es 0.0.** Toda metrica no medible viaja como `None` hasta el
+   JSON. Colapsarla a cero es como un consumidor acaba penalizando a una
+   estrategia por no tener datos, que es el error opuesto al que se quiere
+   evitar.
+2. **`degrading` exige dos motivos concurrentes.** Con muestras de decenas de
+   resoluciones, una sola metrica fuera de rango es ruido. Un motivo solo deja
+   la estrategia en `watch`.
+3. **La alarma se emite en la transicion, no en cada ciclo.** `EdgeDecayDetected`
+   se publica al *entrar* en deterioro. Reanunciarlo cada 15 minutos convierte
+   la alarma en ruido de fondo, que es como se dejan de leer las alarmas.
+4. **Solo frena, nunca empuja.** El multiplicador que consume el Meta Strategy
+   Manager vive en `[factor_floor, 1.0]`: amortigua el peso objetivo de una
+   estrategia cuyo edge se deteriora, **nunca lo sube**, y **nunca desactiva**.
+   Desactivar sigue exigiendo muestra ejecutada (`_is_degraded`). Sin muestra
+   suficiente el multiplicador es exactamente 1.0: sin evidencia no se penaliza
+   a nadie, o toda estrategia recien promovida quedaria apagada antes de poder
+   demostrar nada.
+
+**Half-life es lineal a proposito.** Se extrapola la pendiente medida, no se
+ajusta una exponencial: con decenas o cientos de operaciones por estrategia, la
+exponencial le daria a la cifra una precision que la muestra no tiene. Es una
+alarma de orden de magnitud.
+
+**Sharpe y Sortino no se anualizan.** Anualizar exige una frecuencia de
+operacion estable y en scalping la frecuencia depende del regimen. Un numero
+por operacion es comparable entre estrategias sin inventarse esa estabilidad.
+
+**Fuente y acoplamiento.** El motor lee las resoluciones ya escritas por el
+evaluador continuo, y recibe el `load` del store como callable — no el store —
+para que el mismo motor sirva sobre el historico de un backtest. La capa de ML
+no importa `app.engine.edge_research`: el composition root adapta el informe a
+`EdgeHealthStats`, mismo patron que `VirtualStrategyStats` (Fase 7).
+
+**Confianza en el resultado virtual.** `VirtualOutcome` gana `confidence`. Sin
+ella no se puede distinguir una estrategia que empeora de una que ademas se cree
+cada vez mas segura — que es la definicion util de sobreconfianza y la entrada
+natural del Bloque 10. Las filas escritas antes quedan con `None` y salen de esa
+metrica en vez de entrar con un valor inventado.
+
+**Riesgos conocidos.** (a) La ingesta relee el JSONL completo en cada ciclo y
+deduplica por `signal_id` con una ventana acotada (`seen_limit`): con ficheros
+muy grandes el coste crece linealmente, y si el fichero llegara a superar esa
+ventana la deduplicacion dejaria de ser total. Es aceptable a la cadencia actual
+(un ciclo cada 15 min) y esta acotado por configuracion, pero es la primera
+pieza a revisar si el store crece de orden. (b) El resumen 0-100 mezcla cuatro
+dimensiones con pesos que son un juicio, no una medida; por eso son
+configurables y por eso el informe conserva siempre las metricas individuales y
+las razones que produjeron el estado.
+
+## ADR-101 · La atribucion mide asociacion, reporta su residuo, y lo dice en el JSON
+
+**Contexto.** El Bloque 2 pide explicar por que gano o perdio cada operacion,
+con contribucion por estrategia, liquidez, order flow, sesion, regimen,
+volatilidad, VWAP, momentum, delta, CVD, ML y confirmaciones. La tentacion
+evidente es producir una descomposicion aditiva del resultado. Seria falso: los
+factores estan correlacionados entre si (el spread se ensancha cuando la
+volatilidad sube, el delta acompana al momentum), y una sola operacion no
+contiene evidencia causal de nada.
+
+**Decision.** Se mide **asociacion historica por bucket**: cada factor se trocea
+en terciles (los continuos) o por etiqueta observada (los categoricos), se
+calcula la R media de cada bucket, y el `lift` es esa media menos la global.
+Explicar una operacion es decir en que bucket cayo y cuanto ha rendido
+historicamente ese bucket. Cuatro consecuencias:
+
+1. **El residuo se reporta siempre.** `residual_r = R - baseline - suma(lifts)`.
+   Un residuo grande significa que la explicacion no explica. Ocultarlo
+   convertiria el informe en una narracion, que siempre suena convincente.
+2. **El aviso viaja en la carga util**, no solo en esta ADR: el campo `caveat`
+   del JSON dice "asociacion historica, no causa". El informe se lee en un
+   dashboard, fuera del contexto de la documentacion.
+3. **Los buckets pequenos se descartan** (`min_bucket`). Una etiqueta con dos
+   operaciones produce un lift enorme y sin significado, y en un ranking por
+   magnitud esa fila sube arriba del todo justo por ser ruido.
+4. **Los factores constantes se descartan.** Un factor sin variacion no
+   discrimina; trocearlo produce buckets vacios con lift 0 que ensucian.
+
+**Donde se captura y por que ahi.** La foto de factores se toma desde el Event
+Bus, suscrita a `DecisionGenerated`, no dentro del Decision Engine. El motor de
+decision esta en el camino caliente y no puede pagar lecturas extra del Feature
+Store por cada evaluacion de cada simbolo. El precio es un desfase de hasta el
+TTL del Feature Store (1 s) entre decidir y fotografiar; se **mide** en el campo
+`lag_seconds` de cada fila en vez de fingir simultaneidad.
+
+**El join declara sus huecos.** `join_breakdown` separa "sin `decision_id`"
+(trade adoptado del broker o anterior a la trazabilidad) de "sin foto"
+(decision anterior a este bloque o captura fallida). Son problemas distintos y
+agregarlos escondería cual de los dos duele. `matched` frente a `trades` dice de
+que fraccion de las operaciones habla realmente el informe.
+
+**Persistencia y memoria.** El store retiene las fotos recientes en memoria
+**aunque el disco este desactivado**: sin eso, apagar `persist_snapshots` dejaba
+al motor sin nada que unir y el informe salia vacio sin decir por que. Un ajuste
+de I/O no puede apagar en silencio una funcionalidad entera.
+
+**Riesgos conocidos.** (a) El buffer de decisiones del `SignalHistoryStore` es
+acotado: si una decision rota antes de que llegue su evento, la foto se toma
+igual pero sin el desglose de confianza ni el contexto (quedan `None`/`unknown`),
+no se pierde la fila. (b) Los terciles se recalculan en cada ciclo, asi que los
+cortes se mueven con la muestra; se guardan junto al agregado para que explicar
+una operacion use exactamente los cortes con los que se midio.
+
+## ADR-102 · La microestructura no se estima cuando no hay libro: se declara ausente
+
+**Contexto.** El Bloque 3 pide queue imbalance, queue estimation, order arrival
+rate, cancel rate, book resiliency, replenishment, liquidity consumption, market
+impact y execution pressure. Todas se derivan del **libro de ordenes
+incremental**. `docs/orderflow_nativo.md` ya midio el hecho incomodo: con MT5
+—el broker de la demo— el order flow no esta aproximado, esta **ausente**; el
+proveedor no expone `ORDERBOOK` y nunca emite `Trade`.
+
+**Decision.** El motor se implementa completo contra el libro incremental que
+los proveedores nativos (Binance/Bybit/OKX, Fase 2) si publican, y **declara la
+ausencia en vez de rellenarla**. `MicrostructureSnapshot` lleva `observable` y
+`reason`; cuando no es observable, **todas** las metricas son `None`. Un
+`queue_imbalance` de 0.0 fabricado es indistinguible de un libro perfectamente
+equilibrado, y alimentaria al Decision Engine con una lectura que nadie tomo.
+
+**Deltas, no snapshots.** La diferencia entre "el nivel bajo de 10 a 4" por
+cancelacion y por ejecucion solo existe viendo los deltas y las operaciones por
+separado; con snapshots periodicos ambos casos son la misma resta. Por eso
+`cancel_rate` se calcula como *retirado menos ejecutado*, y por eso el motor
+necesita tambien el flujo de `Trade`.
+
+**Un resync no es una avalancha de ordenes.** Un `is_snapshot` reinicia el
+estado de niveles en vez de contarse como altas masivas. Sin esa regla, cada
+perdida de conexion dispararia el `arrival_rate` justo cuando lo que ha pasado
+es que el motor se quedo ciego — la clase de metrica que miente en el peor
+momento posible.
+
+**Impacto de mercado: `None` antes que extrapolar.** Si el libro visible no
+cubre el nocional de referencia, `market_impact_bps` es `None`. Extrapolar mas
+alla del ultimo nivel publicado seria inventarse profundidad que nadie mostro.
+El nocional es fijo y configurable, no el tamano real de la orden: asi la serie
+es comparable en el tiempo aunque el sizing cambie.
+
+**Integracion con el Decision Engine: fail-open.** El `MicrostructureFilter`
+veta solo con una presion de ejecucion **medida** por encima del umbral. Sin
+medicion deja pasar. Un filtro que bloquea por ausencia de datos apagaria el
+motor entero con el broker actual, y lo haria de la forma mas dificil de
+diagnosticar: sin errores, solo sin operaciones. Ademas, si el motor no esta
+cableado el filtro **no entra en la cadena** — no es lo mismo que estar dentro y
+pasar siempre: fuera ni siquiera aparece en la explicacion de la decision.
+
+**Acoplamiento.** El collector conoce un `Protocol` (`BookObserver`), no el
+motor: la capa de mercado no importa `app.engine`. Las features se registran
+desde fuera del `FeatureStore`, para que ni el store conozca el motor ni el
+motor conozca al store. El composition root los junta.
+
+**Riesgos conocidos.** (a) Con MT5 todo el bloque queda inerte por diseno: es
+codigo correcto sin datos que lo alimenten, y solo cobra valor si se decide
+alimentar los indicadores desde un feed nativo (decision abierta desde el
+informe de order flow). (b) El desfase de timestamps entre el feed de libro y el
+de operaciones puede producir una resta negativa; se acota a cero, lo que
+subestima ligeramente la cancelacion en esos instantes.
+
+## ADR-103 · El pronostico de regimen vale lo que valga su Brier contra el trivial
+
+**Contexto.** El Bloque 4 pide pasar de detectar regimen a **pronosticarlo**:
+probabilidad de continuacion, reversion, ruptura, compresion y expansion. Son dos
+problemas de naturaleza distinta: la deteccion se observa, el pronostico se
+apuesta. Un motor que produce cinco probabilidades bonitas y no se puntua a si
+mismo es una opinion con decimales.
+
+**Decision — metodo simple, validacion dura.** Frecuencia condicional empirica:
+la condicion es `regimen|volatilidad`, y el pronostico es lo que historicamente
+paso desde esa misma condicion. Nada de HMM ni Markov ajustado: con la muestra
+de este proyecto un modelo mas rico da parametros peor estimados y un numero mas
+dificil de auditar. Lo que sostiene el bloque es la validacion:
+
+1. **Todo pronostico se guarda, se resuelve y se puntua** con Brier multiclase.
+2. **Contra el pronostico trivial** (la distribucion global). Un Brier de 0.6 no
+   dice nada hasta saber que el trivial saca 0.7. De ahi `skill = 1 - brier/base`.
+3. **Skill negativo se publica igual**, y viaja en el evento del bus. Es la senal
+   de que este pronostico no vale para decidir; esconderla seria peor que no
+   tener pronostico.
+
+**Sin muestra no se reparte a partes iguales.** Con menos observaciones que el
+minimo, `observable=False` y `probabilities` vacio. Un reparto uniforme *parece*
+un pronostico y no lo es.
+
+**Suavizado de Laplace, no ceros.** Un desenlace nunca visto con probabilidad 0
+significa afirmar que algo es imposible por no haberlo visto en unos cientos de
+observaciones — y el Brier lo castigaria al maximo la primera vez que ocurriera.
+
+**Confianza != acierto.** `confidence` mide cuanta evidencia hay detras y satura
+con la muestra; si el pronostico acierta lo dice el Brier. Confundir ambas es el
+error clasico de este tipo de motores, y por eso son campos separados con
+docstrings que lo dicen.
+
+**Orden del ciclo.** Primero resolver los pendientes, despues emitir los nuevos.
+Al reves, el pronostico recien emitido entraria en su propia validacion.
+
+**Aprender del historico no es lookahead.** El bootstrap clasifica cada desenlace
+con velas **estrictamente posteriores** a su ancla. La condicion, en cambio, se
+toma constante en la serie: el detector clasifica el estado actual, y
+reconstruirlo hacia atras exigiria re-detectar con datos que en su momento no
+existian — eso si seria lookahead disfrazado de backfill. La contrapartida es que
+las observaciones sembradas atribuyen a toda la serie la condicion de su final;
+queda escrito como sesgo conocido del bootstrap.
+
+**Riesgos conocidos.** (a) El sesgo del bootstrap recien descrito: la muestra
+inicial es mas ruidosa que la que el motor acumula despues en vivo, donde cada
+condicion se registra en su momento. (b) La clasificacion de desenlaces usa
+umbrales fijos (1.5x y 0.5x el rango previo) que no estan calibrados por
+simbolo; son un punto de partida razonable, no una medida.
+
+## ADR-104 · Correlacion medida sobre rendimientos, y sin fingir un test de cointegracion
+
+**Contexto.** El filtro de correlacion vetaba por **grupos declarados a mano** en
+configuracion. Un grupo escrito hace meses envejece: dos simbolos pueden dejar
+de moverse juntos, o empezar a hacerlo, y nadie toca el fichero. El Bloque 5
+pide medir lead-lag, cointegracion, correlacion dinamica y rodante, liderazgo,
+correlacion por sesion e influencia cruzada.
+
+**Decision 1 — rendimientos, no precios.** Toda la estadistica trabaja sobre
+rendimientos. Dos precios que suben dan correlacion alta aunque no tengan nada
+que ver: la tendencia comun domina el calculo.
+
+**Decision 2 — no hay test ADF, y se dice.** Un contraste de cointegracion
+necesita tablas de valores criticos; fingir un p-valor seria peor que no darlo.
+En su lugar se calcula el **ratio de cobertura por minimos cuadrados y la vida
+media del residuo**: si el residuo revierte rapido, el par se comporta como
+cointegrado. `residual_half_life` es `None` cuando **no** revierte — la
+respuesta util para descartar un par; un numero enorme sugeriria una reversion
+lentisima en vez de ninguna.
+
+**Decision 3 — los empates de lead-lag los gana el lag menor.** Una serie
+periodica correlaciona igual de bien consigo misma a lag 0 y a un multiplo de su
+periodo. Sin regla de desempate, el **orden de iteracion** decidia quien lidera y
+el motor reportaba liderazgo inventado entre series simultaneas. Se detecto con
+un test y se corrigio: ante la misma evidencia, la explicacion mas simple es que
+se mueven a la vez.
+
+**Decision 4 — el filtro suma, no sustituye.** `CorrelationFilter` une los grupos
+manuales con lo medido. La regla escrita a mano sigue siendo regla dura; la
+medicion anade lo que el mercado esta haciendo de verdad. Sin motor cableado, el
+filtro se comporta **exactamente** como antes de este bloque.
+
+**Correlacion inversa cuenta como correlacion.** Para el filtro, moverse al
+reves concentra la exposicion igual que moverse igual, asi que el umbral se
+aplica sobre el valor absoluto.
+
+**Los pares no medibles se declaran.** `skipped` dice cuales y por que. Un
+informe de correlacion que omite en silencio la mitad de los pares invita a
+concluir que el resto no esta correlacionado.
+
+**Riesgos conocidos.** (a) La correlacion por sesion trocea la misma ventana, asi
+que con pocas velas por sesion la muestra de cada bucket cae por debajo del
+minimo y esa sesion no aparece — es correcto, pero puede dar la impresion de que
+solo existen las sesiones activas. (b) `min_correlation` es un umbral afirmado,
+no derivado de la distribucion observada de correlaciones del universo.
+
+## ADR-105 · El optimizador de ejecucion vale lo que valga su coste de NO ejecutar
+
+**Contexto.** El Bloque 6 pide comparar IOC, LIMIT y MARKET antes de ejecutar,
+estimando slippage, latencia, probabilidad de llenado, coste y calidad, y elegir
+automaticamente. La comparacion tiene una trampa evidente: si solo se suman los
+costes de ejecutar, **LIMIT gana siempre** —no paga spread, incluso lo cobra, y
+no sufre slippage— y el optimizador se convierte en una maquina de no operar.
+
+**Decision — el coste de no ejecutar es un termino de primera clase.**
+`expected_cost = coste_directo x P(llenado) + (1 - P(llenado)) x coste_de_fallar`.
+El `miss_cost_bps` se escala con una `urgency` 0-1, de modo que el mismo motor
+sirve a una salida de emergencia y a una entrada oportunista. Se declara como lo
+que es: **una politica, no una medida**. Nadie ha medido cuanto vale la operacion
+que no se abre; el parametro hace explicita esa decision en vez de esconderla en
+un umbral.
+
+**Error de modelado corregido durante el desarrollo.** La primera version daba a
+IOC el spread a favor (como un pasivo) *y* alta probabilidad de llenado (como un
+agresivo). Con esas dos ventajas ganaba siempre, por contabilidad y no por
+merito. Un optimizador que elige por un error de contabilidad es peor que no
+tener optimizador. Corregido: **IOC cruza el spread y sufre slippage igual que
+MARKET**; lo que lo distingue es que puede quedarse a medias, no que sea barato.
+
+**Reutiliza los motores de la Fase 5.** Slippage y latencia salen de
+`SlippageEngine` y `LatencyEngine` en vez de duplicar el modelo. Si optimizar y
+simular usaran modelos distintos, el optimizador estaria eligiendo para un
+mercado que el simulador no vive, y la discrepancia solo se veria en live.
+
+**La probabilidad de llenado no se inventa sin libro.** El desequilibrio de cola
+(Bloque 3) corrige la base solo cuando **es observable**. Sin libro —MT5— se
+queda en la base configurada. Es justo el escenario donde un optimizador
+demasiado confiado empieza a preferir limites que nunca se llenan.
+
+**Los empates los gana MARKET.** Ante coste esperado igual, la tactica que si
+ejecuta es la que cumple la decision que el motor ya tomo.
+
+**Las descartadas viajan con la elegida.** Sin ellas, "se eligio MARKET" no se
+puede auditar: no se sabe por cuanto gano ni frente a que.
+
+**Riesgos conocidos.** (a) `limit_fill_base` e `ioc_fill_base` son priors
+afirmados, no medidos contra fills reales; el Bloque 15 (Live Shadow Benchmark)
+es el que puede convertirlos en medidas. (b) El optimizador **cotiza pero
+todavia no rutea**: el Execution Engine sigue mandando MARKET. Cablear la
+eleccion al envio real toca la Fase 5 y cambia el comportamiento de ejecucion,
+asi que se deja explicitamente fuera de este bloque.
+
+## ADR-106 · La calidad de la posicion es un veto aparte, y nunca bloquea por ignorancia
+
+**Contexto.** El Bloque 7 pide un score independiente que evalue setup,
+ejecucion, riesgo, liquidez, contexto y coste esperado, **y que pueda bloquear
+operaciones**. La tentacion es meterlo como un factor mas del score de decision.
+Seria un error conceptual: el score mide la **oportunidad**, esto mide la
+**posicion** que saldria de ella. Una senal excelente en un mercado sin liquidez,
+con el coste de entrada comiendose la mitad de la R esperada, es una mala
+posicion aunque sea una buena senal.
+
+**Decision 1 — motor propio, materializado como filtro.** Como filtro, el veto
+aparece en la explicacion de la decision con su motivo, que es la unica forma de
+auditar despues por que no se opero. Como factor del score, se diluiria en una
+media y nadie sabria que fue la calidad lo que lo paro.
+
+**Decision 2 — las dimensiones ausentes no valen cero.** Cada una entra al
+promedio solo si es observable; las demas se reportan en `missing` con su
+motivo. Un cero dice "es malo" y la ausencia dice "no se sabe", y promediar la
+segunda como la primera bloquea operaciones por ignorancia.
+
+**Decision 3 — fail-open por debajo del minimo de evidencia.** Con menos
+dimensiones observables que `min_dimensions`, **no se bloquea**: se declara. Con
+el broker actual —sin libro, sin coste estimado en algunos simbolos— bloquear
+ahi apagaria el motor sin que ningun log dijera nada raro.
+
+**Decision 4 — suelos por dimension.** Promediar deja que una liquidez pesima se
+esconda detras de un setup excelente, y esa es justo la posicion que duele. Una
+dimension por debajo de su suelo puede vetar aunque la media salve. Cuando el
+suelo no veta (configurable), el aviso viaja igual en `reasons`: "paso, pero la
+liquidez esta al limite" es informacion, y solo se ve si se conserva.
+
+**El coste se juzga contra la R esperada.** 8 bps son baratos para una operacion
+de 3 R y carisimos para una de 0.2 R. Sin `expected_r` se cae a un techo
+absoluto — peor comparacion, pero no se inventa la R que nadie ha estimado.
+
+**Estado real del cableado.** El lector de entradas (coste esperado, R esperada,
+riesgo propuesto y su techo) **no esta cableado todavia**: el coste vive en la
+capa de ejecucion (Bloque 6) y el riesgo en el Risk Manager, y ninguno se conoce
+en el momento en que corre la cadena de filtros. Hoy, por tanto, esas tres
+dimensiones quedan como no observables y el filtro no bloquea por ellas. Es el
+comportamiento correcto, no una degradacion silenciosa, y esta cubierto por un
+test — pero conviene saber que el veto opera hoy con la mitad de su informacion.
+
+**Riesgos conocidos.** Los pesos y los suelos son juicios, no medidas. El Bloque
+2 (atribucion) es el que puede decir con evidencia cuales de estas dimensiones
+se asocian de verdad con el resultado, y recalibrarlos entonces.
+
+## ADR-107 · El desglose del PnL mide de donde SALIO el dinero, no donde esta el riesgo
+
+**Contexto.** El Bloque 8 pide analizar continuamente la fuente del PnL y su
+contribucion por simbolo, estrategia, sesion y regimen, mas heatmap de riesgo,
+concentracion y diversificacion. Un +3% mensual agregado no dice si viene de
+cuatro estrategias por igual o de una racha de un simbolo en una sesion.
+
+**Decision 1 — dos avisos que gobiernan la lectura, y viajan en el JSON.**
+(a) Esto mide **PnL realizado, no exposicion viva**: un portfolio con el PnL
+perfectamente repartido puede tener todo el riesgo abierto en un solo simbolo.
+(b) Una contribucion alta **no es una virtud**: puede ser una racha. Por eso cada
+contribucion lleva su numero de operaciones, su expectativa en R y su win rate.
+
+**Decision 2 — las cuotas se miden contra el PnL positivo, no contra el neto.**
+Con ganancias y perdidas mezcladas, la suma neta puede acercarse a cero y las
+cuotas se disparan a cifras absurdas o cambian de signo. Sobre el positivo,
+"aporto el 40% de lo que se gano" siempre significa lo mismo.
+
+**Decision 3 — un grupo que pierde no suma concentracion.** El Herfindahl se
+calcula sobre las cuotas positivas normalizadas. Elevar al cuadrado una cuota
+negativa sumaria concentracion, que es lo contrario de lo que significa: un
+grupo que pierde no concentra el origen del beneficio, lo diluye.
+
+**Decision 4 — `effective_bets` en vez de solo el HHI.** "El equivalente a 1.4
+apuestas independientes" se entiende sin conocer el indice; "HHI 0.71" no.
+
+**Decision 5 — lo no atribuido tiene su propio grupo.** Las operaciones sin
+estrategia (adoptadas del broker, anteriores a la trazabilidad) van a
+`unattributed` en vez de repartirse o descartarse: verlas juntas dice cuanta
+parte del PnL todavia no se puede explicar.
+
+**Con muestra corta se calcula igual, pero avisando.** Esconder los numeros no
+ayuda; lo que hace falta es que nadie los tome por concluyentes, y para eso esta
+`sample_warning`.
+
+**Riesgos conocidos.** El desglose por coste solo separa comision del bruto; el
+reparto fino (fees, slippage, spread, latencia, coste oculto y de oportunidad)
+es el Bloque 9 y no se adelanta aqui.
+
+## ADR-108 · El coste oculto es un residuo, y esa es su utilidad
+
+**Contexto.** El Bloque 9 pide separar el bruto de fees, slippage, spread,
+latencia, coste oculto y coste de oportunidad, con informes diarios.
+
+**Decision 1 — el "coste oculto" no es un concepto, es un residuo.** Se calcula
+como `bruto - neto - (comisiones + slippage + spread)`. Si crece, significa que
+el sistema **no esta midiendo** algun coste. Es un detector de contabilidad
+incompleta, y por eso el informe alza una nota cuando supera una fraccion del
+bruto. Un modulo que inventara una formula para el "coste oculto" perderia
+exactamente esa senal.
+
+**Decision 2 — la latencia no se estima.** El Trade Journal no registra la
+latencia por operacion, asi que su coste sale como `None` (no medido) y cae
+dentro del residuo. Estimarlo lo mezclaria con el residuo y destruiria el
+detector del punto anterior. La nota lo dice en cada informe.
+
+**Decision 3 — el coste de oportunidad se mide, no se conjetura.** El evaluador
+continuo (Fase 4) ya resuelve cada senal contra el mercado posterior. Una senal
+con R virtual **positiva** cuyo `signal_id` no aparece en ningun trade es una
+oportunidad perdida medida. Solo cuentan las que habrian ganado: una senal no
+ejecutada que habria perdido es una bala esquivada, y sumarla con signo
+contrario dejaria el numero en nada.
+
+**Decision 4 — el coste de oportunidad no se reparte por dia.** Es un coste del
+conjunto; repartirlo lo contaria tantas veces como dias tenga el informe.
+
+**Los bps se convierten sobre unidades, no sobre lotes.** Mismo criterio que
+ADR-099: en oro un lote son 100 onzas, y medir sobre `quantity` dejaria el coste
+100 veces por debajo — exactamente el error que costo el incidente del
+`contract_size`.
+
+**Riesgos conocidos.** (a) Slippage y spread se convierten a dinero desde los
+bps registrados en el trade, que son medias de la operacion: una entrada con
+slippage alto y una salida limpia se promedian y el reparto pierde el detalle
+por tramo. (b) El coste de oportunidad esta en **R**, no en dinero, porque las
+senales no ejecutadas no tienen sizing; mezclarlo con el resto del informe
+exigiria asumir un tamano que nadie decidio.
+
+## ADR-109 · La calibracion mide la confianza, pero no la corrige a escondidas
+
+**Contexto.** Una confianza de 0.8 deberia significar que de cada diez veces que
+el sistema la declara, acierta ocho. Casi nunca es asi: los modelos y los
+heuristicos tienden a la sobreconfianza, y no se nota porque la confianza se
+mira junto al resultado individual, donde no hay forma de verla fallar. Solo se
+ve en agregado, y solo si alguien la mide.
+
+**Decision 1 — se mide y se expone, no se aplica sola.** El motor devuelve
+curva, diagrama de fiabilidad, ECE, Brier, sesgo con signo y un factor de
+correccion. La correccion **no se aplica automaticamente** a la confianza de la
+decision. Una capa que corrigiera en silencio su propia entrada haria imposible
+saber si el modelo mejoro o si solo se le esta tapando el error — y el proximo
+que mirase el ECE lo veria bien sin que nada hubiera mejorado.
+
+**Decision 2 — la correccion esta acotada.** Sin techo, una racha de 60
+operaciones puede producir un factor de 0.4 que apagaria medio sistema. El
+rango configurable convierte la correccion en un empujon, no en un volantazo.
+
+**Decision 3 — sin muestra, correccion 1.0.** No se toca la confianza de nadie
+sin evidencia, y el informe lo declara con `observable=False` y su motivo.
+
+**Decision 4 — los tramos con poca muestra se descartan.** Un bin con tres
+observaciones da una tasa de 0.0 o 0.67 y arrastra el ECE con ruido que no
+significa nada.
+
+**El diagrama de fiabilidad se sirve emparejado** (declarada vs observada) para
+que el dashboard no tenga que reconstruir la referencia y arriesgarse a
+dibujarla mal.
+
+**Riesgos conocidos.** (a) El acierto se define como `pnl > 0`, que es lo que el
+journal permite: una operacion que gana 0.1 R cuenta igual que una que gana 3 R,
+asi que la calibracion mide direccion, no magnitud. (b) La correccion es global,
+no por estrategia ni por regimen: un sistema que este bien calibrado en
+tendencia y mal en rango recibe un unico factor promedio.
+
+## ADR-110 · La calidad del dato reduce exposicion; apagar lo decide el kill switch
+
+**Contexto.** El incidente del 04/08 dejo la leccion escrita: el motor puede
+quedarse ciego **sin lanzar un solo error**. El validador descartaba el 100% de
+los ticks, el bucle seguia corriendo, el log no decia nada raro, y el sistema
+dejo de operar cuatro dias. El Bloque 11 pide medir feed, packet loss, tick y
+orderbook quality, datos ausentes, deriva de timestamps, deriva de reloj y lag
+del exchange, agregarlo en un score y **reducir riesgo automaticamente**.
+
+**Decision 1 — reducir, no apagar.** El multiplicador vive en `[risk_floor, 1.0]`
+y nunca llega a 0. Apagar por una metrica de calidad convertiria un problema de
+datos en una parada total, y las paradas totales las decide el kill switch, que
+existe para eso y tiene auditoria propia. Reducir exposicion es reversible y
+proporcional.
+
+**Decision 2 — senales criticas ademas de la media.** Este fue un fallo real del
+primer diseno, detectado por un test: con la media ponderada, un `missing_data`
+en 0 o un `clock_drift` en 0 quedaban **escondidos detras de siete senales
+sanas** y el score ni bajaba del umbral. Ahora cada senal critica puede degradar
+por si sola y el multiplicador toma el camino mas severo de los dos.
+`tick_quality` esta entre las criticas por el motivo mas concreto posible: el
+fallo del 04/08 fue literalmente que el validador descartaba el 100% de los
+ticks.
+
+**Decision 3 — ausencia de medicion no es calidad cero.** Sin mensajes en la
+ventana, `feed_quality` no vale 0: queda como **no observable**. Son cosas
+distintas, y el motor ciego se detecta con `missing_data`, que si mide lo que
+importa. Y sin **ninguna** senal observable el multiplicador se queda en 1.0:
+reducir ahi seria castigar por no haber medido, y este motor no puede convertir
+su propio silencio en una decision operativa.
+
+**Decision 4 — el reductor se aplica DESPUES de los topes de exposicion.** El
+orden importa y tambien salio de un test: aplicado antes, un tope que ya
+estuviera mordiendo se lo tragaba entero —reducir a la mitad una cantidad que el
+tope iba a recortar igualmente no reduce nada— y la proteccion desaparecia justo
+en las operaciones mas grandes, que son las que mas importan. Se aplica antes del
+redondeo a lotes, para que una reduccion pueda dejar la operacion por debajo del
+lote minimo y se rechace limpio: si el dato no es fiable y el tamano reducido ya
+no cabe, no se opera.
+
+**Decision 5 — el multiplicador se lee en cada entrada, no se cachea.** La
+calidad del dato cambia en segundos, y una lectura vieja es justo la que no
+protege.
+
+**La alarma se publica en las dos transiciones.** Entrar en degradacion y salir
+de ella. Repetirla cada minuto seria ruido; no anunciar la recuperacion dejaria
+a quien la leyo creyendo que el problema sigue.
+
+**Riesgos conocidos.** (a) Los contadores del feed son acumulados desde el
+arranque, no de una ventana movil: un episodio malo al principio del dia sigue
+pesando horas despues, y la senal tarda en recuperarse mas de lo que deberia.
+(b) `max_timestamp_drift_seconds` no se alimenta todavia (el collector no
+expone el desfase por mensaje), asi que esa senal queda como no observable.
+
+## ADR-111 · El riesgo de la maquina se compone con el del dato por PRODUCTO
+
+**Contexto.** El Bloque 12 pide analizar CPU, RAM, Redis, broker, latencia,
+exchange, API, MT5, Event Bus, scheduler y cache, y producir un Risk Multiplier
+que reduzca exposicion. Es el gemelo del Bloque 11, pero mirando la maquina en
+vez del dato.
+
+**Por que merece un motor propio.** Una VPS al 95% de CPU no impide operar:
+impide operar **a tiempo**. El motor sigue decidiendo, las ordenes siguen
+saliendo, y la degradacion aparece como slippage y salidas tardias — que se leen
+como mala suerte de mercado. El dano es real y la causa es invisible desde
+cualquier metrica de trading.
+
+**Decision 1 — composicion por producto, no por minimo.** El multiplicador final
+es `infraestructura x calidad_de_dato`. Un feed mediocre en una maquina saturada
+es peor que cualquiera de las dos cosas por separado, y quedarse con el minimo lo
+negaria. El suelo se aplica **al final**, para que componer nunca lleve la
+exposicion por debajo de lo permitido.
+
+**Decision 2 — se miden en el mismo ciclo, en orden.** Primero calidad de dato,
+despues meta-riesgo, que la consume. Con bucles separados, el meta-riesgo
+compondria con una lectura de calidad de hasta un minuto de antiguedad — justo
+cuando lo que cambia rapido es la calidad.
+
+**Decision 3 — zona de confort en los recursos.** Con una rampa lineal simple, una
+CPU al 20% frente a un techo del 90% daba una senal de 0.78: el motor consideraba
+ligeramente enferma una maquina perfectamente sana, y como las senales se
+promedian, la maquina "siempre" parecia a medio gas y la degradacion real no
+destacaba sobre el fondo. Por debajo de `comfort_fraction x limite` la senal vale
+1.0 y solo entonces empieza a caer.
+
+**Decision 4 — un componente que no reporta no es un componente caido.** Redis en
+local, MT5 en una configuracion de cripto: quedan como **no observables**.
+Penalizarlos apagaria medio sistema por configuracion, no por averia.
+
+**Decision 5 — componentes criticos.** `broker`, `event_loop` y `cpu` degradan por
+si solos, sin esperar a que la media baje. La CPU esta entre ellos por ser el
+degradador silencioso clasico.
+
+**Riesgos conocidos.** (a) Se lee el **ultimo** snapshot del health monitor, no se
+fuerza uno nuevo: pedir una medicion sincrona meteria `psutil` en el camino de
+cada medicion de riesgo, a cambio de una lectura de hasta un ciclo de antiguedad.
+(b) Los pesos y umbrales son juicios; nadie ha medido todavia la relacion entre
+CPU alta y slippage real — el Bloque 15 es el que podria darla.
+
+## ADR-112 · Importancia por permutacion, y por que NO se usa SHAP
+
+**Contexto.** El Bloque 13 pide medir importancia de features de forma continua,
+con SHAP "si existe backend compatible" o un mecanismo equivalente, mostrando
+importancia historica, actual, cambio y decay.
+
+**Decision — permutacion, y se explica el descarte de SHAP.** SHAP exige una
+dependencia binaria pesada y esta pensado para arboles de gradiente y redes. Los
+modelos de este proyecto son propios (arbol, bosque, regresion logistica) y
+algunos backends externos son opcionales. Anadir esa dependencia cubriria parte
+del catalogo y habria que caer a otra metrica para el resto: **dos numeros
+distintos llamados igual**, que es peor que uno solo bien entendido.
+
+La importancia por permutacion es agnostica del modelo, funciona con todos por
+igual y responde exactamente la pregunta operativa: *cuanto me costaria perder
+esta feature*.
+
+**La importancia nativa viaja aparte, no fusionada.** Miden cosas distintas —
+cuanto **usa** el modelo una feature frente a cuanto se **pierde** si desaparece
+— y promediarlas daria un numero que no responde a ninguna de las dos.
+
+**Se mide sobre validacion, no sobre entrenamiento.** Medir sobre lo que el
+modelo memorizo infla la importancia de las features con las que sobreajusto.
+
+**Tres detalles que hacen fiable la cifra.**
+1. **Varias repeticiones por feature.** Un solo barajado es una muestra de una
+   variable aleatoria: features irrelevantes salen "importantes" por azar.
+2. **Semilla fija.** Sin ella, dos mediciones del mismo modelo dan numeros
+   distintos y el `change` mediria el ruido del metodo, no del mercado.
+3. **La historia se actualiza DESPUES de comparar.** Si la medicion actual
+   entrara en su propia referencia, el cambio saldria siempre amortiguado.
+
+**Nunca se reporta importancia negativa.** Que barajar mejore el modelo solo
+significa azar; publicarlo como negativo invita a leer que la feature estorba.
+
+**Riesgos conocidos.** (a) La permutacion es O(features x repeticiones x
+predicciones): con muchas features y datasets grandes el ciclo es caro, y por
+eso se dispara bajo demanda y no en bucle. (b) Con features correlacionadas, la
+permutacion reparte mal el credito: si dos features llevan la misma informacion,
+barajar una sola apenas empeora el modelo y ambas parecen poco importantes.
+
+## ADR-113 · Los filtros no penalizan: vetan. Y las evaluaciones sin senal no se guardan
+
+**Contexto.** El Bloque 14 pide que cada decision rechazada indique score
+inicial, **penalizacion de cada filtro**, score final, razon, evidencia y
+confianza, todo persistido y con API.
+
+**Decision 1 — no se inventa una aritmetica que el motor no tiene.** Los filtros
+de este sistema no restan puntos: vetan. Modelarlos como si aplicaran una
+penalizacion parcial produciria numeros con aspecto de calculo que no
+corresponden a nada real. Lo que se registra es lo que ocurre: los **umbrales**
+llevan valor, minimo y **deficit** (eso si es una penalizacion medible), y los
+**filtros** son binarios y se registran como binarios. El `final_score` es 0.0
+cuando algo veto — no se opera, asi que el score efectivo de la oportunidad es
+cero.
+
+**Decision 2 — se cablea en el Decision Engine, no en el bus.** El resultado de
+cada filtro y el deficit de cada umbral **solo existen en ese punto**: el evento
+de decision no los lleva, y reconstruirlos desde fuera seria adivinarlos. Es la
+diferencia con el Bloque 2, donde lo que se captura (features de mercado) si es
+observable desde fuera y por eso vive en el bus.
+
+**Decision 3 — tambien se registran las aceptadas.** Sin ellas no hay
+denominador: "este filtro bloqueo 40 veces" no significa nada sin saber sobre
+cuantas oportunidades.
+
+**Decision 4 — las evaluaciones sin senal se cuentan, no se guardan.** Sin
+senales activas no hay oportunidad que rechazar: no hay umbrales que medir ni
+filtros que hayan actuado. Guardar una fila por cada una —dos simbolos por
+segundo son ~170.000 filas al dia— ahogaria los rechazos reales y dejaria el
+resumen dominado por un motivo que no es un motivo. Se cuentan en
+`no_opportunity`, que es lo que hace falta para que el denominador sea honesto.
+
+**Decision 5 — el resumen cuenta dos cosas distintas.** `blocked_by` (cuantas
+veces bloqueo cada puerta) y `sole_blocker` (cuantas veces fue **la unica**). La
+segunda es la que importa para decidir si relajar un filtro: una puerta que
+siempre bloquea acompanada de otras tres no esta costando nada — quitarla no
+habria dejado pasar ni una sola operacion.
+
+**Un filtro fuera de la cadena no aparece en el registro**, igual que no aparece
+en la explicacion de la decision. Es coherente y deliberado: el registro refleja
+lo que se evaluo, no lo que podria haberse evaluado.
+
+**Riesgos conocidos.** El registro vive en el camino de cada decision. Es un
+append a memoria y un volcado por lotes, pero es trabajo en el camino caliente:
+si el volumen de decisiones creciera un orden de magnitud, habria que moverlo a
+un worker propio.
+
+## ADR-114 · Sin carril live, el gap medido es el modelo mirandose al espejo
+
+**Contexto.** El Bloque 15 pide comparar paper, live y fill ideal, y calcular
+slippage real, execution gap, fill difference y coste de oportunidad. Con una
+condicion explicita del propio enunciado: **no habilitar live trading**, todo
+fail-closed.
+
+**El problema logico del bloque, dicho por delante.** Con solo paper e ideal, el
+"gap de ejecucion" es —por construccion— el slippage y el spread que el propio
+simulador modelo. No es una medicion independiente de nada: es el modelo
+mirandose al espejo. Reportarlo como "slippage real" seria exactamente el tipo
+de cifra que engana a quien la lee, porque suena a observacion y es una
+tautologia.
+
+**Decision — se implementa como linea base, y se etiqueta como tal.** El valor
+del numero es futuro: el dia que exista un carril live, la diferencia entre el
+gap modelado y el gap real dira si el simulador miente y cuanto. Hasta entonces:
+
+1. `fill_difference_bps` es **`None`**, no cero. Cero afirmaria que paper y live
+   coinciden, que es una afirmacion sobre algo que no se ha observado nunca.
+2. El carril live sale con `available=False` y su motivo textual.
+3. El informe lleva `live_enabled: false` y un `caveats` que dice, en la propia
+   carga util, que el gap es una linea base y no una medicion independiente.
+4. Cada informe repite esa misma advertencia entre las recomendaciones.
+
+**El fill ideal no es una simulacion aparte.** Es el resultado real **mas** los
+costes de ejecucion que se le descontaron. Reconstruirlo con un segundo
+simulador introduciria una diferencia que no vendria de la ejecucion sino de la
+discrepancia entre los dos modelos.
+
+**Sin muestra no se recomienda nada.** Una recomendacion es una llamada a la
+accion; emitirla sobre diez operaciones es peor que callarse.
+
+**El bloque no habilita ni prepara live.** El motor no recibe proveedor de
+operaciones live, no conoce ningun broker y no tiene ruta de ejecucion. El
+invariante se expone en `status()["live_enabled"]` para que sea verificable
+desde fuera, y hay un test de integracion que comprueba que el guard anti-live
+sigue resolviendo a `paper` con su motivo.
+
+**Riesgos conocidos.** El coste de oportunidad se toma del Bloque 9 y esta en R,
+no en dinero: las senales no ejecutadas no tienen sizing, y convertirlo exigiria
+asumir un tamano que nadie decidio.

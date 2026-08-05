@@ -13,11 +13,15 @@ from app.engine.events.detections import (
     VWAPCalculated,
 )
 from app.engine.events.events import (
+    AttributionReportGenerated,
     ConsensusReached,
     ContextUpdated,
     DecisionGenerated,
+    EdgeDecayDetected,
+    EdgeReportGenerated,
     FilterTriggered,
     MarketRegimeChanged,
+    RegimeForecastUpdated,
     SignalExpired,
     SignalRejected,
     StrategyExecuted,
@@ -26,17 +30,21 @@ from app.engine.events.events import (
 )
 
 __all__ = [
+    "AttributionReportGenerated",
     "CVDCalculated",
     "ConsensusReached",
     "ContextUpdated",
     "DecisionGenerated",
     "DeltaCalculated",
+    "EdgeDecayDetected",
+    "EdgeReportGenerated",
     "FVGDetected",
     "FilterTriggered",
     "LiquidityDetected",
     "MarketRegimeChanged",
     "MomentumDetected",
     "OrderBlockDetected",
+    "RegimeForecastUpdated",
     "SignalCreated",
     "SignalExpired",
     "SignalRejected",
