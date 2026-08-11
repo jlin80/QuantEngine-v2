@@ -2432,3 +2432,38 @@ strict limpios.
    `> 0`: puestos a cero bloquean todo en silencio (auditoria completa en
    `docs/session_edge.md`). No se corrigio: cambia el significado de una config
    existente y es decision del operador.
+
+## 2026-08-11 - Despliegue de la tarea de sesion a qevps
+
+**Categoria:** ops · **Tags:** `despliegue` `qevps` `session-edge`
+
+**Procedimiento.** Backup previo (`qe_predeploy_20260811_101248`, 1378
+ficheros) -> verificacion de deriva local (ninguna en ficheros trackeados) ->
+parada del motor -> `git checkout -f -B feat/bloques-8-13 origin/feat/bloques-8-13`
+(`73474b3` -> `fbe2d70`) -> verificacion del guard con el codigo ya en disco,
+sin arrancar.
+
+**Correccion sobre el runbook anterior.** El paso de parada solo mato el
+proceso del puerto 8000, sin pasar por la tarea programada ni el watchdog que
+lo supervisan (el orden correcto, documentado el 05/08, es tarea -> watchdogs
+-> motores). El watchdog lo relanzo solo unos minutos despues, ya con el
+codigo nuevo porque el `git checkout` habia corrido antes. El resultado final
+es el mismo (codigo correcto, un solo listener en 8000), pero el arranque no
+fue el controlado que se pretendia. Anotado para que el proximo despliegue
+pare tambien el watchdog explicitamente.
+
+**Verificacion post-despliegue.**
+- 2 procesos python (motor + watchdog, el patron esperado), 1 solo listener en
+  8000, `/api/health` -> `ok`, entorno `paper`.
+- `production.allow_live=False`, `apply_governance=False`,
+  `ml.auto_activate=False`. Sin cambios de riesgo.
+- `research.auto_cycle=True` y `execution.risk.max_consecutive_losses=0`
+  confirmados preexistentes en el `.env` desde antes del 05/08 (contrastado
+  contra el backup de esa fecha): no los introdujo este despliegue.
+- `/api/trades/{id}/explain` probado con una operacion real
+  (`a7ba9023e1a543c6b58c2ba2b498c182`, USTECM): reunio consenso, join de
+  senal, contexto y prediccion del modelo activo sin recalcular nada. Caso de
+  interes que salio de la propia prueba: la senal sola habria dado -1.00R: la
+  salida por `regime_change` la corto antes y la ejecucion cerro en +0.805R —
+  el hueco del Bloque 3 tambien puede ir a favor, no solo en contra.
+- Dashboard (puerto 3000, no tocado por este despliegue) sigue vivo.
