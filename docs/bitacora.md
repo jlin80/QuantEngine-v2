@@ -2533,3 +2533,32 @@ calculado) quedan para desplegar cuando el operador lo confirme.
 integracion end-to-end reproduciendo el caso real medido en produccion:
 rechazo sin override, apertura con override, sin aflojar otros simbolos).
 Suite: **1337 en verde** en 3.12.10. Ruff, Black y MyPy strict limpios.
+
+## 2026-08-11 - El fix de sizing funciono; ahora 5 posiciones concurrentes de oro
+
+**Categoria:** fix · **Tags:** `sizing` `riesgo` `oro` `override-por-simbolo`
+
+Verificado en produccion tras el despliegue anterior: **el fix funciona**.
+4 operaciones de oro, +$63.36 realizados, equity 441 -> 505.58 en horas.
+
+**Pedido de seguimiento:** permitir hasta 5 posiciones de oro simultaneas
+(`max_open_positions` ya estaba en 5 desde antes). `max_positions_per_symbol`
+seguia en el global (1) sin override — se le anadio el mismo patron que a
+los otros tres topes (`max_positions_per_symbol_by_symbol` +
+`max_positions_per_symbol_for(symbol)`).
+
+**Los topes de notional necesitan subir de nuevo.** El calculo del despliegue
+anterior (1100%) cubria UNA posicion (~993% real); con varias abiertas a la
+vez el notional se acumula. Con precio real (~4365) y un piso de equity
+conservador de 450 (no el actual, que fluctua):
+
+| Posiciones | Notional total | Tope minimo |
+| --- | --- | --- |
+| 1 | ~4365 | ~970% |
+| 5 | ~21826 | ~4850% |
+
+`max_exposure_pct` (global, no por simbolo — protege el portfolio entero) sube
+tambien: hoy en 2000%, insuficiente para 5 posiciones de oro por si solas.
+
+**Tests.** 2 nuevos (override de `max_positions_per_symbol`, resolver).
+Suite: **1339 en verde**. Ruff/Black/MyPy limpios.

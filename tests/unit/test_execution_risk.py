@@ -154,3 +154,24 @@ def test_spread_and_liquidity_filters():
     assert rm.check_spread(3.0).allowed
     assert not rm.check_liquidity(50.0).allowed
     assert rm.check_liquidity(200.0).allowed
+
+
+def test_max_positions_per_symbol_override():
+    settings = ExecutionRiskSettings(
+        max_positions_per_symbol=1,
+        max_positions_per_symbol_by_symbol={"XAUUSDM": 5},
+    )
+    rm = RiskManager(settings, 10_000.0)
+    gold = rm.evaluate_entry(_query(symbol="XAUUSDM", positions_on_symbol=3))
+    assert gold.allowed
+
+    other = rm.evaluate_entry(_query(symbol="ETHUSDM", positions_on_symbol=1))
+    assert not other.allowed and other.rule == "max_positions_per_symbol"
+
+
+def test_max_positions_per_symbol_resolver_falls_back_to_global():
+    settings = ExecutionRiskSettings(
+        max_positions_per_symbol=1, max_positions_per_symbol_by_symbol={"XAUUSDM": 5}
+    )
+    assert settings.max_positions_per_symbol_for("XAUUSDM") == 5
+    assert settings.max_positions_per_symbol_for("ETHUSDM") == 1

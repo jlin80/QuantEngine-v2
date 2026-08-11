@@ -69,7 +69,11 @@ solo si supera **todos** los límites, evaluados en orden:
 1. Kill switch / circuit breaker inactivos.
 2. Nocional positivo.
 3. Pérdidas consecutivas por debajo del máximo.
-4. Nº de posiciones (total y por símbolo).
+4. Nº de posiciones (total y por símbolo — `max_positions_per_symbol` también
+   admite override por símbolo, `max_positions_per_symbol_by_symbol`, misma
+   razón: con `contract_size=100` cada posición de oro consume mucho más
+   notional que una de BTC/ETH/USTEC, así que el número de posiciones
+   simultáneas que tiene sentido permitir no es el mismo).
 5. Pérdida realizada diaria/semanal/mensual dentro de límite.
 6. Exposición total / por símbolo / por grupo de correlación.
 

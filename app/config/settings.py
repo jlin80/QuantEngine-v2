@@ -1405,6 +1405,7 @@ class ExecutionRiskSettings(BaseModel):
     max_consecutive_losses: int = 5
     max_open_positions: int = 5
     max_positions_per_symbol: int = 1
+    max_positions_per_symbol_by_symbol: dict[str, int] = Field(default_factory=dict)
     max_exposure_pct: float = 100.0  # exposición total / equity
     max_symbol_exposure_pct: float = 40.0
     max_correlation_exposure_pct: float = 60.0
@@ -1426,6 +1427,12 @@ class ExecutionRiskSettings(BaseModel):
     circuit_breaker_window_minutes: float = 15.0
     # Kill switch: drawdown máximo tolerado sobre el equity pico.
     kill_switch_drawdown_pct: float = 20.0
+
+    def max_positions_per_symbol_for(self, symbol: str) -> int:
+        """Tope de posiciones simultáneas del símbolo, con el global como fallback."""
+        return self.max_positions_per_symbol_by_symbol.get(
+            symbol.upper(), self.max_positions_per_symbol
+        )
 
     def max_symbol_exposure_pct_for(self, symbol: str) -> float:
         """Tope de exposición del símbolo, con el global como fallback."""

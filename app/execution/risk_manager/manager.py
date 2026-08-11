@@ -181,11 +181,12 @@ class RiskManager:
                 "max_open_positions",
                 f"{query.open_positions} posiciones ≥ máximo {s.max_open_positions}",
             )
-        if query.positions_on_symbol >= s.max_positions_per_symbol:
+        max_positions = s.max_positions_per_symbol_for(query.symbol)
+        if query.positions_on_symbol >= max_positions:
             return RiskCheck(
                 False,
                 "max_positions_per_symbol",
-                f"{query.positions_on_symbol} en {query.symbol} ≥ {s.max_positions_per_symbol}",
+                f"{query.positions_on_symbol} en {query.symbol} ≥ {max_positions}",
             )
         period = self._period_check()
         if period is not None:
