@@ -17,6 +17,7 @@ from app.dashboard.api.routes.costs import router as costs_router
 from app.dashboard.api.routes.edge import router as edge_router
 from app.dashboard.api.routes.engine import router as engine_router
 from app.dashboard.api.routes.execution import router as execution_router
+from app.dashboard.api.routes.explain import router as explain_router
 from app.dashboard.api.routes.forecast import router as forecast_router
 from app.dashboard.api.routes.health import router as health_router
 from app.dashboard.api.routes.integrations import router as integrations_router
@@ -80,6 +81,7 @@ def create_app(settings: Settings, container: Container | None = None) -> FastAP
     app.include_router(engine_router, prefix="/api")
     app.include_router(edge_router, prefix="/api")
     app.include_router(attribution_router, prefix="/api")
+    app.include_router(explain_router, prefix="/api")
     app.include_router(microstructure_router, prefix="/api")
     app.include_router(forecast_router, prefix="/api")
     app.include_router(correlation_router, prefix="/api")

@@ -95,6 +95,11 @@ class _MarketView:
     volume: float | None
     last_price: float | None
     session: str
+    # Todas las sesiones activas, no sólo la primera. `session` se conserva
+    # (una sola etiqueta) porque es lo que consume el modelo de slippage, pero
+    # quedarse con `sessions[0]` pierde los solapes — y Europa-América no se
+    # comporta como Europa sola, que es justo lo que hay que poder medir.
+    sessions: tuple[str, ...] = ()
 
 
 class ExecutionEngine(Service):
@@ -612,6 +617,12 @@ class ExecutionEngine(Service):
             atr=view.atr,
             volatility=view.volatility,
         )
+        # Sesión de ENTRADA, guardada en el momento de abrir. Derivarla después
+        # de la hora de cierre daría otra franja en cuanto la operación cruce un
+        # borde de sesión, y la sesión es una condición de la decisión, no del
+        # cierre.
+        position.metadata["entry_sessions"] = list(view.sessions)
+        position.metadata["entry_session"] = view.session
         await self._publish(
             ev.PositionOpened(
                 source="execution_engine",
@@ -1047,6 +1058,7 @@ class ExecutionEngine(Service):
                 volume=ctx.volume_recent,
                 last_price=ctx.last_price,
                 session=session,
+                sessions=tuple(ctx.sessions),
             )
         ticker = self._market.get_ticker(symbol)
         atr = self._symbol_atr(symbol)
@@ -1062,6 +1074,7 @@ class ExecutionEngine(Service):
             volume=None,
             last_price=last,
             session=_session_for(utc_now().hour),
+            sessions=_sessions_for(utc_now().hour),
         )
 
     def _symbol_atr(self, symbol: str) -> float | None:
@@ -1180,6 +1193,12 @@ class ExecutionEngine(Service):
             context_snapshot={
                 "exit_regime": position.metadata.get("exit_regime", "unknown"),
                 "entry_regime": position.regime,
+                # Sesión activa al abrir (tupla completa: los solapes son celdas
+                # propias). Ausente en el historial anterior a este cambio — y
+                # ausente NO es "off": las filas viejas quedan sin sesión, no
+                # reetiquetadas.
+                "entry_sessions": position.metadata.get("entry_sessions"),
+                "entry_session": position.metadata.get("entry_session"),
                 "regime_adverse_streak": position.metadata.get("regime_adverse_streak", 0),
                 "break_even_active": position.break_even_active,
                 "trailing_active": position.trailing_active,
@@ -1307,6 +1326,11 @@ def _session_for(hour: int) -> str:
         if start <= hour < end:
             return name
     return "off"
+
+
+def _sessions_for(hour: int) -> tuple[str, ...]:
+    """Return every UTC session active at ``hour`` (empty tuple if none)."""
+    return tuple(name for name, (start, end) in _SESSION_HOURS.items() if start <= hour < end)
 
 
 def _fmt(value: float | None) -> str:

@@ -3069,3 +3069,40 @@ sigue resolviendo a `paper` con su motivo.
 **Riesgos conocidos.** El coste de oportunidad se toma del Bloque 9 y esta en R,
 no en dinero: las senales no ejecutadas no tienen sizing, y convertirlo exigiria
 asumir un tamano que nadie decidio.
+
+## Fidelidad del laboratorio: el Market Context en el backtest
+
+Hasta el 2026-08-11 el backtest construía el `ExecutionEngine` con
+`context=None`. La consecuencia no era cosmética: `regime` llegaba siempre
+`"unknown"` y `volatility` siempre `"normal"`, así que **la salida por cambio de
+régimen no existía en el laboratorio** — y en producción es la que cierra la
+mayoría de las operaciones. Backtest y producción no eran el mismo sistema.
+
+`BacktestEngine` recibe ahora `QuantSettings` y monta el `MarketContextEngine`
+real **sobre el mismo `MarketDataService`** que consume el motor de ejecución,
+poblado vela a vela por el reloj de replay: no hay lookahead posible por esa vía.
+Lo gobierna `backtesting.market_context_enabled` (por defecto `true`); el toggle
+se conserva para poder medir cuánto cambia el resultado al añadir esa salida,
+igual que `ml.data_quality.enabled`.
+
+**Detalle que no es opcional:** el cache del Feature Store caduca por
+`time.monotonic()` —tiempo real—, y en un backtest miles de velas simuladas
+caben dentro de un TTL de un segundo. El motor invalida el store en cada vela;
+sin eso el contexto se congelaría, que es la misma familia de fallo que el reloj
+congelado del 2026-07-31.
+
+Efecto medido al activarlo: aparece el 90-93 % de cierres por `regime_change`
+que el backtest no podía ver, y con él la explicación del hueco de 0.256R entre
+la señal y la ejecución (`docs/session_edge.md`).
+
+### La sesión de entrada viaja al journal
+
+`_MarketView` gana `sessions` (la tupla completa, no sólo la primera activa) y la
+posición guarda `entry_sessions` / `entry_session` al abrir, que acaban en el
+`context_snapshot` del `TradeRecord`. Sin eso no se puede segmentar por sesión
+sin re-derivarla de la hora de cierre, que da otra franja en cuanto la operación
+cruza un borde. En el historial anterior el campo llega `None`: **ausente no es
+`off`**.
+
+`_market_view` sigue usando `sessions[0]` para el modelo de slippage — deuda
+registrada, no corregida aquí.

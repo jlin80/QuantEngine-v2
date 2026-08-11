@@ -515,6 +515,14 @@ class BacktestingSettings(BaseModel):
     default_spread_bps: float = 2.0  # spread sintético si el dataset no lo trae
     default_timeframe: str = "1m"
     risk_free_rate: float = 0.0  # para Sharpe/Sortino anualizados
+    # Fidelidad del laboratorio: si está activo, el backtest construye el
+    # ExecutionEngine con el Market Context real (régimen, sesión, volatilidad)
+    # en vez de `context=None`. Con `None`, `regime` llega siempre "unknown" y la
+    # salida por cambio de régimen —el 72 % de los cierres en producción— **no
+    # existe** en el backtest: laboratorio y producción son sistemas distintos.
+    # Se deja como toggle, y no cableado a fuego, para poder medir cuánto cambia
+    # el resultado al añadir esa salida (misma razón que `ml.data_quality.enabled`).
+    market_context_enabled: bool = True
     criteria: QualificationCriteriaSettings = Field(default_factory=QualificationCriteriaSettings)
     optimizer: OptimizerSettings = Field(default_factory=OptimizerSettings)
     walk_forward: WalkForwardSettings = Field(default_factory=WalkForwardSettings)

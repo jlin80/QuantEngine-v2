@@ -2314,3 +2314,121 @@ pero la cadena de decision en vivo tiene dos filtros mas que ayer.
 **Aviso menor, no causado por el despliegue.** Un timeout puntual de Redis al
 arrancar, con degradacion a memoria como esta disenado. Redis sigue vivo
 (PID 3228) y es el unico aviso de este tipo en 24 h de log.
+
+## 2026-08-11 - Edge por sesion en XAUUSD: la sesion no era la pregunta
+
+**Categoria:** hallazgo+feat · **Tags:** `sesion` `edge` `xauusd` `regimen` `fidelidad` `riesgo`
+
+**La pregunta era si alguna estrategia tiene edge estable en alguna sesion de
+oro. La respuesta es que no, pero lo importante es lo que aparecio al medirlo.**
+
+### Antes de medir: el laboratorio no veia lo que ve produccion
+
+Se cerro la deuda de fidelidad anotada el 04/08. El backtest construia el
+`ExecutionEngine` con `context=None`, asi que el regimen era siempre `unknown` y
+**la salida por cambio de regimen no existia en el laboratorio**. Ahora
+`BacktestEngine` monta el `MarketContextEngine` real sobre el mismo
+`MarketDataService` que consume el motor, poblado vela a vela por el reloj de
+replay. Toggle `backtesting.market_context_enabled` para poder medir la
+diferencia, no para dejarlo apagado.
+
+Detalle que costo encontrar: el cache del Feature Store caduca por
+`time.monotonic()`, y en backtest miles de velas simuladas caben en un TTL de un
+segundo. Sin invalidar por vela, el contexto se congela — la misma familia del
+reloj congelado del 31/07.
+
+De paso, la sesion de entrada (la **tupla completa**, con solapes) viaja ahora al
+`context_snapshot` del journal. Antes no estaba, pese a lo que se asumia.
+
+### El primer barrido no midio edge: midio un freno
+
+17 estrategias x 50 000 velas dieron entre 5 y 18 operaciones cada una. Las 97
+celdas salieron `muestra_insuficiente`. Instrumentando el `RiskManager` real:
+**601 decisiones aceptadas, 8 operaciones, 573 rechazos por
+`max_consecutive_losses`** — y las 8 operaciones, todas del primer dia.
+
+**`max_consecutive_losses = 5` es un estado absorbente.** Bloquea toda entrada al
+llegar a 5 perdidas seguidas, y el contador solo se reinicia con una operacion
+**ganadora**; sin poder abrir, no puede haber ganadora. No decae con el tiempo,
+no tiene ventana movil y **sobrevive a los reinicios**: `RecoveryService`
+persiste `consecutive_losses` en el snapshot y lo restaura al arrancar.
+
+Es el cuadro del incidente del 04/08 —motor vivo, sano, sin operar— con otra
+causa. Con una expectativa cerca de cero, cinco perdidas seguidas no son un
+evento raro. **No se ha cambiado en produccion**: el barrido se repitio con el
+freno levantado **solo en laboratorio**, con bandera explicita registrada en el
+JSON de salida. Los umbrales del kill criteria no se tocaron.
+
+### El resultado, con muestra de verdad
+
+11 575 operaciones y 38 849 senales resueltas. **Cero celdas con edge estable.**
+La corrección FDR no tuvo que descartar nada: **ninguna de las 68 celdas
+elegibles llego a expectancy positiva** (la mejor, −0.058R).
+
+Y la sesion resulto no ser la variable: entre la mejor y la peor hay **0.031R**,
+mientras que el hueco entre lo que da la senal y lo que consigue la ejecucion es
+**0.256R** — ocho veces mayor. Ese numero coincide con el −0.252R que ADR-097
+midio por otra via sobre operaciones reales.
+
+**42 de las 68 celdas tienen expectancy de SENAL positiva. Las 42 tienen
+ejecucion negativa.**
+
+### Donde se va ese 0.256R (y esto solo se pudo ver por el cableado de arriba)
+
+| Estrategia | Ops | `regime_change` | R medio | `take_profit` | R medio |
+| --- | --- | --- | --- | --- | --- |
+| `fair_value_gap` | 1 499 | **92.7 %** | −0.184 | 1.8 % | +1.528 |
+| `range_breakout` | 1 541 | **90.0 %** | −0.184 | 5.3 % | +1.529 |
+| `order_block` | 282 | **93.3 %** | −0.190 | 3.9 % | +1.784 |
+
+Cuando una operacion llega a su objetivo devuelve +1.5R; a su stop, −1.3R. Los
+niveles estan sanos. **Casi nunca llegan a ninguno**: la salida por regimen
+cierra nueve de cada diez a los 3-4 minutos, a −0.18R cada vez.
+
+**Lo que esto NO prueba:** ni que la salida por regimen deba quitarse (medir su
+coste no mide lo que evito), ni que las estrategias tengan edge — la expectancy
+de senal no paso por walk-forward ni por correccion multiple, porque el kill
+criteria se declaro sobre la ejecutada. Cambiarlo ahora seria mover la porteria.
+
+### Bloques que NO se ejecutaron, y por que
+
+Los Bloques 4 (calibracion de parametros) y 5 (pesos por sesion al MSM) no se
+tocaron: el kill criteria dice que sin celdas estables, calibrar es ajustar
+ruido. `QE_ML__META__APPLY_GOVERNANCE` sigue en `false`. Ninguna estrategia
+activada ni desactivada, ningun limite de riesgo movido, `allow_live` intacto.
+
+### Bloque 6: explicacion por operacion
+
+`GET /api/trades/{id}/explain` (`app/engine/trade_explain/`) reune —sin recalcular
+nada— contribuciones del consenso, el join `signal_id → VirtualOutcome`, el
+`context_snapshot` y `MLEngine.explain_prediction`. Recibe proveedores, no
+objetos del motor, para no romper la direccion de dependencias del ADR-087.
+
+Las cuatro ausencias tienen nombre propio y ninguna es un cero:
+`no_disponible`, `unmatched_legacy`, `unmatched_unresolved`, `sin_modelo`. El
+campo `thesis_resolved` marca si el cierre resolvio la tesis o la corto — es lo
+que hace util el endpoint dado el 92 % de arriba.
+
+### Archivos
+
+**Nuevos.** `app/backtesting/session_edge.py`, `app/engine/trade_explain/`,
+`app/dashboard/api/routes/explain.py`, `scripts/session_edge.py`,
+`docs/session_edge.md`, `tests/unit/test_session_edge.py`,
+`tests/unit/test_trade_explain.py`.
+
+**Modificados.** `app/backtesting/{engine/engine,api,quant_source,simulator/execution_factory}.py`,
+`app/execution/execution_engine/engine.py`, `app/engine/bootstrap.py`,
+`app/config/settings.py`, `app/dashboard/api/main.py`, `docs/{ml,architecture}.md`.
+
+**Tests.** 26 nuevos. Suite: **1324 en verde** en 3.12.10. Ruff, Black y MyPy
+strict limpios.
+
+### Lo primero de la siguiente lista
+
+1. El freno por racha de perdidas: absorbente y persistente entre reinicios.
+2. La salida por regimen en 1m, que se lleva el 92 % de los cierres.
+3. `max_daily_loss_pct`, `max_weekly_loss_pct`, `max_monthly_loss_pct`,
+   `circuit_breaker_loss_pct` y `max_spread_bps` **no** guardan el caso `0` con
+   `> 0`: puestos a cero bloquean todo en silencio (auditoria completa en
+   `docs/session_edge.md`). No se corrigio: cambia el significado de una config
+   existente y es decision del operador.

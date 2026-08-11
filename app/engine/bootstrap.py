@@ -44,6 +44,8 @@ from app.engine.rejections import RejectionStore
 from app.engine.signal_engine import SignalEngine
 from app.engine.state_manager import HistoryWriter, SignalHistoryStore
 from app.engine.strategy_engine import StrategyEngine
+from app.engine.trade_explain import SignalVerdict as ExplainVerdict
+from app.engine.trade_explain import TradeExplainer
 from app.engine.validators import SignalValidator
 from app.execution.api import ExecutionCore
 from app.execution.benchmark import ShadowBenchmark
@@ -1050,6 +1052,41 @@ def _build_ml(container: Container, settings: Settings, bus: EventBus) -> None:
                 enabled=settings.ml.meta.apply_governance,
             ),
         )
+
+    # Explicación por operación (`/api/trades/{id}/explain`). Se construye aquí
+    # porque cruza cuatro capas —journal, decisiones, evaluador continuo y
+    # modelo activo— y ninguna debe conocer a las otras: recibe proveedores, no
+    # objetos. Es de sólo lectura y el ML sigue sin decidir nada.
+    if container.contains(TradeJournal) and container.contains(SignalHistoryStore):
+        journal = container.resolve(TradeJournal)
+        signal_history = container.resolve(SignalHistoryStore)
+        explain_outcomes: Callable[[], dict[str, ExplainVerdict]] = (
+            (lambda: _explain_verdicts(outcome_store)) if outcome_store is not None else dict
+        )
+        container.register_instance(
+            TradeExplainer,
+            TradeExplainer(
+                journal.all,
+                lambda: signal_history.decisions(limit=1000),
+                explain_outcomes,
+                # Sin modelo activo el predictor devuelve su propia degradación
+                # elegante; se pasa igualmente para no duplicar esa lógica aquí.
+                engine.explain_prediction,
+            ),
+        )
+
+
+def _explain_verdicts(store: VirtualOutcomeStore) -> dict[str, ExplainVerdict]:
+    """Adapt the per-signal virtual outcomes to the explainer's shape."""
+    return {
+        signal_id: ExplainVerdict(
+            signal_id=signal_id,
+            strategy=outcome.strategy,
+            r_multiple=outcome.r_multiple,
+            outcome=outcome.outcome,
+        )
+        for signal_id, outcome in store.index().items()
+    }
 
 
 def _signal_outcomes(store: VirtualOutcomeStore) -> dict[str, SignalOutcome]:

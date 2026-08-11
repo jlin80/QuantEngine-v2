@@ -34,7 +34,7 @@ from app.engine.feature_store import FeatureStore
 from app.engine.filters import build_filter_chain
 from app.engine.interfaces.strategy import AnalysisContext
 from app.engine.market_context import MarketContextEngine
-from app.engine.models import CadenceKind
+from app.engine.models import CadenceKind, SignalRecord
 from app.engine.plugins import PluginLoader
 from app.engine.regime_detection import RegimeDetector
 from app.engine.signal_engine import SignalEngine
@@ -191,6 +191,13 @@ class QuantCoreDecisionSource:
             1m, 50 minutos de visión); esto permite **medir** si un contexto
             superior aporta algo antes de cablearlo. Sólo se publican velas ya
             cerradas: ver :mod:`app.backtesting.htf`.
+        signal_sink: Sumidero de cada señal admitida, igual que el de producción
+            (``bootstrap._signal_sink``). Existe para poder enganchar el
+            **evaluador continuo** al backtest y medir la calidad de la señal —
+            todas las señales, no sólo las que llegaron a operación.
+        on_bar_end: Se invoca al terminar cada vela, con esa vela. Es el punto
+            donde el evaluador continuo resuelve sus operaciones virtuales, para
+            que sólo vea precio ya publicado y no el futuro.
     """
 
     def __init__(
@@ -200,6 +207,8 @@ class QuantCoreDecisionSource:
         *,
         spread_bps: float,
         higher_timeframes: Sequence[Timeframe] = (),
+        signal_sink: Callable[[SignalRecord], None] | None = None,
+        on_bar_end: Callable[[Candle], None] | None = None,
     ) -> None:
         self._settings = settings
         self._symbol = symbol.upper()
@@ -219,7 +228,10 @@ class QuantCoreDecisionSource:
         self._context_engine = MarketContextEngine(
             self._market, self._features, self._regime, quant.context
         )
-        self._history = SignalHistoryStore(memory_limit=quant.history.memory_limit)
+        self._on_bar_end = on_bar_end
+        self._history = SignalHistoryStore(
+            memory_limit=quant.history.memory_limit, signal_sink=signal_sink
+        )
         weights = {name: cfg.weight for name, cfg in quant.strategies.items()}
         consensus = ConsensusEngine(
             quant.consensus, weights, performance_factor=self._history.performance_factor
@@ -261,6 +273,17 @@ class QuantCoreDecisionSource:
     def close(self) -> None:
         """Kept for API compatibility (the shared loop lives for the process)."""
         return None
+
+    @property
+    def market(self) -> MarketDataService:
+        """El mercado que ve la estrategia: sólo velas ``<= índice actual``.
+
+        Se expone para que el evaluador continuo pueda resolver sus operaciones
+        virtuales contra **exactamente** los mismos datos, sin abrirle una vía
+        al futuro. Cambia de instancia en cada :meth:`reset`, así que hay que
+        leerlo en cada uso y no cachearlo.
+        """
+        return self._market
 
     # ------------------------------------------------------------------
     # Ciclo de vida
@@ -318,6 +341,16 @@ class QuantCoreDecisionSource:
         self._feed_up_to(candles, index)
         self._features.invalidate(symbol)
 
+        try:
+            return await self._decide_inner(symbol, candles, index)
+        finally:
+            if self._on_bar_end is not None:
+                self._on_bar_end(candles[index])
+
+    async def _decide_inner(
+        self, symbol: str, candles: Sequence[Candle], index: int
+    ) -> DecisionGenerated | None:
+        """Evaluate the strategy library for the current bar."""
         decision = None
         for strategy in self._strategies:
             if strategy.symbols and symbol not in {s.upper() for s in strategy.symbols}:

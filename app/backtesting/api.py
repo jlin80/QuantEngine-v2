@@ -51,7 +51,7 @@ class BacktestLab:
         self._settings = settings
         self._bt = settings.backtesting
         self._execution = settings.execution
-        self._engine = BacktestEngine(self._bt, self._execution)
+        self._engine = BacktestEngine(self._bt, self._execution, settings.quant)
         self._datasets = DatasetManager()
         self._reports = ReportGenerator()
         self._benchmark = BenchmarkEngine()

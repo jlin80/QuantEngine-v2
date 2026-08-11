@@ -249,3 +249,45 @@ incluida la regla de seguridad de que **nunca se activa un modelo inferior**.
 El ML nunca abre operaciones por sí solo ni habilita live trading. Toda
 recomendación de la IA pasa por el Decision Engine, el Risk Manager y el resto de
 validaciones existentes antes de convertirse en una decisión. Solo paper trading.
+
+## Explicación por operación (`/api/trades/{id}/explain`)
+
+`app/engine/trade_explain/` responde, para una operación cerrada, las cinco
+preguntas que antes exigían cruzar cuatro ficheros a mano: qué la disparó, qué
+confirmaciones faltaron, por qué salió donde salió, cuánto se dejó la ejecución
+respecto a lo que daba la señal, y qué variables pesaron según el modelo activo.
+
+**No calcula nada nuevo.** Reúne lo que ya existe: contribuciones del consenso
+(`Decision.consensus`), `signal_id → VirtualOutcome` (el join real del Bloque 8),
+`context_snapshot` del journal y `MLEngine.explain_prediction`. Duplicar
+cualquiera de esos cálculos crearía un segundo número con el mismo nombre.
+
+Recibe **proveedores, no objetos del motor**: es lo que permite que el ML no
+dependa de `app.engine` ni al revés (ADR-087). Lo cablea el composition root.
+
+### Las cuatro ausencias, cada una con su nombre
+
+Ninguna se rellena con un cero:
+
+| Situación | Qué se reporta |
+| --- | --- |
+| La decisión ya no está en el historial en memoria | `consensus_contributions: null` y `confirmations.status = "no_disponible"` — no aportó «cero», es que no se puede leer |
+| La operación no lleva `signal_ids` | `unmatched_legacy`: journal anterior al Bloque 8 o posición adoptada |
+| Lleva `signal_ids` sin resolución virtual | `unmatched_unresolved`: sin niveles, o la operación virtual sigue abierta |
+| No hay modelo activo | `model.status = "sin_modelo"` |
+
+Con varias señales, el R de la señal es la **media** de sus resoluciones: la
+decisión es multi-estrategia por diseño y atribuirla a una sola sería darle a una
+lo que votaron varias. La misma regla que usa `datasets/join.py`.
+
+### `thesis_resolved`: la distinción que hace útil el endpoint
+
+Una salida por `regime_change`, `time_exit`, `context_lost`, `volatility_exit`,
+`risk_exit`, `kill_switch` o `manual` cierra la operación **sin resolver su
+tesis**: no llegó a su objetivo ni a su stop. El campo lo marca explícitamente,
+porque sin él una señal con edge que la ejecución cortó es indistinguible de una
+señal que nunca lo tuvo. Medido en XAUUSD (ver `docs/session_edge.md`): el
+90-93 % de los cierres son de esta clase.
+
+El ML sigue sin decidir: el endpoint es de sólo lectura y no toca el Decision
+Engine ni el guard anti-live.

@@ -11,6 +11,7 @@ import random
 from dataclasses import dataclass
 
 from app.config.settings import ExecutionSettings
+from app.engine.market_context import MarketContextEngine
 from app.execution.commission import CommissionEngine
 from app.execution.execution_engine import ExecutionEngine
 from app.execution.journal import TradeJournal
@@ -44,6 +45,7 @@ def build_execution_stack(
     market: MarketDataService,
     *,
     rng: random.Random | None = None,
+    context: MarketContextEngine | None = None,
 ) -> ExecutionStack:
     """Wire a self-contained execution stack for a backtest run.
 
@@ -51,10 +53,14 @@ def build_execution_stack(
         settings: Configuración de ejecución (misma que en paper real).
         market: Servicio de datos histórico que alimenta al motor.
         rng: Fuente aleatoria del Paper Engine (determinismo en tests).
+        context: Market Context Engine sobre el mismo mercado histórico. Con
+            ``None`` el motor cae al camino degradado (régimen ``unknown``,
+            volatilidad ``normal``) y **la salida por cambio de régimen no
+            ocurre**; ver ``backtesting.market_context_enabled``.
 
     Returns:
-        Un :class:`ExecutionStack` listo para recibir decisiones, sin bus ni
-        contexto (el backtest los suple con datos históricos y su reloj).
+        Un :class:`ExecutionStack` listo para recibir decisiones, sin bus (el
+        backtest lo suple con datos históricos y su reloj).
     """
     commission = CommissionEngine(settings.commission)
     slippage = SlippageEngine(settings.slippage)
@@ -91,7 +97,7 @@ def build_execution_stack(
         journal,
         performance,
         bus=None,
-        context=None,
+        context=context,
     )
     return ExecutionStack(
         engine=engine,

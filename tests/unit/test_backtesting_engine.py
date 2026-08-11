@@ -10,7 +10,12 @@ from app.backtesting.metrics import StatisticsEngine
 from app.backtesting.models import BacktestConfig, EquityPoint
 from app.backtesting.monte_carlo import MonteCarloSimulator
 from app.backtesting.walk_forward import generate_windows
-from app.config.settings import BacktestingSettings, ExecutionSettings, MonteCarloSettings
+from app.config.settings import (
+    BacktestingSettings,
+    ExecutionSettings,
+    MonteCarloSettings,
+    QuantSettings,
+)
 from app.engine.events import DecisionGenerated
 from app.execution.models import ExitReason, PositionSide, TradeRecord
 
@@ -125,6 +130,56 @@ def test_backtest_always_long_source_opens_a_position():
     engine = BacktestEngine(BacktestingSettings(), ExecutionSettings(enabled=True))
     result = engine.run(candles, _AlwaysLong(), _config())
     assert result.statistics["total_trades"] >= 1
+
+
+def _always_long_at(index_to_open: int):
+    class _AlwaysLong:
+        def reset(self) -> None:
+            pass
+
+        def decide(self, symbol: str, series: object, index: int) -> DecisionGenerated | None:
+            return open_decision(symbol, "open_long") if index == index_to_open else None
+
+    return _AlwaysLong()
+
+
+def test_backtest_without_quant_settings_stays_context_blind():
+    """El camino heredado: sin `quant`, el motor no ve régimen ni sesión.
+
+    Se fija a propósito, porque es la deuda de fidelidad que documentó la
+    bitácora del 04/08: con `context=None` el backtest y producción son
+    sistemas distintos.
+    """
+    candles = DatasetManager().synthetic("BTCUSDT", "1m", count=120, seed=5)
+    engine = BacktestEngine(BacktestingSettings(), ExecutionSettings(enabled=True))
+    result = engine.run(candles, _always_long_at(25), _config())
+    assert result.trades
+    assert all(trade.regime == "unknown" for trade in result.trades)
+
+
+def test_backtest_with_quant_settings_sees_regime_and_session():
+    """Con el Market Context cableado, el backtest clasifica igual que producción."""
+    candles = DatasetManager().synthetic("BTCUSDT", "1m", count=120, seed=5)
+    engine = BacktestEngine(BacktestingSettings(), ExecutionSettings(enabled=True), QuantSettings())
+    result = engine.run(candles, _always_long_at(25), _config())
+    assert result.trades
+    trade = result.trades[0]
+    assert trade.regime != "unknown"
+    # La sesión de entrada viaja al journal, y como tupla completa: los solapes
+    # son celdas propias, no se colapsan a la primera sesión activa.
+    assert trade.context_snapshot["entry_sessions"] is not None
+
+
+def test_backtest_market_context_can_be_turned_off():
+    """El toggle existe para poder medir cuánto cambia el resultado al añadirlo."""
+    candles = DatasetManager().synthetic("BTCUSDT", "1m", count=120, seed=5)
+    engine = BacktestEngine(
+        BacktestingSettings(market_context_enabled=False),
+        ExecutionSettings(enabled=True),
+        QuantSettings(),
+    )
+    result = engine.run(candles, _always_long_at(25), _config())
+    assert all(trade.regime == "unknown" for trade in result.trades)
 
 
 # --------------------------------------------------------------------------

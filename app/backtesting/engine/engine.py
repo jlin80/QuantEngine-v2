@@ -24,7 +24,10 @@ from app.backtesting.market import HistoricalMarket
 from app.backtesting.metrics import StatisticsEngine
 from app.backtesting.models import BacktestConfig, BacktestResult, EquityPoint
 from app.backtesting.simulator import build_execution_stack
-from app.config.settings import BacktestingSettings, ExecutionSettings
+from app.config.settings import BacktestingSettings, ExecutionSettings, QuantSettings
+from app.engine.feature_store import FeatureStore
+from app.engine.market_context import MarketContextEngine
+from app.engine.regime_detection import RegimeDetector
 from app.execution.models import ExitReason
 from app.market.models import Candle
 
@@ -53,11 +56,44 @@ class BacktestEngine:
     Args:
         settings: Configuración del laboratorio (balance, spread, risk-free).
         execution: Configuración de ejecución (misma que en paper real).
+        quant: Configuración del QuantCore. Cuando se pasa (y
+            ``settings.market_context_enabled``), el backtest construye el
+            **Market Context real** sobre el mismo mercado histórico, de modo
+            que el motor vea régimen, sesión y volatilidad igual que en
+            producción. Con ``None`` se conserva el camino degradado anterior.
     """
 
-    def __init__(self, settings: BacktestingSettings, execution: ExecutionSettings) -> None:
+    def __init__(
+        self,
+        settings: BacktestingSettings,
+        execution: ExecutionSettings,
+        quant: QuantSettings | None = None,
+    ) -> None:
         self._settings = settings
         self._execution = execution
+        self._quant = quant
+
+    def _build_context(
+        self, market: HistoricalMarket
+    ) -> tuple[MarketContextEngine | None, FeatureStore | None]:
+        """Build the Market Context Engine over the replayed market, if enabled.
+
+        El contexto se construye **sobre el mismo** ``MarketDataService`` que
+        consume el Execution Engine, así que lee exactamente las velas ya
+        publicadas por el reloj de replay: no hay lookahead posible por esta vía.
+
+        Devuelve también el Feature Store porque el backtest tiene que
+        invalidarlo **vela a vela**: su cache caduca por ``time.monotonic()``
+        (tiempo real), y en un backtest miles de velas simuladas caben dentro de
+        un TTL de un segundo. Sin invalidar, el contexto se congelaría igual que
+        se congeló el reloj el 2026-07-31.
+        """
+        if self._quant is None or not self._settings.market_context_enabled:
+            return None, None
+        features = FeatureStore(market.service)
+        regime = RegimeDetector(market.service, self._quant.regime)
+        context = MarketContextEngine(market.service, features, regime, self._quant.context)
+        return context, features
 
     def run(
         self,
@@ -101,7 +137,8 @@ class BacktestEngine:
 
         execution = self._execution.model_copy(update={"initial_balance": config.initial_balance})
         market = HistoricalMarket()
-        stack = build_execution_stack(execution, market.service)
+        context, features = self._build_context(market)
+        stack = build_execution_stack(execution, market.service, context=context)
         engine = stack.engine
         clock = ReplayClock(candles[0].start)
         decision_source.reset()
@@ -111,6 +148,8 @@ class BacktestEngine:
             for index, candle in enumerate(candles):
                 clock.set(candle.end)
                 market.push_candle(candle)
+                if features is not None:
+                    features.invalidate(config.symbol)
                 for price in _ohlc_path(candle):
                     market.push_price(
                         config.symbol, price, timestamp=candle.end, spread_bps=config.spread_bps
