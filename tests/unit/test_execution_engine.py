@@ -539,3 +539,101 @@ async def test_external_close_tolerates_slippage_on_the_stop():
     slipped = position.stop_loss - risk * 0.1  # dentro del 20% de tolerancia
 
     assert engine._infer_external_exit(position, slipped)[0] is ExitReason.STOP_LOSS
+
+
+# --------------------------------------------------------------------------
+# Sizing por símbolo (override de riesgo/notional para instrumentos caros)
+# --------------------------------------------------------------------------
+
+
+def _gold_decision() -> DecisionGenerated:
+    return DecisionGenerated(
+        source="test",
+        decision_id="d1",
+        symbol="XAUUSDM",
+        action="open_long",
+        accepted=True,
+        score=80.0,
+        confidence=0.8,
+        summary="momentum",
+    )
+
+
+def _gold_market() -> tuple[MarketDataService, MarketStateStore]:
+    # Precios y spread representativos del caso real de producción.
+    return make_market_with_state(
+        candles=make_candles([4370.0, 4375.0, 4372.0, 4378.0, 4376.0] * 6, symbol="XAUUSDM"),
+        ticker=make_ticker(symbol="XAUUSDM", bid=4377.9, ask=4378.15),
+    )
+
+
+def _with_gold_spec(engine):
+    """Injects a real XAUUSD contract (contract_size=100) into the paper broker.
+
+    ``PaperBroker`` no expone ``instrument_spec`` en los tests unitarios
+    (siempre asume contract_size=1, transparente para BTC/ETH/USTEC); aquí se
+    parchea puntualmente para reproducir el caso real de oro sin necesitar un
+    broker MT5 de verdad.
+    """
+    from app.execution.models import InstrumentSpec
+
+    spec = InstrumentSpec(symbol="XAUUSDM", contract_size=100.0, volume_min=0.01, volume_step=0.01)
+    engine._paper.instrument_spec = lambda symbol: spec if symbol == "XAUUSDM" else None
+    return engine
+
+
+async def test_symbol_matches_the_real_gold_case_gets_rejected_without_override():
+    """Reproduce el caso real: cuenta pequeña, oro sin override, se rechaza."""
+    market, _ = _gold_market()
+    engine = _with_gold_spec(
+        make_engine(
+            market,
+            make_execution_settings(
+                initial_balance=440.75,
+                sizing={
+                    "risk_per_trade_pct": 0.5,
+                    "max_position_pct": 20.0,
+                    "min_stop_pct": 0.15,
+                },
+            ),
+        )
+    )
+    position = await engine.process_decision(_gold_decision())
+    assert position is None
+    assert engine.orders.status()["rejected"] == 1
+
+
+async def test_symbol_override_lets_gold_open_without_loosening_globals():
+    """Con el override SOLO en XAUUSDM (sizing y riesgo), la cuenta puede abrir oro.
+
+    Todos los topes se dejan en valores que por sí solos bloquearían un lote
+    de oro (los globales de producción de referencia: 400/400/800%): sólo el
+    override específico de XAUUSDM debe abrir la puerta.
+    """
+    market, _ = _gold_market()
+    engine = _with_gold_spec(
+        make_engine(
+            market,
+            make_execution_settings(
+                initial_balance=440.75,
+                sizing={
+                    "risk_per_trade_pct": 0.5,
+                    "max_position_pct": 400.0,
+                    "min_stop_pct": 0.15,
+                    "risk_per_trade_pct_by_symbol": {"XAUUSDM": 2.0},
+                    "max_position_pct_by_symbol": {"XAUUSDM": 1100.0},
+                },
+                risk={
+                    "max_exposure_pct": 2000.0,
+                    "max_symbol_exposure_pct": 400.0,
+                    "max_correlation_exposure_pct": 800.0,
+                    "max_symbol_exposure_pct_by_symbol": {"XAUUSDM": 1100.0},
+                    "max_correlation_exposure_pct_by_symbol": {"XAUUSDM": 1100.0},
+                },
+            ),
+        )
+    )
+    position = await engine.process_decision(_gold_decision())
+    assert position is not None
+    assert position.quantity > 0
+    assert position.quantity == pytest.approx(0.01, abs=1e-9)

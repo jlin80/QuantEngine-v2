@@ -2467,3 +2467,69 @@ pare tambien el watchdog explicitamente.
   salida por `regime_change` la corto antes y la ejecucion cerro en +0.805R —
   el hueco del Bloque 3 tambien puede ir a favor, no solo en contra.
 - Dashboard (puerto 3000, no tocado por este despliegue) sigue vivo.
+
+## 2026-08-11 - Oro no operaba: tres topes de exposicion sin ajustar por simbolo
+
+**Categoria:** fix · **Tags:** `sizing` `riesgo` `oro` `contract-size` `override-por-simbolo`
+
+**Sintoma reportado.** Tras restringir produccion a operar solo XAUUSD
+(`symbols_enabled`), el motor aceptaba decisiones de oro por decenas cada
+hora pero nunca abria una operacion. Cero trades desde el cambio.
+
+**Diagnostico, descartando en orden.** Verificado con la cuenta MT5 real (no
+la estimacion interna): margen libre $440 de $441 de equity, apalancamiento
+real 1:2000 — la cuenta no tenia problema de margen. El log activo (`app.log`,
+no `engine.log` — ver nota de logging abajo) dio el motivo exacto:
+`sizing: el lote minimo (0.01) no cabe en el riesgo: caben 0.0000 lotes`.
+
+**La causa real: tres topes de notional, ninguno ajustado por
+contract_size.** XAUUSD tiene `contract_size=100` (1 lote = 100 onzas); a
+~4380 USD/onza, el lote MINIMO posible (0.01 = 1 onza) ya representa ~4380 USD
+de notional — sobre una cuenta de 441 USD, eso es ~993% de exposicion. Tres
+limites globales, calibrados para BTC/ETH/USTEC (`contract_size=1`), no
+llegaban ahi ni con los valores ya subidos en produccion:
+
+| Limite | Valor en produccion | Necesario para 1 onza |
+| --- | --- | --- |
+| `sizing.risk_per_trade_pct` | 0.5% | ≥1.49% (stop_distance real $6.57, gobernado por el piso `min_stop_pct`) |
+| `sizing.max_position_pct` | 400% | ≥993% |
+| `risk.max_symbol_exposure_pct` | 400% | ≥993% |
+| `risk.max_correlation_exposure_pct` | 800% | ≥993% |
+
+**Por que no es un bug de leverage.** La primera hipotesis fue que
+`max_position_pct` deberia dividir por apalancamiento (como si hace
+`PortfolioManager.used_capital`). Es incorrecta: el tope de notional protege
+contra el movimiento de PRECIO, no contra el margen requerido — el
+apalancamiento reduce cuanto efectivo necesitas, no cuanto puedes perder en
+una vela adversa. Ajustarlo por leverage 1:2000 dejaria pasar posiciones
+absurdas. El problema real es que los tres topes son **globales**, un unico
+numero para un instrumento de 100 USD/unidad (BTC) y uno de 4300 USD/unidad
+con contract_size 100 (oro): lo que le queda ajustado a uno le queda
+imposible al otro.
+
+**Arreglo: overrides por simbolo, mismo patron que `atr_pct_low_by_symbol`
+(Fase de calibracion del 04/08).** Nuevo en `SizingSettings`:
+`risk_per_trade_pct_by_symbol`, `max_position_pct_by_symbol`. Nuevo en
+`ExecutionRiskSettings`: `max_symbol_exposure_pct_by_symbol`,
+`max_correlation_exposure_pct_by_symbol`. Cada uno con su resolver
+`*_for(symbol)`, global como fallback. `PositionSizer.calculate()` y
+`RiskManager._exposure_check` los consultan cuando reciben `symbol`;
+`ExecutionEngine.process_decision` ahora pasa `symbol=symbol` al sizer.
+Compatible hacia atras: sin `symbol` (llamadas antiguas, tests), el
+comportamiento es identico al de siempre.
+
+**Hallazgo de logging, de paso.** `logs/engine.log` en produccion llevaba
+muerto desde el 21/07 (nadie escribe ahi); el log activo es `logs/app.log`.
+Cualquier diagnostico contra `engine.log` habria fallado en silencio — vale
+la pena revisar por que existen dos rutas de log y cual es la que documenta
+el runbook.
+
+**No se ha tocado el `.env` de produccion en esta entrada.** El codigo queda
+listo (tests + gates); los valores concretos para XAUUSDM (~2% riesgo,
+~1100% notional en los tres topes, con margen sobre el 993% minimo
+calculado) quedan para desplegar cuando el operador lo confirme.
+
+**Tests.** 11 nuevos (overrides de sizing, overrides del Risk Manager,
+integracion end-to-end reproduciendo el caso real medido en produccion:
+rechazo sin override, apertura con override, sin aflojar otros simbolos).
+Suite: **1337 en verde** en 3.12.10. Ruff, Black y MyPy strict limpios.

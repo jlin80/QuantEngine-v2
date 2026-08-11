@@ -69,6 +69,7 @@ class PositionSizer:
         reward_risk: float | None = None,
         spec: InstrumentSpec | None = None,
         risk_multiplier: float = 1.0,
+        symbol: str | None = None,
     ) -> SizingResult:
         """Compute the position quantity.
 
@@ -87,6 +88,10 @@ class PositionSizer:
                 limpio, que es el comportamiento correcto — si el dato no es
                 fiable y el tamaño reducido ya no cabe, no se opera. Nunca
                 puede aumentar el tamaño: valores por encima de 1.0 se acotan.
+            symbol: Símbolo a operar. Resuelve el riesgo por operación y el
+                tope de notional por símbolo (``*_by_symbol``), con el global
+                como fallback. Sin él (compatibilidad con llamadas antiguas y
+                tests) se usa directamente el global.
 
         Returns:
             Cantidad en lotes y su justificación (0 si no es posible dimensionar).
@@ -95,6 +100,17 @@ class PositionSizer:
         spec = spec or DEFAULT_SPEC
         if price <= 0 or equity <= 0:
             return SizingResult(0.0, method, 0.0, stop_distance, 0.0, "equity/precio no válidos")
+
+        risk_pct = (
+            self._settings.risk_per_trade_pct_for(symbol)
+            if symbol is not None
+            else self._settings.risk_per_trade_pct
+        )
+        position_pct = (
+            self._settings.max_position_pct_for(symbol)
+            if symbol is not None
+            else self._settings.max_position_pct
+        )
 
         if method == "fixed_amount":
             notional = self._settings.fixed_amount
@@ -108,14 +124,16 @@ class PositionSizer:
             reason = f"{self._settings.percent_of_equity:.2f}% del equity"
         elif method == "kelly":
             quantity, risk_amount, reason = self._kelly(
-                equity, stop_distance, win_rate, reward_risk
+                equity, stop_distance, win_rate, reward_risk, risk_pct
             )
         elif method == "dynamic_risk":
             quantity, risk_amount, reason = self._risk_based(
-                equity, stop_distance, confidence=confidence
+                equity, stop_distance, confidence=confidence, risk_pct=risk_pct
             )
         else:  # fixed_risk | atr (ambos = riesgo fijo sobre la distancia de stop)
-            quantity, risk_amount, reason = self._risk_based(equity, stop_distance, confidence=1.0)
+            quantity, risk_amount, reason = self._risk_based(
+                equity, stop_distance, confidence=1.0, risk_pct=risk_pct
+            )
 
         # El reductor externo entra DESPUÉS de los topes, y el orden importa:
         # aplicado antes, un tope que ya estuviera mordiendo se lo tragaba
@@ -123,7 +141,9 @@ class PositionSizer:
         # igualmente no reduce nada— y la protección desaparecía justo en las
         # operaciones más grandes, que son las que más importan. Acotado por
         # arriba a 1.0: subir tamaño por aquí sería una puerta trasera al sizing.
-        units = self._apply_caps(quantity, equity, price) * max(0.0, min(1.0, risk_multiplier))
+        units = self._apply_caps(quantity, equity, price, position_pct) * max(
+            0.0, min(1.0, risk_multiplier)
+        )
         if units < self._settings.min_quantity:
             return SizingResult(
                 0.0, method, risk_amount, stop_distance, 0.0, "bajo la cantidad mínima"
@@ -159,12 +179,12 @@ class PositionSizer:
         )
 
     def _risk_based(
-        self, equity: float, stop_distance: float, *, confidence: float
+        self, equity: float, stop_distance: float, *, confidence: float, risk_pct: float
     ) -> tuple[float, float, str]:
         """Fixed/dynamic risk sizing off the stop distance."""
         if stop_distance <= 0:
             return 0.0, 0.0, "sin distancia de stop (riesgo indefinido)"
-        pct = self._settings.risk_per_trade_pct
+        pct = risk_pct
         if confidence < 1.0:
             pct *= max(0.25, min(confidence, 1.0))
         risk_amount = equity * pct / 100.0
@@ -178,25 +198,30 @@ class PositionSizer:
         stop_distance: float,
         win_rate: float | None,
         reward_risk: float | None,
+        risk_pct: float,
     ) -> tuple[float, float, str]:
         """Partial-Kelly sizing; falls back to fixed risk without history."""
         if win_rate is None or reward_risk is None or reward_risk <= 0 or stop_distance <= 0:
-            quantity, risk_amount, _ = self._risk_based(equity, stop_distance, confidence=1.0)
+            quantity, risk_amount, _ = self._risk_based(
+                equity, stop_distance, confidence=1.0, risk_pct=risk_pct
+            )
             return quantity, risk_amount, "Kelly sin historial → riesgo fijo"
         # f* = W - (1 - W) / RR ; se usa una fracción parcial acotada.
         edge = win_rate - (1.0 - win_rate) / reward_risk
         fraction = max(0.0, edge) * self._settings.kelly_fraction
-        cap = self._settings.risk_per_trade_pct / 100.0
+        cap = risk_pct / 100.0
         fraction = min(fraction, cap)
         risk_amount = equity * fraction
         quantity = risk_amount / stop_distance
         reason = f"Kelly parcial f={fraction:.4f} (W={win_rate:.2f}, RR={reward_risk:.2f})"
         return quantity, risk_amount, reason
 
-    def _apply_caps(self, quantity: float, equity: float, price: float) -> float:
+    def _apply_caps(
+        self, quantity: float, equity: float, price: float, max_position_pct: float
+    ) -> float:
         """Cap the quantity by the maximum notional exposure per trade."""
         if quantity <= 0:
             return 0.0
-        max_notional = equity * self._settings.max_position_pct / 100.0
+        max_notional = equity * max_position_pct / 100.0
         max_quantity = max_notional / price
         return min(quantity, max_quantity)

@@ -1372,6 +1372,27 @@ class SizingSettings(BaseModel):
     kelly_fraction: float = 0.25  # fracción parcial de Kelly
     max_position_pct: float = 20.0  # tope de notional como % del equity
     min_quantity: float = 0.0
+    # Overrides por símbolo (mismo patrón que `atr_pct_low_by_symbol`): tanto
+    # el riesgo por operación como el tope de notional dependen del precio por
+    # unidad del subyacente, y ese precio no es comparable entre símbolos. El
+    # lote mínimo de XAUUSD (contract_size=100, ~4300 USD/onza) vale ~10x más
+    # que el de BTC/ETH/USTEC (contract_size=1) al mismo tamaño de cuenta: un
+    # único par de porcentajes deja a oro sin poder abrir ni el lote mínimo, o
+    # afloja la protección del resto de símbolos si se sube el global para
+    # que oro quepa. `max_position_pct` en particular es DELIBERADAMENTE
+    # independiente del apalancamiento (protege contra el movimiento de
+    # precio, no contra el margen requerido); el override es por símbolo, no
+    # por apalancamiento.
+    risk_per_trade_pct_by_symbol: dict[str, float] = Field(default_factory=dict)
+    max_position_pct_by_symbol: dict[str, float] = Field(default_factory=dict)
+
+    def risk_per_trade_pct_for(self, symbol: str) -> float:
+        """Riesgo por operación del símbolo, con el global como fallback."""
+        return self.risk_per_trade_pct_by_symbol.get(symbol.upper(), self.risk_per_trade_pct)
+
+    def max_position_pct_for(self, symbol: str) -> float:
+        """Tope de notional del símbolo, con el global como fallback."""
+        return self.max_position_pct_by_symbol.get(symbol.upper(), self.max_position_pct)
 
 
 class ExecutionRiskSettings(BaseModel):
@@ -1387,6 +1408,16 @@ class ExecutionRiskSettings(BaseModel):
     max_exposure_pct: float = 100.0  # exposición total / equity
     max_symbol_exposure_pct: float = 40.0
     max_correlation_exposure_pct: float = 60.0
+    # Overrides por símbolo, mismo patrón y misma razón que
+    # `SizingSettings.max_position_pct_by_symbol`: el notional de un lote
+    # mínimo escala con el contract_size y el precio por unidad del
+    # subyacente, que no es comparable entre XAUUSD (contract_size=100,
+    # miles de USD/onza) y BTC/ETH/USTEC (contract_size=1). Un único par de
+    # porcentajes globales o bloquea a oro incluso en su lote mínimo, o
+    # afloja la protección de correlación/exposición del resto de símbolos si
+    # se sube lo suficiente como para que oro quepa.
+    max_symbol_exposure_pct_by_symbol: dict[str, float] = Field(default_factory=dict)
+    max_correlation_exposure_pct_by_symbol: dict[str, float] = Field(default_factory=dict)
     correlation_groups: list[list[str]] = Field(default_factory=list)
     min_liquidity: float = 0.0  # volumen reciente mínimo
     max_spread_bps: float = 10.0
@@ -1395,6 +1426,18 @@ class ExecutionRiskSettings(BaseModel):
     circuit_breaker_window_minutes: float = 15.0
     # Kill switch: drawdown máximo tolerado sobre el equity pico.
     kill_switch_drawdown_pct: float = 20.0
+
+    def max_symbol_exposure_pct_for(self, symbol: str) -> float:
+        """Tope de exposición del símbolo, con el global como fallback."""
+        return self.max_symbol_exposure_pct_by_symbol.get(
+            symbol.upper(), self.max_symbol_exposure_pct
+        )
+
+    def max_correlation_exposure_pct_for(self, symbol: str) -> float:
+        """Tope de exposición correlacionada del símbolo, con el global como fallback."""
+        return self.max_correlation_exposure_pct_by_symbol.get(
+            symbol.upper(), self.max_correlation_exposure_pct
+        )
 
 
 class StrategyExperimentSettings(BaseModel):

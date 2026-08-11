@@ -49,6 +49,70 @@ def test_blocks_on_correlation_group():
     assert not check.allowed and check.rule == "max_correlation_exposure"
 
 
+def test_correlation_check_applies_even_without_a_group():
+    """El propio notional de la operación cuenta, tenga o no grupo asignado.
+
+    ``correlated = _correlated_exposure() + new_notional``: aunque el símbolo
+    no esté en ningún `correlation_groups`, su propio notional sigue sumando
+    contra el tope. No es un caso raro — es el camino normal para un símbolo
+    sin grupo configurado (``correlation_groups=[]`` por defecto).
+    """
+    rm = RiskManager(ExecutionRiskSettings(max_correlation_exposure_pct=5.0), 10_000.0)
+    check = rm.evaluate_entry(_query(new_notional=600.0))
+    assert not check.allowed and check.rule == "max_correlation_exposure"
+
+
+# --------------------------------------------------------------------------
+# Overrides por símbolo (mismo problema que el sizing: XAUUSD contract_size=100
+# hace que su notional mínimo no sea comparable al de BTC/ETH/USTEC)
+# --------------------------------------------------------------------------
+
+
+def test_symbol_exposure_override_lets_gold_through_without_loosening_others():
+    settings = ExecutionRiskSettings(
+        max_exposure_pct=2000.0,
+        max_symbol_exposure_pct=40.0,
+        max_symbol_exposure_pct_by_symbol={"XAUUSDM": 1100.0},
+        max_correlation_exposure_pct=2000.0,
+    )
+    rm = RiskManager(settings, 440.75)
+    gold = rm.evaluate_entry(_query(symbol="XAUUSDM", new_notional=4_378.0, equity=440.75))
+    assert gold.allowed
+
+    other = rm.evaluate_entry(_query(symbol="ETHUSDM", new_notional=4_378.0, equity=440.75))
+    assert not other.allowed and other.rule == "max_symbol_exposure"
+
+
+def test_correlation_exposure_override_lets_gold_through_without_loosening_others():
+    settings = ExecutionRiskSettings(
+        # Alto para ambos, así el símbolo de control pasa el chequeo de
+        # exposición y llega al de correlación, que es el que este test mide.
+        max_exposure_pct=2000.0,
+        max_symbol_exposure_pct=2000.0,
+        max_correlation_exposure_pct=60.0,
+        max_correlation_exposure_pct_by_symbol={"XAUUSDM": 1100.0},
+    )
+    rm = RiskManager(settings, 440.75)
+    gold = rm.evaluate_entry(_query(symbol="XAUUSDM", new_notional=4_378.0, equity=440.75))
+    assert gold.allowed
+
+    other = rm.evaluate_entry(_query(symbol="ETHUSDM", new_notional=4_378.0, equity=440.75))
+    assert not other.allowed and other.rule == "max_correlation_exposure"
+
+
+def test_exposure_resolvers_fall_back_to_global_for_unlisted_symbols():
+    settings = ExecutionRiskSettings(
+        max_symbol_exposure_pct=40.0,
+        max_correlation_exposure_pct=60.0,
+        max_symbol_exposure_pct_by_symbol={"XAUUSDM": 1100.0},
+        max_correlation_exposure_pct_by_symbol={"XAUUSDM": 1100.0},
+    )
+    assert settings.max_symbol_exposure_pct_for("XAUUSDM") == 1100.0
+    assert settings.max_symbol_exposure_pct_for("ETHUSDM") == 40.0
+    assert settings.max_correlation_exposure_pct_for("xauusdm") == 1100.0  # normaliza mayúsculas
+    assert settings.max_correlation_exposure_pct_for("BTCUSDM") == 60.0
+
+
 def test_consecutive_losses_block_then_reset():
     rm = RiskManager(ExecutionRiskSettings(max_consecutive_losses=2), 10_000.0)
     rm.on_trade_closed(-10.0)

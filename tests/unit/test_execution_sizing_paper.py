@@ -2,6 +2,7 @@
 
 import random
 
+import pytest
 from app.config.settings import SizingSettings
 from app.execution.commission import CommissionEngine
 from app.execution.latency import LatencyEngine
@@ -156,3 +157,94 @@ def test_sizing_quantizes_lots_downwards():
     # 100 / 57 = 1.7543... unidades = lotes -> 1.75 tras cuantizar hacia abajo.
     assert result.quantity == 1.75
     assert result.risk_amount <= 100.0
+
+
+# --------------------------------------------------------------------------
+# Overrides por símbolo (riesgo por operación y tope de notional)
+# --------------------------------------------------------------------------
+#
+# El lote mínimo de XAUUSD (contract_size=100, ~4300 USD/onza) representa
+# ~10x más riesgo y notional que el de BTC/ETH/USTEC (contract_size=1) al
+# mismo tamaño de cuenta. Un único par de porcentajes globales o deja a oro
+# sin poder abrir el lote mínimo, o afloja la protección del resto de
+# símbolos si se sube para que oro quepa. Reproduce el caso real medido en
+# producción: cuenta de 440.75 con oro a ~4378, sin overrides.
+
+
+def _gold_case_settings(**overrides) -> SizingSettings:
+    base: dict[str, object] = {
+        "method": "fixed_risk",
+        "risk_per_trade_pct": 0.5,
+        "max_position_pct": 20.0,
+    }
+    base.update(overrides)
+    return SizingSettings(**base)
+
+
+def _gold_spec() -> InstrumentSpec:
+    return InstrumentSpec(symbol="XAUUSDM", contract_size=100.0, volume_min=0.01, volume_step=0.01)
+
+
+def test_global_defaults_cannot_size_one_lot_of_gold_on_a_small_account():
+    """El caso real: globales por defecto, oro nunca cabe con esta cuenta."""
+    sizer = PositionSizer(_gold_case_settings())
+    result = sizer.calculate(
+        equity=440.75, price=4_378.0, stop_distance=6.567, spec=_gold_spec(), symbol="XAUUSDM"
+    )
+    assert result.quantity == 0.0
+
+
+def test_symbol_override_lets_gold_size_the_minimum_lot():
+    """Con overrides SOLO para XAUUSDM, el lote mínimo de oro cabe."""
+    settings = _gold_case_settings(
+        risk_per_trade_pct_by_symbol={"XAUUSDM": 2.0},
+        max_position_pct_by_symbol={"XAUUSDM": 1100.0},
+    )
+    sizer = PositionSizer(settings)
+    result = sizer.calculate(
+        equity=440.75, price=4_378.0, stop_distance=6.567, spec=_gold_spec(), symbol="XAUUSDM"
+    )
+    assert result.quantity >= 0.01
+    assert result.quantity == pytest.approx(0.01, abs=1e-9)
+
+
+def test_symbol_override_does_not_loosen_other_symbols():
+    """El override de oro no afecta a un símbolo sin entrada propia."""
+    settings = _gold_case_settings(
+        risk_per_trade_pct_by_symbol={"XAUUSDM": 2.0},
+        max_position_pct_by_symbol={"XAUUSDM": 1100.0},
+    )
+    sizer = PositionSizer(settings)
+    spec = InstrumentSpec(symbol="ETHUSDM", contract_size=1.0, volume_min=0.01, volume_step=0.01)
+    with_symbol = sizer.calculate(
+        equity=440.75, price=1_861.48, stop_distance=8.17, spec=spec, symbol="ETHUSDM"
+    )
+    without_override = PositionSizer(_gold_case_settings()).calculate(
+        equity=440.75, price=1_861.48, stop_distance=8.17, spec=spec
+    )
+    assert with_symbol.quantity == without_override.quantity
+    assert with_symbol.risk_amount == without_override.risk_amount
+
+
+def test_no_symbol_argument_falls_back_to_global_pct():
+    """Compatibilidad: sin `symbol`, se comporta exactamente como antes."""
+    settings = _gold_case_settings(
+        risk_per_trade_pct_by_symbol={"XAUUSDM": 5.0}, max_position_pct=100.0
+    )
+    sizer = PositionSizer(settings)
+    without_symbol = sizer.calculate(equity=10_000.0, price=100.0, stop_distance=2.0)
+    # 0.5% global, no el 5% de XAUUSDM: no se pasó symbol.
+    assert without_symbol.risk_amount == 50.0
+
+
+def test_settings_resolvers_fall_back_to_global_for_unlisted_symbols():
+    settings = SizingSettings(
+        risk_per_trade_pct=0.5,
+        max_position_pct=20.0,
+        risk_per_trade_pct_by_symbol={"XAUUSDM": 2.0},
+        max_position_pct_by_symbol={"XAUUSDM": 1100.0},
+    )
+    assert settings.risk_per_trade_pct_for("XAUUSDM") == 2.0
+    assert settings.risk_per_trade_pct_for("ETHUSDM") == 0.5
+    assert settings.max_position_pct_for("xauusdm") == 1100.0  # normaliza a mayúsculas
+    assert settings.max_position_pct_for("BTCUSDM") == 20.0

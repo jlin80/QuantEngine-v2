@@ -211,23 +211,25 @@ class RiskManager:
                 f"({s.max_exposure_pct:.0f}% de un equity de {equity:.2f})",
             )
         symbol = query.symbol.upper()
+        symbol_pct = s.max_symbol_exposure_pct_for(symbol)
         projected_symbol = query.symbol_exposures.get(symbol, 0.0) + query.new_notional
-        limit_symbol = equity * s.max_symbol_exposure_pct / 100.0
+        limit_symbol = equity * symbol_pct / 100.0
         if projected_symbol > limit_symbol:
             return RiskCheck(
                 False,
                 "max_symbol_exposure",
                 f"exposición en {symbol} {projected_symbol:.2f} > límite {limit_symbol:.2f} "
-                f"({s.max_symbol_exposure_pct:.0f}% de un equity de {equity:.2f})",
+                f"({symbol_pct:.0f}% de un equity de {equity:.2f})",
             )
+        correlation_pct = s.max_correlation_exposure_pct_for(symbol)
         correlated = self._correlated_exposure(symbol, query) + query.new_notional
-        limit_corr = equity * s.max_correlation_exposure_pct / 100.0
+        limit_corr = equity * correlation_pct / 100.0
         if correlated > limit_corr:
             return RiskCheck(
                 False,
                 "max_correlation_exposure",
                 f"exposición correlacionada {correlated:.2f} > límite {limit_corr:.2f} "
-                f"({s.max_correlation_exposure_pct:.0f}% de un equity de {equity:.2f})",
+                f"({correlation_pct:.0f}% de un equity de {equity:.2f})",
             )
         return RiskCheck(True)
 

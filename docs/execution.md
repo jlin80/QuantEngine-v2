@@ -73,6 +73,17 @@ solo si supera **todos** los límites, evaluados en orden:
 5. Pérdida realizada diaria/semanal/mensual dentro de límite.
 6. Exposición total / por símbolo / por grupo de correlación.
 
+**`max_symbol_exposure_pct` y `max_correlation_exposure_pct` admiten override
+por símbolo** (`*_by_symbol`, con el global como fallback vía
+`max_symbol_exposure_pct_for(symbol)` / `max_correlation_exposure_pct_for`).
+Motivo: son topes de notional **sin ajustar por apalancamiento** —
+deliberadamente, protegen contra el movimiento de precio, no contra el margen
+requerido— y el notional de un lote mínimo escala con `contract_size` × precio
+por unidad. XAUUSD (`contract_size=100`, miles de USD/onza) puede necesitar
+~25× el tope que le basta a BTC/ETH/USTEC (`contract_size=1`); forzar un único
+par de porcentajes globales o deja a oro sin poder abrir ni el lote mínimo, o
+afloja la protección del resto de símbolos.
+
 Filtros de mercado adicionales: **spread** (`max_spread_bps`) y **liquidez**
 (`min_liquidity`). Cortacircuitos:
 
@@ -101,6 +112,15 @@ decisión) y `kelly` (parcial, con respaldo a riesgo fijo sin historial). La
 distancia de stop se deriva del ATR (`atr_stop_multiplier`); el objetivo, de la
 relación `reward_risk`. Todo con tope de exposición por operación
 (`max_position_pct`).
+
+`risk_per_trade_pct` y `max_position_pct` también admiten override por símbolo
+(`risk_per_trade_pct_by_symbol`, `max_position_pct_by_symbol`), misma razón que
+en el Risk Manager: si el lote mínimo del símbolo no cabe en el presupuesto de
+riesgo global, la operación se rechaza limpio (`sizing.quantity == 0`, nunca se
+infla hasta `volume_min`) — el caso real que lo motivó fue XAUUSD en una cuenta
+de $500, donde el lote mínimo (1 onza, ~4300 USD de notional) no cabía ni en el
+0.5% de riesgo por operación ni en el 20% de tope de notional que sí bastaban
+para BTC/ETH/USTEC.
 
 ## Formato de notificaciones Discord
 

@@ -537,6 +537,7 @@ class ExecutionEngine(Service):
             risk_multiplier=(
                 1.0 if self._risk_multiplier_reader is None else self._risk_multiplier_reader()
             ),
+            symbol=symbol,
         )
         if sizing.quantity <= 0:
             await self._reject(symbol, side, RejectReason.INVALID_QUANTITY, "sizing", sizing.reason)
