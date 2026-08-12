@@ -55,12 +55,19 @@ def session_cell(sessions: Sequence[str] | None) -> str:
 
 @dataclass(slots=True)
 class CellSample:
-    """Muestra cruda de una celda (estrategia, sesión) antes de resumirla."""
+    """Muestra cruda de una celda (estrategia, sesión) antes de resumirla.
+
+    ``trade_holding_s`` y ``trade_exit`` son del Bloque 7 (¿esto sigue siendo
+    scalping?): sin el motivo de salida, un holding corto no distingue "llegó
+    a su objetivo rápido" de "algo lo cortó antes de tiempo".
+    """
 
     strategy: str
     session: str
     trade_r: list[float] = field(default_factory=list)
     trade_times: list[datetime] = field(default_factory=list)
+    trade_holding_s: list[float] = field(default_factory=list)
+    trade_exit: list[str] = field(default_factory=list)
     signal_r: list[float] = field(default_factory=list)
 
 
@@ -83,6 +90,8 @@ class CellResult:
     survives_fdr: bool
     verdict: str
     reason: str
+    holding_median_s: float | None = None
+    exit_mix: tuple[tuple[str, float], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """JSON-safe representation (``None`` se conserva, nunca pasa a 0.0)."""
@@ -102,6 +111,8 @@ class CellResult:
             "survives_fdr": self.survives_fdr,
             "verdict": self.verdict,
             "reason": self.reason,
+            "holding_median_s": self.holding_median_s,
+            "exit_mix": dict(self.exit_mix),
         }
 
 
@@ -256,6 +267,8 @@ def evaluate_cells(
                         f"n_trades={n_trades} (<{min_trades}) / "
                         f"n_señales={n_signals} (<{min_signals})"
                     ),
+                    holding_median_s=_median(sample.trade_holding_s),
+                    exit_mix=_exit_mix(sample.trade_exit),
                 )
             )
             continue
@@ -294,6 +307,8 @@ def evaluate_cells(
                 survives_fdr=survives,
                 verdict=verdict,
                 reason=reason,
+                holding_median_s=_median(sample.trade_holding_s),
+                exit_mix=_exit_mix(sample.trade_exit),
             )
         )
     return results
@@ -316,6 +331,169 @@ def _subperiod_expectancy(
                 index += 1
         buckets[index].append(r_value)
     return tuple(_mean(bucket) for bucket in buckets)
+
+
+def _median(values: Sequence[float]) -> float | None:
+    """Mediana de la muestra (``None`` si está vacía).
+
+    Mediana y no media: el holding tiene cola larga, y una operación de dos
+    horas mueve la media sin describir a las otras mil.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _exit_mix(reasons: Sequence[str]) -> tuple[tuple[str, float], ...]:
+    """Reparto de motivos de salida, de mayor a menor."""
+    if not reasons:
+        return ()
+    total = len(reasons)
+    counts: dict[str, int] = {}
+    for reason in reasons:
+        counts[reason] = counts.get(reason, 0) + 1
+    return tuple(sorted(((k, v / total) for k, v in counts.items()), key=lambda kv: -kv[1]))
+
+
+def scalping_check(results: Sequence[CellResult], *, max_holding_s: float) -> dict[str, object]:
+    """Bloque 7: ¿alguna celda se sale del régimen de scalping?
+
+    La pregunta del enunciado es si el edge de alguna celda aparece **sólo con
+    holdings largos**. Se responde en dos direcciones, porque medir sólo una
+    daría por buena la mitad del problema:
+
+    - **por arriba**: celdas cuyo holding mediano supera ``max_holding_s``;
+    - **por abajo**: celdas cuya salida dominante no es ni objetivo ni stop, es
+      decir, operaciones cortadas antes de que su tesis se resolviera. Un
+      holding corto no prueba que el sistema haga scalping: puede probar que
+      algo lo interrumpe.
+
+    Args:
+        results: Celdas evaluadas (sólo se miran las de muestra suficiente).
+        max_holding_s: Techo del régimen de scalping, en segundos.
+
+    Returns:
+        Veredicto, celdas fuera de rango y el reparto de salidas dominante.
+    """
+    measured = [r for r in results if r.verdict != "muestra_insuficiente" and r.holding_median_s]
+    too_long = [
+        f"{r.strategy}@{r.session}"
+        for r in measured
+        if r.holding_median_s is not None and r.holding_median_s > max_holding_s
+    ]
+    # Una celda "resuelve su tesis" cuando sale por su propio objetivo o su
+    # propio stop. Cualquier otra cosa (régimen, tiempo, kill switch) la corta.
+    resolved = {"take_profit", "stop_loss", "trailing_stop"}
+    cut_short = [
+        f"{r.strategy}@{r.session}"
+        for r in measured
+        if r.exit_mix and r.exit_mix[0][0] not in resolved
+    ]
+    holdings = [r.holding_median_s for r in measured if r.holding_median_s is not None]
+    with_edge_and_long = [
+        f"{r.strategy}@{r.session}"
+        for r in measured
+        if r.verdict == "edge_estable"
+        and r.holding_median_s is not None
+        and r.holding_median_s > max_holding_s
+    ]
+    if with_edge_and_long:
+        decision = "edge_solo_con_holdings_largos"
+    elif too_long:
+        decision = "holdings_largos_sin_edge"
+    else:
+        decision = "dentro_del_regimen_de_scalping"
+    return {
+        "decision": decision,
+        "max_holding_s": max_holding_s,
+        "cells_measured": len(measured),
+        "holding_median_s": _median(holdings),
+        "cells_over_threshold": too_long,
+        "cells_with_edge_over_threshold": with_edge_and_long,
+        "cells_cut_before_thesis": cut_short,
+    }
+
+
+def walk_forward(
+    samples: Sequence[CellSample],
+    *,
+    boundaries: Sequence[datetime],
+    min_trades: int = 30,
+    fdr_q: float = 0.10,
+    resamples: int = 10_000,
+) -> list[dict[str, object]]:
+    """Bloque 1: walk-forward IS→OOS **de la regla de selección**.
+
+    Un walk-forward valida una decisión tomada con datos pasados. Aquí la
+    decisión es la del kill criteria: *«esta celda tiene edge»*. Cada pliegue
+    aplica esa regla usando **sólo** las operaciones anteriores a la frontera
+    (in-sample) y después mide, sin volver a elegir, qué hicieron esas mismas
+    celdas en el bloque siguiente (out-of-sample).
+
+    Es la diferencia que faltó en el ranking BTC/ETH: allí se eligió y se midió
+    sobre el mismo tramo, y el ranking resultó ser ruido (r = +0.084).
+
+    Args:
+        samples: Muestras crudas por celda, con sus tiempos.
+        boundaries: Fronteras internas que definen los bloques (len = n - 1).
+        min_trades: Muestra mínima exigida **en cada lado** del pliegue.
+        fdr_q: Tasa de FDR aplicada dentro del in-sample.
+        resamples: Remuestreos del bootstrap.
+
+    Returns:
+        Un registro por pliegue. Una selección vacía es un resultado
+        —significa que la regla no eligió nada que validar— y se reporta como
+        tal, no como un pliegue omitido.
+    """
+    blocks: list[datetime | None] = [*boundaries, None]
+    folds: list[dict[str, object]] = []
+    for index in range(len(blocks) - 1):
+        is_end = blocks[index]
+        oos_end = blocks[index + 1]
+        if is_end is None:
+            continue
+        selected: list[str] = []
+        candidates = 0
+        p_values: list[float] = []
+        keys: list[tuple[CellSample, float, float]] = []
+        for sample in samples:
+            in_sample = [
+                r for r, t in zip(sample.trade_r, sample.trade_times, strict=True) if t < is_end
+            ]
+            if len(in_sample) < min_trades:
+                continue
+            candidates += 1
+            expectancy = _mean(in_sample)
+            ci_low, _, p_value = bootstrap_expectancy(in_sample, resamples=resamples)
+            p_values.append(p_value)
+            keys.append((sample, expectancy or 0.0, ci_low))
+        passed = benjamini_hochberg(p_values, q=fdr_q)
+        oos_values: list[float] = []
+        for (sample, expectancy, ci_low), survives in zip(keys, passed, strict=True):
+            if not (expectancy > 0 and ci_low > 0 and survives):
+                continue
+            selected.append(f"{sample.strategy}@{sample.session}")
+            oos_values.extend(
+                r
+                for r, t in zip(sample.trade_r, sample.trade_times, strict=True)
+                if t >= is_end and (oos_end is None or t < oos_end)
+            )
+        folds.append(
+            {
+                "fold": index + 1,
+                "is_end": is_end.isoformat(),
+                "oos_end": oos_end.isoformat() if oos_end is not None else None,
+                "cells_eligible_in_sample": candidates,
+                "cells_selected_in_sample": selected,
+                "oos_trades": len(oos_values),
+                "oos_expectancy_r": _mean(oos_values),
+            }
+        )
+    return folds
 
 
 def verdict_summary(

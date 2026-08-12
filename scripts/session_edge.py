@@ -39,8 +39,10 @@ from app.backtesting.session_edge import (
     CellResult,
     CellSample,
     evaluate_cells,
+    scalping_check,
     session_cell,
     verdict_summary,
+    walk_forward,
 )
 from app.config.settings import QuantStrategySettings, Settings, get_settings
 from app.engine.evaluation import PerformanceTracker
@@ -176,11 +178,15 @@ def run_strategy(
     )
     result = lab.run_backtest(candles, source, config)
 
-    trades: list[tuple[str, float, datetime]] = []
+    trades: list[tuple[str, float, datetime, float, str]] = []
     for trade in result.trades:
         snapshot = trade.context_snapshot or {}
         cell = session_cell(snapshot.get("entry_sessions"))
-        trades.append((cell, trade.r_multiple, trade.entry_time))
+        # Bloque 7: holding y motivo de salida. El holding se deriva de las dos
+        # marcas de tiempo y no de un campo aparte, para que no pueda quedar
+        # desalineado con la operacion que describe.
+        holding = (trade.exit_time - trade.entry_time).total_seconds()
+        trades.append((cell, trade.r_multiple, trade.entry_time, holding, str(trade.exit_reason)))
 
     signals = [
         (session_cell(_sessions_at(settings, row.opened_at)), row.r_multiple)
@@ -200,7 +206,9 @@ def _sessions_at(settings: Settings, moment: datetime) -> tuple[str, ...]:
 
 
 def build_samples(
-    per_strategy: dict[str, tuple[list[tuple[str, float, datetime]], list[tuple[str, float]]]],
+    per_strategy: dict[
+        str, tuple[list[tuple[str, float, datetime, float, str]], list[tuple[str, float]]]
+    ],
 ) -> list[CellSample]:
     """Fold the per-strategy runs into one sample per (strategy, session) cell."""
     samples: dict[tuple[str, str], CellSample] = {}
@@ -212,10 +220,12 @@ def build_samples(
         return samples[key]
 
     for strategy, (trades, signals) in per_strategy.items():
-        for session, r_value, moment in trades:
+        for session, r_value, moment, holding, exit_reason in trades:
             sample = _cell(strategy, session)
             sample.trade_r.append(r_value)
             sample.trade_times.append(moment)
+            sample.trade_holding_s.append(holding)
+            sample.trade_exit.append(exit_reason)
         for session, r_value in signals:
             _cell(strategy, session).signal_r.append(r_value)
     return sorted(samples.values(), key=lambda s: (s.strategy, s.session))
@@ -272,6 +282,16 @@ def main() -> int:
     parser.add_argument("--min-trades", type=int, default=30)
     parser.add_argument("--min-signals", type=int, default=30)
     parser.add_argument("--fdr-q", type=float, default=0.10)
+    parser.add_argument(
+        "--max-holding-s",
+        type=float,
+        default=1800.0,
+        help=(
+            "Techo del régimen de scalping en segundos (Bloque 7). 1800 = 30 min, muy "
+            "por debajo de la salida por tiempo del motor (240 min): lo que se comprueba "
+            "es que la operativa siga siendo intradía corta, no que respete el tope duro."
+        ),
+    )
     parser.add_argument("--only", help="Coma-separada: sólo estas estrategias")
     parser.add_argument(
         "--lift-loss-streak-halt",
@@ -336,6 +356,41 @@ def main() -> int:
     print(f"  {summary['why']}")
     print(f"  conteo por categoría: {summary['counts']}")
 
+    # Bloque 1: walk-forward de la REGLA de selección, sobre las mismas
+    # fronteras por calendario que ya usan los sub-periodos.
+    folds = walk_forward(
+        samples,
+        boundaries=subperiod_boundaries(candles, args.subperiods),
+        min_trades=args.min_trades,
+        fdr_q=args.fdr_q,
+    )
+    print("\nWALK-FORWARD (IS -> OOS)")
+    for fold in folds:
+        selected = fold["cells_selected_in_sample"]
+        assert isinstance(selected, list)
+        print(
+            f"  pliegue {fold['fold']}: {fold['cells_eligible_in_sample']} celdas elegibles IS, "
+            f"{len(selected)} seleccionadas -> OOS {fold['oos_trades']} ops "
+            f"expectancy {_fmt(fold['oos_expectancy_r'])}"  # type: ignore[arg-type]
+        )
+        if selected:
+            print(f"    seleccionadas: {', '.join(selected)}")
+
+    # Bloque 7: ¿esto sigue siendo scalping?
+    scalping = scalping_check(results, max_holding_s=args.max_holding_s)
+    print("\nBLOQUE 7 - régimen de scalping")
+    print(f"  {scalping['decision']} (techo {args.max_holding_s:.0f}s)")
+    print(
+        f"  holding mediano de las celdas medidas: "
+        f"{_fmt(scalping['holding_median_s'], 0)}s "  # type: ignore[arg-type]
+        f"sobre {scalping['cells_measured']} celdas"
+    )
+    over = scalping["cells_over_threshold"]
+    cut = scalping["cells_cut_before_thesis"]
+    assert isinstance(over, list) and isinstance(cut, list)
+    print(f"  celdas por encima del techo: {len(over)}")
+    print(f"  celdas cortadas antes de resolver su tesis: {len(cut)}")
+
     payload = {
         "symbol": args.symbol.upper(),
         "bars": len(candles),
@@ -349,6 +404,8 @@ def main() -> int:
         "loss_streak_halt_lifted": args.lift_loss_streak_halt,
         "cells": [r.to_dict() for r in results],
         "summary": summary,
+        "walk_forward": folds,
+        "scalping": scalping,
     }
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

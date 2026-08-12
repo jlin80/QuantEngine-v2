@@ -326,3 +326,82 @@ cuatro minutos, con −0.18R cada vez. Multiplicado por el 92 % de la muestra, e
   solape en el modelo de slippage. El journal ya guarda la tupla completa
   (`entry_sessions`); esa ruta no.
 - El freno por racha de pérdidas, arriba. Es lo primero de la lista.
+
+## Cierre de los Bloques 1 y 7 (2026-08-12)
+
+Dos casillas del enunciado quedaron sin cerrar el 11/08: el **walk-forward
+IS→OOS** del Bloque 1 (se probó estabilidad por sub-periodos, que no es lo
+mismo) y la **verificación de régimen de scalping** del Bloque 7, que nunca se
+escribió. Se cierran aquí con datos, no con argumentos. Corrida nueva sobre
+50 000 velas de `XAUUSDm` (2026-06-23 → 2026-08-12), mismo protocolo y mismos
+umbrales — no se tocó ninguno.
+
+### Bloque 1 — walk-forward de la regla de selección
+
+Un walk-forward valida **una decisión tomada con datos pasados**. Aquí la
+decisión es la del kill criteria: *«esta celda tiene edge»*. Cada pliegue la
+aplica usando sólo las operaciones anteriores a la frontera (in-sample) y
+después mide, **sin volver a elegir**, qué hicieron esas mismas celdas en el
+bloque siguiente (out-of-sample). Es exactamente la separación que faltó cuando
+el ranking BTC/ETH resultó ser ruido (r = +0.084): allí se eligió y se midió
+sobre el mismo tramo.
+
+| Pliegue | Fin del IS | Celdas elegibles IS | Seleccionadas | Ops OOS | Expectancy OOS |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 2026-07-10 | 44 | **0** | 0 | — |
+| 2 | 2026-07-26 | 56 | **0** | 0 | — |
+
+**La regla no seleccionó nada que validar, en ninguno de los dos pliegues.** No
+es que el out-of-sample saliera mal: es que ni siquiera mirando **sólo** el
+in-sample —el tramo donde una regla sobreajustada tendría todas las de ganar—
+hubo una celda con expectancy positiva, IC inferior sobre cero y superviviente
+del FDR. Un conjunto de selección vacío es el resultado más fuerte que puede dar
+un walk-forward: no hay nada que pueda degradarse fuera de muestra porque no hay
+nada elegido dentro.
+
+Esto **confirma** el veredicto del Bloque 3 por una vía independiente y cierra
+la casilla: no se cablean pesos por sesión.
+
+### Bloque 7 — ¿esto sigue siendo scalping?
+
+Se mide en dos direcciones, porque una sola daría por buena la mitad del
+problema. Techo declarado: **1800 s (30 min)**, muy por debajo de la salida por
+tiempo del motor (240 min) — lo que se comprueba es que la operativa siga siendo
+intradía corta, no que respete el tope duro.
+
+| | |
+| --- | --- |
+| Celdas medidas | 68 |
+| Holding mediano | **240 s** (rango de medianas: 180-360 s) |
+| Celdas por encima del techo | **0** |
+| Celdas con edge que sólo aparece con holdings largos | **0** |
+| Celdas cuya salida dominante **no** resuelve su tesis | **68 de 68** |
+
+**Veredicto: `dentro_del_regimen_de_scalping`.** Ninguna combinación
+(estrategia, sesión) se sale del régimen, y la pregunta del enunciado —«¿el edge
+aparece sólo con holdings largos?»— no llega a plantearse, porque no hay edge en
+ninguna celda.
+
+Pero la medición **por abajo** es la que importa. Un holding corto no prueba que
+el sistema haga scalping: puede probar que algo lo está cortando. Reparto real
+de motivos de salida sobre las 11 370 operaciones de las celdas medidas:
+
+| Motivo de salida | Cuota |
+| --- | --- |
+| `regime_change` | **91.3 %** |
+| `stop_loss` | 5.7 % |
+| `take_profit` | 2.3 % |
+| `trailing_stop` | 0.5 % |
+| `break_even` | 0.2 % |
+| `time_exit` | 0.1 % |
+
+**En las 68 celdas, sin una sola excepción, la salida dominante es
+`regime_change`.** El 11/08 esto se vio en tres estrategias representativas;
+ahora se sabe que es universal. Sólo el **8.5 %** de las operaciones termina en
+un nivel propio de la estrategia (objetivo, stop o trailing). El sistema no está
+haciendo scalping *por diseño de sus estrategias*: lo está haciendo porque la
+salida por régimen cierra nueve de cada diez posiciones a los cuatro minutos.
+
+Sigue sin probar que la salida por régimen deba quitarse —medir su coste no mide
+lo que evitó—, pero el Bloque 7 queda respondido: **el régimen es de scalping, y
+no es la estrategia quien lo decide.**

@@ -8,8 +8,10 @@ from app.backtesting.session_edge import (
     bootstrap_expectancy,
     evaluate_cells,
     profit_factor,
+    scalping_check,
     session_cell,
     verdict_summary,
+    walk_forward,
 )
 
 _START = datetime(2026, 6, 22, tzinfo=UTC)
@@ -154,3 +156,94 @@ def test_no_winners_is_a_verdict_not_a_failure():
     summary = verdict_summary(results)
     assert summary["decision"] == "no_hay_edge_estable_por_sesion"
     assert summary["counts"]["sin_edge"] == 4
+
+
+# --------------------------------------------------------------------------
+# Bloque 1 — walk-forward IS → OOS
+# --------------------------------------------------------------------------
+
+
+def _timed(strategy: str, session: str, values: list[float]):
+    """Muestra con una operación por hora, en orden cronológico real.
+
+    A diferencia de ``_sample``, aquí el orden importa: el walk-forward parte
+    por fecha, y repartir las operaciones en ciclo entre sub-periodos haría que
+    "antes de la frontera" no significara nada.
+    """
+    sample = CellSample(strategy=strategy, session=session)
+    for i, value in enumerate(values):
+        sample.trade_r.append(value)
+        sample.trade_times.append(_START + timedelta(hours=i))
+        sample.signal_r.append(value)
+    return sample
+
+
+def test_walk_forward_selects_in_sample_and_measures_out_of_sample():
+    """La celda gana en IS y pierde en OOS: el WF tiene que enseñar la caída."""
+    sample = _timed("bos", "europe", [1.0] * 40 + [-1.0] * 40)
+    boundary = _START + timedelta(hours=40)
+    folds = walk_forward([sample], boundaries=[boundary], min_trades=30, resamples=500)
+    assert len(folds) == 1
+    assert folds[0]["cells_selected_in_sample"] == ["bos@europe"]
+    assert folds[0]["oos_trades"] == 40
+    assert folds[0]["oos_expectancy_r"] == -1.0
+
+
+def test_walk_forward_reports_an_empty_selection_instead_of_skipping_the_fold():
+    """Sin celdas elegidas el pliegue se reporta igual: es un resultado."""
+    sample = _timed("bos", "europe", [-1.0] * 80)
+    boundary = _START + timedelta(hours=40)
+    folds = walk_forward([sample], boundaries=[boundary], min_trades=30, resamples=500)
+    assert folds[0]["cells_selected_in_sample"] == []
+    assert folds[0]["oos_trades"] == 0
+    assert folds[0]["oos_expectancy_r"] is None
+
+
+def test_walk_forward_ignores_cells_without_in_sample_evidence():
+    """Una celda que solo opera DESPUÉS de la frontera no se puede seleccionar."""
+    late = CellSample(strategy="late", session="asia")
+    for i in range(60):
+        late.trade_r.append(1.0)
+        late.trade_times.append(_START + timedelta(hours=50 + i))
+    folds = walk_forward([late], boundaries=[_START + timedelta(hours=40)], resamples=500)
+    assert folds[0]["cells_eligible_in_sample"] == 0
+    assert folds[0]["cells_selected_in_sample"] == []
+
+
+# --------------------------------------------------------------------------
+# Bloque 7 — régimen de scalping
+# --------------------------------------------------------------------------
+
+
+def _with_exits(strategy: str, values: list[float], holding_s: float, reason: str):
+    sample = _sample(strategy, "europe", values)
+    sample.trade_holding_s.extend([holding_s] * len(values))
+    sample.trade_exit.extend([reason] * len(values))
+    return sample
+
+
+def test_scalping_check_passes_when_holdings_are_short():
+    sample = _with_exits("bos", [1.0, 0.8, 1.2] * 15, 180.0, "take_profit")
+    results = evaluate_cells([sample], boundaries=_boundaries(), resamples=500)
+    check = scalping_check(results, max_holding_s=1800.0)
+    assert check["decision"] == "dentro_del_regimen_de_scalping"
+    assert check["holding_median_s"] == 180.0
+    assert check["cells_cut_before_thesis"] == []
+
+
+def test_scalping_check_flags_edge_that_only_appears_with_long_holdings():
+    """Es la pregunta literal del Bloque 7: edge, sí, pero fuera de scalping."""
+    sample = _with_exits("bos", [1.0, 0.8, 1.2] * 15, 7200.0, "take_profit")
+    results = evaluate_cells([sample], boundaries=_boundaries(), resamples=500)
+    check = scalping_check(results, max_holding_s=1800.0)
+    assert check["decision"] == "edge_solo_con_holdings_largos"
+    assert check["cells_with_edge_over_threshold"] == ["bos@europe"]
+
+
+def test_scalping_check_flags_trades_cut_before_their_thesis_resolves():
+    """Holding corto NO prueba scalping: puede ser que algo lo esté cortando."""
+    sample = _with_exits("bos", [-0.2, -0.1, -0.3] * 15, 200.0, "regime_change")
+    results = evaluate_cells([sample], boundaries=_boundaries(), resamples=500)
+    check = scalping_check(results, max_holding_s=1800.0)
+    assert check["decision"] == "dentro_del_regimen_de_scalping"
+    assert check["cells_cut_before_thesis"] == ["bos@europe"]

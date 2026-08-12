@@ -2562,3 +2562,59 @@ tambien: hoy en 2000%, insuficiente para 5 posiciones de oro por si solas.
 
 **Tests.** 2 nuevos (override de `max_positions_per_symbol`, resolver).
 Suite: **1339 en verde**. Ruff/Black/MyPy limpios.
+
+## 2026-08-12 - Cierre de los Bloques 1 y 7 de la tarea de sesion
+
+**Categoria:** medicion · **Tags:** `sesion` `walk-forward` `scalping` `xauusd` `cierre-tarea`
+
+Auditando la tarea de sesion aparecieron dos casillas sin cerrar: el
+**walk-forward IS->OOS** del Bloque 1 (el 11/08 se probo estabilidad por
+sub-periodos, que no es lo mismo) y la **verificacion de regimen de scalping**
+del Bloque 7, que nunca se escribio pese a que los datos estaban a mano. Se
+cierran con una corrida nueva (50 000 velas, 2026-06-23 -> 2026-08-12), mismo
+protocolo y **sin tocar ningun umbral**.
+
+### Bloque 1: la regla no selecciono nada que validar
+
+`walk_forward()` aplica el kill criteria usando solo las operaciones anteriores
+a la frontera y despues mide, sin volver a elegir, que hicieron esas celdas en
+el bloque siguiente. Es la separacion que falto en el ranking BTC/ETH.
+
+| Pliegue | Celdas elegibles IS | Seleccionadas | Ops OOS |
+| --- | --- | --- | --- |
+| 1 | 44 | **0** | 0 |
+| 2 | 56 | **0** | 0 |
+
+No es que el OOS saliera mal: **ni mirando solo el in-sample** —donde una regla
+sobreajustada tendria todas las de ganar— hubo una celda con expectancy
+positiva, IC inferior sobre cero y superviviente del FDR. Un conjunto de
+seleccion vacio es el resultado mas fuerte que puede dar un walk-forward: no hay
+nada que pueda degradarse fuera de muestra porque no hay nada elegido dentro.
+Confirma el veredicto del Bloque 3 por una via independiente.
+
+### Bloque 7: el regimen es de scalping, pero no lo decide la estrategia
+
+Holding mediano **240 s**, cero celdas por encima del techo de 30 min, cero
+celdas con edge que dependa de holdings largos. La pregunta del enunciado ni se
+plantea, porque no hay edge en ninguna celda.
+
+Lo que si aparece es la medicion **por abajo**, que es la que importa: un
+holding corto no prueba scalping, puede probar que algo lo esta cortando. Sobre
+11 370 operaciones, `regime_change` se lleva el **91.3 %** de las salidas y solo
+el **8.5 %** termina en un nivel propio de la estrategia (objetivo, stop o
+trailing). **En las 68 celdas medidas, sin una sola excepcion, la salida
+dominante es `regime_change`.** El 11/08 esto se vio en tres estrategias
+representativas; ahora se sabe que es universal.
+
+### Que se anadio al codigo
+
+`walk_forward()` y `scalping_check()` en `app/backtesting/session_edge.py`, mas
+holding y motivo de salida por operacion en `CellSample`/`CellResult` (sin el
+motivo, un holding corto no distingue "llego rapido a su objetivo" de "algo lo
+corto"). El script los imprime y los persiste en el JSON. 9 tests nuevos, entre
+ellos los dos casos que importan: una celda que gana en IS y pierde en OOS, y
+una celda cortada antes de resolver su tesis pese a tener holding corto.
+
+Suite completa en verde, Ruff/Black/MyPy strict limpios. **No se cambio ningun
+umbral, ninguna config de produccion ni ninguna estrategia**: la tarea sigue
+cerrada con el mismo veredicto, ahora con las dos casillas que le faltaban.
