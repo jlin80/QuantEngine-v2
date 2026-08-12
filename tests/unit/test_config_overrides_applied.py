@@ -45,6 +45,19 @@ def test_overrides_survive_a_fresh_settings_object():
     assert reloaded.execution.trailing_activate_r == 2.5
 
 
+def test_ignore_drawdown_limits_is_a_hot_toggle():
+    """El toggle del dashboard debe aplicar sin reiniciar el motor."""
+    from app.dashboard.api.config_store import _is_live
+
+    settings = Settings()
+    assert settings.execution.risk.ignore_drawdown_limits is False
+
+    config_store.apply(settings, {"execution.risk.ignore_drawdown_limits": True})
+
+    assert settings.execution.risk.ignore_drawdown_limits is True
+    assert _is_live("execution.risk.ignore_drawdown_limits")
+
+
 def test_reapply_runs_before_subsystems_are_built():
     """Ancla el ORDEN en bootstrap: reapply antes de construir nada.
 

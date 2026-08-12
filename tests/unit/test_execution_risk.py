@@ -138,6 +138,46 @@ def test_kill_switch_on_drawdown():
     assert rm.evaluate_entry(_query()).allowed
 
 
+def test_ignore_drawdown_limits_never_trips_kill_switch():
+    settings = ExecutionRiskSettings(kill_switch_drawdown_pct=10.0, ignore_drawdown_limits=True)
+    rm = RiskManager(settings, 10_000.0)
+    rm.update_equity(80.0)
+    assert not rm.kill_switch_active
+    assert rm.evaluate_entry(_query()).allowed
+    # El drawdown se sigue midiendo: el override no ciega la métrica.
+    assert rm.status()["drawdown_pct"] == 80.0
+    assert rm.status()["ignore_drawdown_limits"] is True
+
+
+def test_ignore_drawdown_limits_releases_a_drawdown_kill_switch():
+    settings = ExecutionRiskSettings(kill_switch_drawdown_pct=10.0)
+    rm = RiskManager(settings, 10_000.0)
+    rm.update_equity(12.0)
+    assert rm.kill_switch_active
+    settings.ignore_drawdown_limits = True  # el toggle del dashboard, en caliente
+    rm.update_equity(15.0)
+    assert not rm.kill_switch_active
+    assert rm.evaluate_entry(_query()).allowed
+
+
+def test_ignore_drawdown_limits_does_not_release_a_manual_kill_switch():
+    settings = ExecutionRiskSettings(ignore_drawdown_limits=True)
+    rm = RiskManager(settings, 10_000.0)
+    rm.engage_kill_switch("parada manual del operador")
+    rm.update_equity(50.0)
+    assert rm.kill_switch_active
+    assert not rm.evaluate_entry(_query()).allowed
+
+
+def test_ignore_drawdown_limits_keeps_other_limits():
+    settings = ExecutionRiskSettings(max_daily_loss_pct=1.0, ignore_drawdown_limits=True)
+    rm = RiskManager(settings, 10_000.0)
+    rm.on_trade_closed(-150.0)
+    rm.update_equity(40.0)
+    check = rm.evaluate_entry(_query())
+    assert not check.allowed and check.rule == "max_daily_loss"
+
+
 def test_circuit_breaker_on_fast_loss():
     settings = ExecutionRiskSettings(
         circuit_breaker_loss_pct=2.0, circuit_breaker_window_minutes=15.0

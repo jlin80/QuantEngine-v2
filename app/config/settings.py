@@ -1427,6 +1427,13 @@ class ExecutionRiskSettings(BaseModel):
     circuit_breaker_window_minutes: float = 15.0
     # Kill switch: drawdown máximo tolerado sobre el equity pico.
     kill_switch_drawdown_pct: float = 20.0
+    # Override explícito del operador: con esto en `True` el bot NO se detiene
+    # por drawdown, por hondo que sea. Desactiva las tres paradas por drawdown
+    # a la vez (kill switch del Risk Manager, trigger de Safe Mode y filtro de
+    # drawdown diario del motor), y suelta el kill switch si ya había saltado
+    # por drawdown. El resto de límites (pérdida diaria/semanal/mensual,
+    # pérdidas consecutivas, circuit breaker, exposición) siguen vigentes.
+    ignore_drawdown_limits: bool = False
 
     def max_positions_per_symbol_for(self, symbol: str) -> int:
         """Tope de posiciones simultáneas del símbolo, con el global como fallback."""

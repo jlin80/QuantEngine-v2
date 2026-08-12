@@ -64,6 +64,7 @@ class RiskManager:
         self._consecutive_losses = 0
         self._kill_switch = False
         self._kill_reason = ""
+        self._kill_by_drawdown = False
         self._circuit_breaker = False
         self._circuit_reason = ""
         self._circuit_until: datetime | None = None
@@ -90,17 +91,25 @@ class RiskManager:
         """Current streak of consecutive losing trades."""
         return self._consecutive_losses
 
-    def engage_kill_switch(self, reason: str) -> None:
-        """Engage the kill switch (blocks all new entries)."""
+    def engage_kill_switch(self, reason: str, *, by_drawdown: bool = False) -> None:
+        """Engage the kill switch (blocks all new entries).
+
+        Args:
+            reason: Motivo legible.
+            by_drawdown: Si el disparo viene del drawdown. Se recuerda para que
+                ``ignore_drawdown_limits`` pueda soltar sólo esos disparos.
+        """
         if not self._kill_switch:
             self._log.warning("Kill switch engaged: %s", reason)
         self._kill_switch = True
         self._kill_reason = reason
+        self._kill_by_drawdown = by_drawdown
 
     def reset_kill_switch(self) -> None:
         """Manually release the kill switch."""
         self._kill_switch = False
         self._kill_reason = ""
+        self._kill_by_drawdown = False
 
     def reset_circuit_breaker(self) -> None:
         """Manually release the circuit breaker."""
@@ -288,11 +297,25 @@ class RiskManager:
         self._check_circuit_breaker(when)
 
     def update_equity(self, drawdown_pct: float) -> None:
-        """Update the running drawdown and trip the kill switch if breached."""
+        """Update the running drawdown and trip the kill switch if breached.
+
+        Con ``ignore_drawdown_limits`` activo el drawdown se sigue midiendo y
+        publicando, pero no detiene nada: si el switch ya estaba activo *por
+        drawdown*, se suelta aquí. Un switch disparado por otra causa (manual,
+        programado) no se toca: este override es sólo sobre el drawdown.
+        """
         self._last_drawdown_pct = drawdown_pct
+        if self._settings.ignore_drawdown_limits:
+            if self._kill_switch and self._kill_by_drawdown:
+                self._log.warning(
+                    "Kill switch por drawdown liberado: ignore_drawdown_limits está activo"
+                )
+                self.reset_kill_switch()
+            return
         if drawdown_pct >= self._settings.kill_switch_drawdown_pct > 0:
             self.engage_kill_switch(
-                f"drawdown {drawdown_pct:.1f}% ≥ {self._settings.kill_switch_drawdown_pct:.1f}%"
+                f"drawdown {drawdown_pct:.1f}% ≥ {self._settings.kill_switch_drawdown_pct:.1f}%",
+                by_drawdown=True,
             )
 
     def _check_circuit_breaker(self, now: datetime) -> None:
@@ -330,6 +353,7 @@ class RiskManager:
             "circuit_reason": self._circuit_reason,
             "consecutive_losses": self._consecutive_losses,
             "drawdown_pct": round(self._last_drawdown_pct, 4),
+            "ignore_drawdown_limits": self._settings.ignore_drawdown_limits,
             "realized_today": round(self._realized_since(_start_of_day(utc_now())), 4),
             "limits": {
                 "max_risk_per_trade_pct": self._settings.max_risk_per_trade_pct,

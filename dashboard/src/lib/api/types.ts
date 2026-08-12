@@ -191,6 +191,8 @@ export interface RiskStatus {
   circuit_reason: string;
   consecutive_losses: number;
   drawdown_pct: number;
+  /** Operator override: no drawdown-based halt is enforced while true. */
+  ignore_drawdown_limits: boolean;
   realized_today: number;
   limits: RiskLimits;
 }

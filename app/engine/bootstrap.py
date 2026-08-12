@@ -556,7 +556,16 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
 
     filters = build_filter_chain(
         quant.filters,
-        drawdown_reader=lambda: history.get_state("daily_drawdown_pct"),
+        # El override del operador (`execution.risk.ignore_drawdown_limits`) se
+        # lee en cada evaluación, no al construir la cadena: así el toggle del
+        # dashboard aplica en caliente. Con él activo el filtro ve 0% y nunca
+        # bloquea, en vez de sacarlo de la cadena (seguiría apareciendo en la
+        # explicación de la decisión, que es lo que queremos auditar).
+        drawdown_reader=lambda: (
+            0.0
+            if settings.execution.risk.ignore_drawdown_limits
+            else history.get_state("daily_drawdown_pct")
+        ),
         recent_decisions=lambda: history.decisions(limit=50),
         microstructure=micro_reader,
         measured_correlation=(

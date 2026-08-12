@@ -708,6 +708,12 @@ class QuantEngine:
             status = execution.risk.status()
             raw_drawdown = status.get("drawdown_pct")
             drawdown = float(raw_drawdown) if isinstance(raw_drawdown, int | float) else None
+            # Con el override del operador activo el drawdown se deja de
+            # reportar a Safe Mode: `None` es "no observable", y Safe Mode no
+            # degrada por un sensor que no reporta. El resto de señales
+            # (latencia, CPU, errores, broker) siguen vigilándose igual.
+            if self._settings.execution.risk.ignore_drawdown_limits:
+                drawdown = None
             risk_breach = bool(status.get("circuit_breaker", False))
         if snapshot is None:
             return SafeModeObservation(drawdown_pct=drawdown, risk_breach=risk_breach)

@@ -98,6 +98,25 @@ Filtros de mercado adicionales: **spread** (`max_spread_bps`) y **liquidez**
   `circuit_breaker_window_minutes` supera `circuit_breaker_loss_pct`; pausa
   las entradas hasta que la ventana expira.
 
+### Override del operador: `ignore_drawdown_limits`
+
+`execution.risk.ignore_drawdown_limits` (toggle en la tarjeta *Risk manager* del
+dashboard, y en el Config Center) desactiva **todas** las paradas por drawdown a
+la vez, en caliente y sin reiniciar:
+
+- el **kill switch** por drawdown del Risk Manager no salta; si ya había saltado
+  *por drawdown*, se suelta en el siguiente ciclo (y el endpoint libera también
+  el `KillSwitchController` global, que persiste su estado en disco);
+- Safe Mode deja de recibir el drawdown como señal (`None` = no observable), así
+  que su trigger `DRAWDOWN` no se dispara;
+- el filtro de **drawdown diario** del motor ve 0 % y no bloquea señales.
+
+Lo que **sigue vigente** con el toggle activo: pérdidas diaria / semanal /
+mensual, pérdidas consecutivas, circuit breaker, límites de exposición y
+posiciones, y el resto de triggers de Safe Mode (latencia, CPU, memoria,
+errores, broker). Un kill switch disparado a mano, por programación o por otra
+causa **no** se suelta: el override es sólo sobre el drawdown.
+
 ## Contabilidad (Portfolio Manager)
 
 Modelo de margen, simétrico para largos y cortos:

@@ -28,6 +28,9 @@ WHITELIST: tuple[str, ...] = (
     "execution.risk.max_exposure_pct",
     "execution.risk.max_consecutive_losses",
     "execution.risk.kill_switch_drawdown_pct",
+    # Toggle de operador: deja de parar por drawdown (kill switch, Safe Mode y
+    # filtro de drawdown diario). Va bajo `execution.risk.` → aplica en caliente.
+    "execution.risk.ignore_drawdown_limits",
     "execution.symbols_enabled",
     "execution.strategies_enabled",
     "execution.falsification.enabled",
