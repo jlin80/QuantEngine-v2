@@ -59,6 +59,11 @@ async def patch_config(request: Request, patch: dict[str, Any]) -> dict[str, Any
         applied = config_store.apply(settings, patch)
     except KeyError as exc:
         raise HTTPException(status_code=422, detail=f"Key not allowed: {exc}") from exc
+    except ValueError as exc:
+        # El valor no encaja con el tipo declarado. Devolver el motivo importa:
+        # un 500 genérico aquí obligaba a leer el log del servidor para saber
+        # que faltaba una coma en un JSON.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     audit_log.record(action="config.patch", after=applied)
     if applied.get(IGNORE_DRAWDOWN):
         await _release_drawdown_kill_switch(request)

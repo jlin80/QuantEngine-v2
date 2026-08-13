@@ -377,10 +377,16 @@ export interface BacktestExperimentsResponse {
 
 // ---------------------------------------------------------------- command layer
 
+export type ConfigKind = "bool" | "number" | "dict" | "list" | "string";
+
 export interface ConfigEntry {
   value: unknown;
   overridden: boolean;
   default: unknown;
+  /** Tipo declarado en el esquema. No se deduce del valor: un dict vacío no dice nada. */
+  kind: ConfigKind;
+  /** El motor lo lee en cada evaluación; si es false, el cambio exige reinicio. */
+  live: boolean;
 }
 
 export interface ConfigResponse {

@@ -11,16 +11,23 @@ import json
 import logging
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, get_origin
+
+from pydantic import TypeAdapter, ValidationError
 
 from app.config.settings import Settings
 
 _log = logging.getLogger("app.api.config")
 
 WHITELIST: tuple[str, ...] = (
-    "risk.max_daily_drawdown_pct",
-    "risk.max_open_positions",
-    "risk.risk_per_trade_pct",
+    # `risk.*` (el `RiskSettings` raíz) estuvo aquí y no lo lee NADIE: el propio
+    # modelo se documenta como "contratos para fases futuras". Eran tres campos
+    # editables con nombres casi idénticos a los `execution.risk.*` de al lado,
+    # que sí mandan — bajar ahí el drawdown máximo no cambiaba nada y parecía
+    # que sí. El freno diario real es `quant.filters.max_drawdown_pct`, que no
+    # estaba en la whitelist y ahora sí (lo lee el DrawdownFilter al construir
+    # la cadena, así que exige reinicio y `apply` lo reporta).
+    "quant.filters.max_drawdown_pct",
     "execution.risk.max_risk_per_trade_pct",
     "execution.risk.max_daily_loss_pct",
     "execution.risk.max_open_positions",
@@ -188,8 +195,14 @@ class RuntimeConfigStore:
         Args:
             settings: Root settings object.
 
+        Se publica también el ``kind`` declarado y si el path aplica en
+        caliente. El frontend deducía el control del ``typeof`` del valor por
+        defecto, y un `dict` vacío es indistinguible de un objeto cualquiera:
+        los campos compuestos acababan en un input de texto que mostraba
+        ``[object Object]``. El tipo lo sabe el esquema — que lo diga él.
+
         Returns:
-            Mapping ``path -> {value, overridden, default}``.
+            Mapping ``path -> {value, overridden, default, kind, live}``.
         """
         with self._lock:
             overrides = dict(self._overrides)
@@ -200,6 +213,8 @@ class RuntimeConfigStore:
                 "value": overrides.get(path, default),
                 "overridden": path in overrides,
                 "default": default,
+                "kind": _kind(_annotation(settings, path), default),
+                "live": _is_live(path),
             }
         return result
 
@@ -214,23 +229,30 @@ class RuntimeConfigStore:
             settings: Root settings object (mutado en sitio).
             patch: Mapping of whitelisted paths to new values.
 
+        El parche es **todo o nada**: se valida entero antes de escribir nada.
+        Aplicar la mitad de un parche deja al motor en un estado que el operador
+        no pidió y que la UI no refleja — peor que rechazarlo completo.
+
         Returns:
-            The applied (coerced) values.
+            The applied (validated) values.
 
         Raises:
             KeyError: If a key is not in the whitelist.
+            ValueError: Si algún valor no encaja con el tipo declarado, o si no
+                se pudo escribir sobre los settings vivos.
         """
-        applied: dict[str, Any] = {}
         with self._lock:
+            validated: dict[str, Any] = {}
             for key, value in patch.items():
                 if key not in WHITELIST:
                     raise KeyError(key)
-                coerced = _coerce(_resolve(settings, key), value)
-                _set_live(settings, key, coerced)
+                validated[key] = _coerce(settings, key, value)
+            for key, coerced in validated.items():
+                if not _set_live(settings, key, coerced):
+                    raise ValueError(f"{key}: no se pudo aplicar sobre la configuración viva")
                 self._overrides[key] = coerced
-                applied[key] = coerced
             self._persist()
-        return applied
+        return validated
 
     def reapply(self, settings: Settings) -> None:
         """Push persisted overrides onto the live settings (call at startup).
@@ -270,23 +292,87 @@ class RuntimeConfigStore:
             return dict(current)
 
 
-def _coerce(current: Any, value: Any) -> Any:
-    """Coerce a new value to the type of the current setting value.
+def _kind(annotation: Any, current: Any) -> str:
+    """Clasificar un path para que el dashboard elija el control adecuado.
+
+    Se mira primero la anotación declarada y sólo se cae al valor actual cuando
+    no hay esquema que consultar.
+    """
+    target = annotation if annotation is not None else type(current)
+    origin = get_origin(target) or target
+    if origin is bool:
+        return "bool"
+    if origin in (int, float):
+        return "number"
+    if origin is dict:
+        return "dict"
+    if origin is list:
+        return "list"
+    return "string"
+
+
+def _annotation(settings: Settings, path: str) -> Any:
+    """Anotación de tipo declarada para un path, o ``None`` si no se puede leer.
+
+    Se prefiere al tipo del **valor actual** porque un `dict` vacío no dice nada
+    sobre lo que acepta: `symbols_enabled` empieza en `{}` y de ahí no se deduce
+    que sus valores sean booleanos.
+    """
+    parts = path.split(".")
+    parent: Any = settings
+    for part in parts[:-1]:
+        parent = getattr(parent, part, None)
+        if parent is None:
+            return None
+    fields = getattr(type(parent), "model_fields", None)
+    if not isinstance(fields, dict):
+        return None
+    field = fields.get(parts[-1])
+    return None if field is None else field.annotation
+
+
+def _coerce(settings: Settings, path: str, value: Any) -> Any:
+    """Validar y convertir un valor entrante contra el esquema declarado.
+
+    Los settings anidados **no** llevan ``validate_assignment``, así que un
+    ``setattr`` acepta cualquier cosa sin chistar. Sin esta puerta, guardar un
+    campo de tipo `dict` desde el dashboard escribía la cadena `"[object
+    Object]"` dentro de `execution.symbols_enabled`, y el siguiente tick moría
+    con ``AttributeError`` al llamar ``.get()`` sobre un `str` — en el camino
+    caliente de ejecución. Validar aquí es lo que hace que el Config Center no
+    pueda tumbar el motor.
 
     Args:
-        current: Current setting value (used as the type hint).
-        value: Incoming value from the request.
+        settings: Root settings object.
+        path: Dotted path que se está escribiendo.
+        value: Valor entrante de la petición (puede venir como JSON en texto).
 
     Returns:
-        The coerced value.
+        El valor validado y convertido al tipo declarado.
+
+    Raises:
+        ValueError: Si el valor no encaja con el tipo declarado.
     """
-    if isinstance(current, bool):
-        return bool(value)
-    if isinstance(current, int):
-        return int(value)
-    if isinstance(current, float):
-        return float(value)
-    return value
+    annotation = _annotation(settings, path)
+    if annotation is None:
+        return value
+    # Los campos compuestos llegan como texto desde un input; un dict/lista ya
+    # decodificado pasa de largo.
+    if isinstance(value, str):
+        origin = get_origin(annotation)
+        if origin in (dict, list) or annotation in (dict, list):
+            try:
+                value = json.loads(value)
+            except ValueError as exc:
+                raise ValueError(f"{path}: se esperaba JSON válido ({exc})") from exc
+    try:
+        return TypeAdapter(annotation).validate_python(value)
+    except ValidationError as exc:
+        errors = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or 'valor'}: {err['msg']}"
+            for err in exc.errors()
+        )
+        raise ValueError(f"{path}: {errors}") from exc
 
 
 config_store = RuntimeConfigStore(Path("logs") / "runtime_config.json")

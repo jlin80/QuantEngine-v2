@@ -7,6 +7,7 @@ import { SectionCard } from "@/components/common/section-card";
 import { Async } from "@/components/common/states";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useConfig } from "@/lib/api/hooks";
 import { useConfigPatch } from "@/lib/api/mutations";
 import type { ConfigEntry, ConfigResponse } from "@/lib/api/types";
@@ -21,7 +22,48 @@ function section(path: string): string {
   return path.split(".")[0];
 }
 
-function Field({
+/**
+ * Editor JSON para los campos compuestos (dict/list). Mantiene el texto en
+ * estado propio para no reformatear mientras se escribe, y sólo propaga el
+ * valor cuando parsea: así un JSON a medio teclear no se envía al motor. El
+ * error se muestra aquí en vez de esperar al 422 del backend.
+ */
+function JsonField({
+  value,
+  onChange,
+}: {
+  value: unknown;
+  onChange: (v: unknown) => void;
+}) {
+  const [text, setText] = useState(() => JSON.stringify(value ?? {}, null, 2));
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <textarea
+        spellCheck={false}
+        rows={Math.min(8, Math.max(2, text.split("\n").length))}
+        className={`${inputClass} h-auto w-64 resize-y py-1 font-mono text-xs ${
+          error ? "border-bear/60" : ""
+        }`}
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          try {
+            onChange(JSON.parse(e.target.value));
+            setError(null);
+          } catch (err) {
+            setError(err instanceof Error ? err.message : "JSON inválido");
+          }
+        }}
+      />
+      {error && <span className="max-w-64 text-right text-[11px] text-bear">{error}</span>}
+    </div>
+  );
+}
+
+/** Exportado para test: el control se elige por `entry.kind`, no por el valor. */
+export function Field({
   path,
   entry,
   value,
@@ -33,10 +75,9 @@ function Field({
   onChange: (v: unknown) => void;
 }) {
   const label = titleCase(path.split(".").slice(1).join(" ") || path);
-  const base = entry.default;
 
   let control: React.ReactNode;
-  if (typeof base === "boolean") {
+  if (entry.kind === "bool") {
     control = (
       <button
         type="button"
@@ -66,7 +107,7 @@ function Field({
         ))}
       </select>
     );
-  } else if (typeof base === "number") {
+  } else if (entry.kind === "number") {
     control = (
       <input
         type="number"
@@ -76,6 +117,8 @@ function Field({
         onChange={(e) => onChange(e.target.value === "" ? null : Number(e.target.value))}
       />
     );
+  } else if (entry.kind === "dict" || entry.kind === "list") {
+    control = <JsonField value={value} onChange={onChange} />;
   } else {
     control = (
       <input
@@ -87,13 +130,28 @@ function Field({
   }
 
   return (
-    <div className="flex items-center justify-between gap-3 py-1.5">
-      <span className="flex items-center gap-2 text-sm">
+    <div className="flex items-start justify-between gap-3 py-1.5">
+      <span className="flex flex-wrap items-center gap-2 pt-1 text-sm">
         {label}
         {entry.overridden && (
           <Badge variant="outline" className="border-info/40 text-info">
             override
           </Badge>
+        )}
+        {!entry.live && (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Badge variant="outline" className="border-warn/40 text-warn">
+                  restart
+                </Badge>
+              }
+            />
+            <TooltipContent>
+              El motor lee este valor sólo al arrancar. Se guarda y se aplica en el próximo
+              reinicio.
+            </TooltipContent>
+          </Tooltip>
         )}
       </span>
       {control}
