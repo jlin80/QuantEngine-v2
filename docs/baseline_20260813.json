@@ -1,0 +1,37 @@
+{
+  "generado": "2026-08-13T20:57:22.069127+00:00",
+  "proposito": "Linea base antes de las 2 semanas de medicion. Comparar contra esto.",
+  "muestra_vigente": {
+    "descripcion": "XAUUSDM desde el pivote a solo-oro del 11/08",
+    "n": 391,
+    "expectancy_r": 0.032,
+    "desviacion_r": 0.7834,
+    "win_rate_pct": 47.3,
+    "profit_factor": 1.108,
+    "pnl": 79.1,
+    "ops_por_dia": 190
+  },
+  "historial_completo": {
+    "n": 1928,
+    "expectancy_r": -0.0648
+  },
+  "mezcla_salidas_pct": {
+    "regime_change": 65.9,
+    "stop_loss": 15.1,
+    "manual": 8.7,
+    "take_profit": 5.1,
+    "trailing_stop": 4.7,
+    "break_even": 0.6
+  },
+  "graduacion": {
+    "cumplidos": 2,
+    "total": 7,
+    "faltan": [
+      "expectativa",
+      "profit_factor",
+      "drawdown",
+      "dias_continuados",
+      "salidas_por_ejecucion"
+    ]
+  }
+}
