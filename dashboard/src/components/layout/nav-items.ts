@@ -1,11 +1,15 @@
 import {
+  Activity,
+  Ban,
   Bell,
   Boxes,
   BrainCircuit,
   Briefcase,
   CandlestickChart,
+  Coins,
   FileText,
   FlaskConical,
+  Gauge,
   HeartPulse,
   LayoutDashboard,
   NotebookText,
@@ -46,6 +50,18 @@ export const NAV: NavSection[] = [
       { label: "Order Flow", href: "/orderflow", icon: Waves, enabled: true },
       { label: "Machine Learning", href: "/ml", icon: BrainCircuit, enabled: true },
       { label: "Backtesting", href: "/backtesting", icon: FlaskConical, enabled: true },
+    ],
+  },
+  // Edge Intelligence (bloques 1-15). Tenían backend, tests y ADR desde el
+  // 05/08 pero ninguna pantalla: son los diagnósticos que responden por qué el
+  // motor no gana, y vivían sólo para quien supiera hacer `curl`.
+  {
+    title: "Edge Intelligence",
+    items: [
+      { label: "Edge Research", href: "/edge", icon: Activity, enabled: true },
+      { label: "Why Not Trade", href: "/rejections", icon: Ban, enabled: true },
+      { label: "Costes", href: "/costs", icon: Coins, enabled: true },
+      { label: "Diagnóstico", href: "/diagnostics", icon: Gauge, enabled: true },
     ],
   },
   {

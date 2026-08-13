@@ -143,14 +143,6 @@ export function useBacktestRun(): UseMutationResult<Dict, ApiError, Record<strin
   });
 }
 
-export function useBacktestCancel(): UseMutationResult<Dict, ApiError, string> {
-  return useAction<string, Dict>({
-    run: (jobId) => apiSend<Dict>("POST", `/api/backtesting/cancel/${jobId}`),
-    success: "Backtest cancelled",
-    invalidate: ["backtesting"],
-  });
-}
-
 // ------------------------------------------------------------------ reports
 
 export function useReportGenerate(): UseMutationResult<
@@ -246,5 +238,59 @@ export function useEngineRestart(): UseMutationResult<
         error.status === 409 ? "Close open positions first" : "Restart failed",
         { description: error.detail || error.message, duration: 10_000 },
       ),
+  });
+}
+
+// ------------------------------------------------------------------ Edge Intelligence
+//
+// Ciclos bajo demanda. Ninguno abre operaciones, cambia pesos ni habilita live:
+// releen lo ya escrito y recalculan, así que el operador puede forzar una
+// medición sin esperar a la cadencia del scheduler.
+
+export function useEdgeCycle(): UseMutationResult<Dict, ApiError, void> {
+  return useAction<void, Dict>({
+    run: () => apiSend<Dict>("POST", "/api/edge/cycle"),
+    success: "Edge cycle completed",
+    invalidate: ["edge"],
+  });
+}
+
+export function useAttributionCycle(): UseMutationResult<Dict, ApiError, void> {
+  return useAction<void, Dict>({
+    run: () => apiSend<Dict>("POST", "/api/attribution/cycle"),
+    success: "Attribution cycle completed",
+    invalidate: ["attribution"],
+  });
+}
+
+export function useQualityMeasure(): UseMutationResult<Dict, ApiError, void> {
+  return useAction<void, Dict>({
+    run: () => apiSend<Dict>("POST", "/api/quality/measure"),
+    success: "Data quality measured",
+    invalidate: ["quality"],
+  });
+}
+
+export function useMetaRiskMeasure(): UseMutationResult<Dict, ApiError, void> {
+  return useAction<void, Dict>({
+    run: () => apiSend<Dict>("POST", "/api/quality/meta-risk/measure"),
+    success: "Meta risk measured",
+    invalidate: ["quality"],
+  });
+}
+
+export function useForecastCycle(): UseMutationResult<Dict, ApiError, void> {
+  return useAction<void, Dict>({
+    run: () => apiSend<Dict>("POST", "/api/forecast/cycle"),
+    success: "Forecast cycle completed",
+    invalidate: ["forecast"],
+  });
+}
+
+export function useCorrelationCycle(): UseMutationResult<Dict, ApiError, void> {
+  return useAction<void, Dict>({
+    run: () => apiSend<Dict>("POST", "/api/correlation/cycle"),
+    success: "Correlation cycle completed",
+    invalidate: ["correlation"],
   });
 }

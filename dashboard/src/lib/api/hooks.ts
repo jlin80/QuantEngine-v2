@@ -83,6 +83,25 @@ export const queryKeys = {
   securityReport: ["security", "report"] as const,
   backups: ["backups"] as const,
   updates: ["updates", "check"] as const,
+  // Edge Intelligence (bloques 1-15).
+  edgeReport: ["edge", "report"] as const,
+  edgeStatus: ["edge", "status"] as const,
+  edgeHistory: (strategy: string, limit: number) =>
+    ["edge", "history", strategy, limit] as const,
+  rejectionsSummary: ["rejections", "summary"] as const,
+  rejectionsStatus: ["rejections", "status"] as const,
+  rejections: (limit: number) => ["rejections", "recent", limit] as const,
+  costsReport: ["costs", "report"] as const,
+  costsDaily: ["costs", "daily"] as const,
+  attributionReport: ["attribution", "report"] as const,
+  qualityStatus: ["quality", "status"] as const,
+  metaRisk: ["quality", "meta-risk"] as const,
+  forecastStatus: ["forecast", "status"] as const,
+  correlationReport: ["correlation", "report"] as const,
+  microstructureStatus: ["microstructure", "status"] as const,
+  portfolioReport: ["portfolio", "report"] as const,
+  benchmarkReport: ["benchmark", "report"] as const,
+  optimizerPlan: ["optimizer", "plan"] as const,
 };
 
 function retry(failureCount: number, error: ApiError): boolean {
@@ -452,6 +471,178 @@ export function useUpdates(): UseQueryResult<Dict, ApiError> {
   return useQuery<Dict, ApiError>({
     queryKey: queryKeys.updates,
     queryFn: () => apiGet<Dict>("/api/updates/check"),
+    refetchInterval: 60_000,
+    retry,
+  });
+}
+
+// --------------------------------------------------------------- Edge Intelligence
+//
+// Los quince bloques de Edge Intelligence tenían backend, tests y ADR, pero
+// ninguna pantalla: el dashboard consumía 32 de los ~90 endpoints de lectura.
+// Son justo los diagnósticos que responden por qué el motor no gana, así que
+// vivían sólo para quien supiera hacer `curl`.
+//
+// Todos son de sólo lectura y degradan a `DisabledState` con 503 cuando su
+// subsistema está apagado, igual que el resto del dashboard.
+
+/** Salud del edge por estrategia (decay, half-life, estabilidad). */
+export function useEdgeReport(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.edgeReport,
+    queryFn: () => apiGet<Dict>("/api/edge/report"),
+    refetchInterval: 30_000,
+    retry,
+  });
+}
+
+export function useEdgeStatus(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.edgeStatus,
+    queryFn: () => apiGet<Dict>("/api/edge/status"),
+    refetchInterval: 30_000,
+    retry,
+  });
+}
+
+/** Serie histórica del edge de una estrategia. `null` desactiva la query. */
+export function useEdgeHistory(
+  strategy: string | null,
+  limit = 100,
+): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.edgeHistory(strategy ?? "", limit),
+    queryFn: () => apiGet<Dict>(`/api/edge/strategies/${strategy}/history`, { limit }),
+    enabled: Boolean(strategy),
+    refetchInterval: 60_000,
+    retry,
+  });
+}
+
+/** Qué está costando operaciones: bloqueos por puerta y bloqueos en solitario. */
+export function useRejectionsSummary(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.rejectionsSummary,
+    queryFn: () => apiGet<Dict>("/api/rejections/summary"),
+    refetchInterval: 15_000,
+    retry,
+  });
+}
+
+export function useRejections(limit = 50): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.rejections(limit),
+    queryFn: () => apiGet<Dict>("/api/rejections", { limit }),
+    refetchInterval: 10_000,
+    retry,
+  });
+}
+
+export function useRejectionsStatus(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.rejectionsStatus,
+    queryFn: () => apiGet<Dict>("/api/rejections/status"),
+    refetchInterval: 30_000,
+    retry,
+  });
+}
+
+/** Reparto del bruto: comisiones, slippage, spread, residuo y oportunidad. */
+export function useCostsReport(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.costsReport,
+    queryFn: () => apiGet<Dict>("/api/costs/report"),
+    refetchInterval: 30_000,
+    retry,
+  });
+}
+
+export function useCostsDaily(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.costsDaily,
+    queryFn: () => apiGet<Dict>("/api/costs/daily"),
+    refetchInterval: 60_000,
+    retry,
+  });
+}
+
+/** Atribución del edge: asociación, nunca causa; el residuo se reporta siempre. */
+export function useAttributionReport(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.attributionReport,
+    queryFn: () => apiGet<Dict>("/api/attribution/report"),
+    refetchInterval: 60_000,
+    retry,
+  });
+}
+
+export function useQualityStatus(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.qualityStatus,
+    queryFn: () => apiGet<Dict>("/api/quality/status"),
+    refetchInterval: 20_000,
+    retry,
+  });
+}
+
+export function useMetaRisk(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.metaRisk,
+    queryFn: () => apiGet<Dict>("/api/quality/meta-risk"),
+    refetchInterval: 20_000,
+    retry,
+  });
+}
+
+export function useForecastStatus(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.forecastStatus,
+    queryFn: () => apiGet<Dict>("/api/forecast/status"),
+    refetchInterval: 30_000,
+    retry,
+  });
+}
+
+export function useCorrelationReport(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.correlationReport,
+    queryFn: () => apiGet<Dict>("/api/correlation/report"),
+    refetchInterval: 60_000,
+    retry,
+  });
+}
+
+export function useMicrostructureStatus(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.microstructureStatus,
+    queryFn: () => apiGet<Dict>("/api/microstructure/status"),
+    refetchInterval: 30_000,
+    retry,
+  });
+}
+
+export function usePortfolioReport(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.portfolioReport,
+    queryFn: () => apiGet<Dict>("/api/portfolio/report"),
+    refetchInterval: 30_000,
+    retry,
+  });
+}
+
+export function useBenchmarkReport(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.benchmarkReport,
+    queryFn: () => apiGet<Dict>("/api/benchmark/report"),
+    refetchInterval: 60_000,
+    retry,
+  });
+}
+
+export function useExecutionOptimizerPlan(): UseQueryResult<Dict, ApiError> {
+  return useQuery<Dict, ApiError>({
+    queryKey: queryKeys.optimizerPlan,
+    queryFn: () => apiGet<Dict>("/api/optimizer/plan"),
     refetchInterval: 60_000,
     retry,
   });
