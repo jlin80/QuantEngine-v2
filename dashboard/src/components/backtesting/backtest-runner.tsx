@@ -1,13 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import { Loader2, Play, X } from "lucide-react";
+import { Loader2, Play } from "lucide-react";
 
 import { MetricsGrid } from "@/components/common/metrics-grid";
 import { SectionCard } from "@/components/common/section-card";
 import { Button } from "@/components/ui/button";
 import { useStrategies, useSymbols } from "@/lib/api/hooks";
-import { useBacktestCancel, useBacktestRun } from "@/lib/api/mutations";
+import { useBacktestRun } from "@/lib/api/mutations";
 
 const inputClass =
   "h-8 rounded-md border border-border bg-background px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
@@ -25,7 +25,6 @@ export function BacktestRunner() {
   const symbols = useSymbols();
   const strategies = useStrategies();
   const run = useBacktestRun();
-  const cancel = useBacktestCancel();
 
   const [symbol, setSymbol] = useState("");
   const [strategy, setStrategy] = useState("");
@@ -35,7 +34,6 @@ export function BacktestRunner() {
   const symbolOptions = symbols.data ? Object.keys(symbols.data.symbols) : [];
   const strategyOptions = strategies.data?.strategies.map((s) => s.name) ?? [];
   const result = run.data as Record<string, unknown> | undefined;
-  const jobId = typeof result?.job_id === "string" ? result.job_id : null;
 
   return (
     <SectionCard title="Run backtest" icon={<Play />}>
@@ -56,7 +54,7 @@ export function BacktestRunner() {
             value={strategy}
             onChange={(e) => setStrategy(e.target.value)}
           >
-            <option value="">Select…</option>
+            <option value="">Todas</option>
             {strategyOptions.map((s) => (
               <option key={s} value={s}>
                 {s}
@@ -73,22 +71,11 @@ export function BacktestRunner() {
         <Button
           size="sm"
           onClick={() => run.mutate({ symbol, strategy, start, end })}
-          disabled={run.isPending || !symbol || !strategy}
+          disabled={run.isPending || !symbol}
         >
           {run.isPending ? <Loader2 className="animate-spin" /> : <Play />}
           Run
         </Button>
-        {jobId && (
-          <Button
-            size="sm"
-            variant="destructive"
-            onClick={() => cancel.mutate(jobId)}
-            disabled={cancel.isPending}
-          >
-            <X />
-            Cancel
-          </Button>
-        )}
       </div>
       {result && (
         <div className="mt-4 border-t pt-3">

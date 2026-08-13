@@ -1,5 +1,6 @@
 """Integración: endpoints /api/engine/* con un Quant Core real cableado."""
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -148,3 +149,88 @@ def test_engine_endpoints_503_without_core(settings: Settings):
     app = create_app(settings, Container())
     with TestClient(app) as client:
         assert client.get("/api/engine/status").status_code == 503
+
+
+# --------------------------------------------------------------------------
+# Control de estrategias. Estos endpoints sólo escribían la intención en el
+# almacén de configuración, que no leía nadie: el dashboard confirmaba
+# "Strategy disabled" y la estrategia seguía evaluando indefinidamente.
+# --------------------------------------------------------------------------
+
+ALWAYS_LONG = """
+from app.engine.interfaces.strategy import AnalysisContext, BaseStrategy
+from app.engine.models import Cadence, CadenceKind, Direction, StrategySignal
+from app.market.models import Timeframe
+
+
+class AlwaysLong(BaseStrategy):
+    name = "always_long"
+    symbols = ("BTCUSDT",)
+    cadence = Cadence(kind=CadenceKind.EVERY_CANDLE, timeframe=Timeframe.M1)
+
+    async def analyze(self, ctx: AnalysisContext) -> StrategySignal | None:
+        return None
+"""
+
+
+@pytest.fixture()
+def loaded_client(settings: Settings, tmp_path: Path):
+    """Cliente con una estrategia realmente cargada en el motor."""
+    (tmp_path / "always_long.py").write_text(ALWAYS_LONG, encoding="utf-8")
+    core = _build_core(settings, tmp_path)
+    asyncio.run(core.strategies.start())
+    container = Container()
+    container.register_instance(QuantCore, core)
+    app = create_app(settings, container)
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+def test_disable_strategy_actually_disables_it(loaded_client: TestClient):
+    assert loaded_client.get("/api/engine/strategies").json()["strategies"][0]["enabled"] is True
+
+    response = loaded_client.post("/api/engine/strategies/always_long/disable")
+    assert response.status_code == 200
+    assert response.json()["applied"]["enabled"] is False
+
+    # Lo que importa: la lectura que pinta la tabla refleja el cambio.
+    listed = loaded_client.get("/api/engine/strategies").json()["strategies"][0]
+    assert listed["enabled"] is False
+
+    assert loaded_client.post("/api/engine/strategies/always_long/enable").status_code == 200
+    assert loaded_client.get("/api/engine/strategies").json()["strategies"][0]["enabled"] is True
+
+
+def test_set_weight_applies_and_is_reflected(loaded_client: TestClient):
+    response = loaded_client.patch(
+        "/api/engine/strategies/always_long/weight", json={"weight": 0.4}
+    )
+    assert response.status_code == 200
+    assert response.json()["applied"]["weight"] == 0.4
+    assert loaded_client.get("/api/engine/strategies").json()["strategies"][0]["weight"] == 0.4
+
+
+def test_unknown_strategy_is_404_not_a_silent_ok(loaded_client: TestClient):
+    """Antes devolvía 200 para cualquier nombre, incluso inventado."""
+    assert loaded_client.post("/api/engine/strategies/no_existe/disable").status_code == 404
+    assert loaded_client.post("/api/engine/strategies/no_existe/enable").status_code == 404
+    assert (
+        loaded_client.patch(
+            "/api/engine/strategies/no_existe/weight", json={"weight": 1.0}
+        ).status_code
+        == 404
+    )
+
+
+def test_negative_weight_is_rejected(loaded_client: TestClient):
+    response = loaded_client.patch(
+        "/api/engine/strategies/always_long/weight", json={"weight": -1.0}
+    )
+    assert response.status_code == 422
+
+
+def test_backtest_cancel_no_longer_lies(client: TestClient):
+    """Devolvía ``{"status": "cancelled"}`` sin cancelar nada."""
+    response = client.post("/api/backtesting/cancel/whatever")
+    assert response.status_code == 409
+    assert "sincrona" in response.json()["detail"].lower().replace("í", "i")

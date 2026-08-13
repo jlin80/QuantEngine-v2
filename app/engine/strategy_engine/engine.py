@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 from app.config.settings import QuantSettings
@@ -69,6 +70,13 @@ class StrategyEngine(Service):
         decision_engine: Decision Engine (se invoca tras cada señal).
         bus: Event Bus.
         scheduler: Scheduler interno (cadencias por tiempo).
+        overrides: Proveedor de las decisiones del operador tomadas desde el
+            dashboard (``nombre -> {enabled?, weight?}``), aplicadas tras el
+            descubrimiento. Sin esto, apagar una estrategia sólo duraba hasta el
+            siguiente reinicio, que la volvía a levantar con el valor del `.env`
+            sin avisar. Se inyecta como callable para no acoplar el núcleo del
+            motor al almacén del dashboard; ``None`` deja el comportamiento
+            previo intacto.
     """
 
     def __init__(
@@ -82,6 +90,7 @@ class StrategyEngine(Service):
         decision_engine: DecisionEngine,
         bus: EventBus,
         scheduler: AsyncScheduler,
+        overrides: Callable[[], dict[str, dict[str, Any]]] | None = None,
     ) -> None:
         super().__init__("strategy_engine")
         self._settings = settings
@@ -93,6 +102,7 @@ class StrategyEngine(Service):
         self._decision_engine = decision_engine
         self._bus = bus
         self._scheduler = scheduler
+        self._overrides = overrides
         self._strategies: dict[str, _LoadedStrategy] = {}
         self._subscriptions: list[Any] = []
         self._timer_jobs: list[str] = []
@@ -107,6 +117,7 @@ class StrategyEngine(Service):
         if self._settings.auto_discover:
             for cls in self._loader.discover():
                 await self._register(cls)
+        self._apply_overrides()
         self._subscriptions.append(self._bus.subscribe(self._on_tick, NewTick))
         self._subscriptions.append(self._bus.subscribe(self._on_candle, CandleClosed))
 
@@ -223,6 +234,36 @@ class StrategyEngine(Service):
         loaded.weight = applied
         loaded.stats.weight = applied
         return applied
+
+    def _apply_overrides(self) -> None:
+        """Aplicar las decisiones del operador sobre las estrategias cargadas.
+
+        Se llama tras el descubrimiento, no antes: una estrategia que ya no
+        existe (renombrada, retirada del catálogo) no debe abortar el arranque
+        ni desaparecer en silencio — se registra y se sigue. Un override roto no
+        puede dejar al motor sin estrategias.
+        """
+        if self._overrides is None:
+            return
+        try:
+            overrides = self._overrides()
+        except Exception:  # pragma: no cover - el almacén no puede tumbar el motor
+            self._log.exception("No se pudieron leer los overrides de estrategias")
+            return
+        for name, changes in overrides.items():
+            if name not in self._strategies:
+                self._log.warning("Override de estrategia ignorado: '%s' no está cargada", name)
+                continue
+            if "enabled" in changes:
+                enabled = bool(changes["enabled"])
+                if enabled:
+                    self.enable_strategy(name)
+                else:
+                    self.disable_strategy(name)
+                self._log.info("Override del operador: '%s' enabled=%s", name, enabled)
+            if "weight" in changes:
+                applied = self.set_weight(name, float(changes["weight"]))
+                self._log.info("Override del operador: '%s' weight=%.3f", name, applied)
 
     def _require(self, name: str) -> _LoadedStrategy:
         """Loaded strategy or ConfigurationError."""

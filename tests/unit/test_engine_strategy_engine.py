@@ -121,7 +121,11 @@ class OnTimer(BaseStrategy):
 class Stack:
     """Pila completa del Quant Core sobre mercado sintético."""
 
-    def __init__(self, plugin_dir: Path) -> None:
+    def __init__(
+        self,
+        plugin_dir: Path,
+        overrides: dict[str, dict[str, object]] | None = None,
+    ) -> None:
         self.bus = EventBus()
         self.scheduler = AsyncScheduler()
         self.market = make_market(
@@ -165,6 +169,7 @@ class Stack:
             self.decisions,
             self.bus,
             self.scheduler,
+            overrides=(lambda: overrides) if overrides is not None else None,
         )
         self.events: list[str] = []
 
@@ -202,10 +207,14 @@ def _candle_event() -> CandleClosed:
     )
 
 
-async def _stack(tmp_path: Path, plugins: dict[str, str]) -> Stack:
+async def _stack(
+    tmp_path: Path,
+    plugins: dict[str, str],
+    overrides: dict[str, dict[str, object]] | None = None,
+) -> Stack:
     for name, source in plugins.items():
         (tmp_path / f"{name}.py").write_text(source, encoding="utf-8")
-    stack = Stack(tmp_path)
+    stack = Stack(tmp_path, overrides)
     await stack.start()
     return stack
 
@@ -327,5 +336,55 @@ async def test_status_snapshot_for_dashboard(tmp_path: Path):
         assert status["enabled"] == 1
         assert status["strategies"][0]["name"] == "always_long"
         assert "feature_store" in status
+    finally:
+        await stack.stop()
+
+
+# --------------------------------------------------------------------------
+# Overrides del operador. Apagar una estrategia desde el dashboard sólo mutaba
+# el motor en memoria: el siguiente reinicio la volvía a levantar con el valor
+# del `.env`, sin avisar, y la decisión del operador se perdía en silencio.
+# --------------------------------------------------------------------------
+
+
+async def test_operator_override_survives_restart(tmp_path: Path):
+    """Un `disable` persistido se reaplica tras el descubrimiento."""
+    stack = await _stack(
+        tmp_path,
+        {"always_long": ALWAYS_LONG},
+        overrides={"always_long": {"enabled": False}},
+    )
+    try:
+        assert stack.engine.stats()[0].enabled is False
+        await stack.engine._on_candle(_candle_event())
+        await asyncio.sleep(0.15)
+        assert stack.engine.stats()[0].runs == 0, "el override debe impedir la evaluación"
+    finally:
+        await stack.stop()
+
+
+async def test_operator_weight_override_applies(tmp_path: Path):
+    stack = await _stack(
+        tmp_path,
+        {"always_long": ALWAYS_LONG},
+        overrides={"always_long": {"weight": 0.25}},
+    )
+    try:
+        assert stack.engine.weights()["always_long"] == 0.25
+        assert stack.engine.stats()[0].weight == 0.25
+    finally:
+        await stack.stop()
+
+
+async def test_override_for_unknown_strategy_does_not_break_startup(tmp_path: Path):
+    """Una estrategia retirada del catálogo no puede impedir el arranque."""
+    stack = await _stack(
+        tmp_path,
+        {"always_long": ALWAYS_LONG},
+        overrides={"ya_no_existe": {"enabled": False}, "always_long": {"weight": 3.0}},
+    )
+    try:
+        assert stack.engine.loaded == ["always_long"]
+        assert stack.engine.weights()["always_long"] == 3.0
     finally:
         await stack.stop()

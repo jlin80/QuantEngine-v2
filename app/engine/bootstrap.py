@@ -611,6 +611,8 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
     container.register_instance(DecisionEngine, decision_engine)
 
     loader = PluginLoader(list(quant.plugin_dirs))
+    from app.dashboard.api.config_store import config_store
+
     strategy_engine = StrategyEngine(
         quant,
         loader,
@@ -621,6 +623,7 @@ def _build_quant(container: Container, settings: Settings, bus: EventBus) -> Non
         decision_engine,
         bus,
         scheduler,
+        overrides=config_store.strategy_overrides,
     )
     container.register_instance(StrategyEngine, strategy_engine)
 
