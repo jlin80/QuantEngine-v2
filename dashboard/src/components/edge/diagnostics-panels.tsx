@@ -4,7 +4,6 @@ import {
   Award,
   BarChart3,
   Layers,
-  LayoutGrid,
   Loader2,
   Radar,
   Radio,
@@ -22,7 +21,6 @@ import type { ApiError } from "@/lib/api/client";
 import {
   useBenchmarkReport,
   useCorrelationReport,
-  useExecutionOptimizerPlan,
   useForecastStatus,
   useMetaRisk,
   useMicrostructureStatus,
@@ -195,14 +193,9 @@ export function BenchmarkCard() {
   );
 }
 
-export function ExecutionOptimizerCard() {
-  return (
-    <DiagnosticCard
-      title="Execution Optimizer"
-      icon={<LayoutGrid />}
-      query={useExecutionOptimizerPlan()}
-      disabledLabel="Execution Optimizer disabled"
-      note="Cotiza pero no rutea: el Execution Engine sigue mandando MARKET. El coste de NO ejecutar entra como término de primera clase."
-    />
-  );
-}
+// El Execution Optimizer no tiene tarjeta aquí a propósito. `/optimizer/plan`
+// no publica un estado: cotiza IOC/LIMIT/MARKET para un escenario concreto y
+// exige símbolo, cantidad, liquidez y urgencia. Llamarlo con los defaults a
+// cero devuelve una cotización sin sentido, y presentarla como medición sería
+// exactamente el tipo de panel decorativo que estas pantallas vienen a quitar.
+// Necesita un formulario de escenario propio; hasta entonces, nada.

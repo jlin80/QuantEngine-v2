@@ -3,7 +3,6 @@ import {
   BenchmarkCard,
   CorrelationCard,
   DataQualityCard,
-  ExecutionOptimizerCard,
   MetaRiskCard,
   MicrostructureCard,
   PortfolioIntelligenceCard,
@@ -24,7 +23,6 @@ export default function DiagnosticsPage() {
         <CorrelationCard />
         <PortfolioIntelligenceCard />
         <MicrostructureCard />
-        <ExecutionOptimizerCard />
         <BenchmarkCard />
       </div>
     </div>

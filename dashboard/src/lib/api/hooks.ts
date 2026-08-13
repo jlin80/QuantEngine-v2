@@ -101,7 +101,6 @@ export const queryKeys = {
   microstructureStatus: ["microstructure", "status"] as const,
   portfolioReport: ["portfolio", "report"] as const,
   benchmarkReport: ["benchmark", "report"] as const,
-  optimizerPlan: ["optimizer", "plan"] as const,
 };
 
 function retry(failureCount: number, error: ApiError): boolean {
@@ -639,11 +638,6 @@ export function useBenchmarkReport(): UseQueryResult<Dict, ApiError> {
   });
 }
 
-export function useExecutionOptimizerPlan(): UseQueryResult<Dict, ApiError> {
-  return useQuery<Dict, ApiError>({
-    queryKey: queryKeys.optimizerPlan,
-    queryFn: () => apiGet<Dict>("/api/optimizer/plan"),
-    refetchInterval: 60_000,
-    retry,
-  });
-}
+// `/optimizer/plan` no tiene hook: no publica un estado, cotiza un escenario
+// (símbolo, cantidad, liquidez, urgencia son obligatorios) y sin ellos
+// responde 422. Necesita un formulario, no una tarjeta de estado.
