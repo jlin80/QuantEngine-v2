@@ -171,22 +171,55 @@ class RuntimeConfigStore:
         self._overrides: dict[str, Any] = {}
         self._strategy: dict[str, dict[str, Any]] = {}
         self._lock = Lock()
+        self.load_error: str | None = None
+        """Motivo por el que no se pudo leer el fichero, o ``None`` si todo fue bien."""
         self._load()
 
     def _load(self) -> None:
-        """Load overrides from disk (best effort)."""
+        """Load overrides from disk, recording any failure.
+
+        Se lee con ``utf-8-sig``: en Windows es fácil que una herramienta deje
+        un BOM al principio (``Set-Content -Encoding utf8`` de PowerShell 5.1 lo
+        hace), y con ``utf-8`` a secas el BOM rompe el ``json.loads`` y tira el
+        fichero **entero**. Pasó de verdad el 13/08: el motor arrancó sin ningún
+        override del operador — incluidos los frenos de riesgo.
+
+        Un fallo ya no se traga en silencio: queda en :attr:`load_error`, que el
+        guard de arranque convierte en abortar en `paper`/`production`. Arrancar
+        con la configuración vacía es indistinguible de arrancar bien, y la
+        diferencia son los límites de pérdida.
+        """
+        self.load_error = None
         if self._path is None or not self._path.exists():
             return
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
+            data = json.loads(self._path.read_text(encoding="utf-8-sig"))
             self._overrides = dict(data.get("overrides", {}))
             self._strategy = dict(data.get("strategies", {}))
         except (OSError, ValueError) as exc:
-            _log.warning("Runtime config load failed: %r", exc)
+            self.load_error = f"{self._path}: {exc}"
+            _log.error(
+                "Runtime config ILEGIBLE (%s). El motor no debe operar sin la "
+                "configuración del operador: se conserva el fichero tal cual.",
+                self.load_error,
+            )
 
     def _persist(self) -> None:
-        """Persist overrides to disk (best effort)."""
+        """Persist overrides to disk (best effort).
+
+        Se niega a escribir mientras haya un ``load_error`` sin resolver. Sin
+        esto, un fichero corrupto más cualquier cambio desde el dashboard
+        sobreescribiría la configuración real con la vacía que se pudo cargar —
+        el fichero es la única copia, así que la pérdida sería definitiva.
+        """
         if self._path is None:
+            return
+        if self.load_error is not None:
+            _log.error(
+                "No se persiste la configuración: el fichero de origen no se pudo "
+                "leer (%s). Sobrescribirlo perdería los overrides existentes.",
+                self.load_error,
+            )
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)

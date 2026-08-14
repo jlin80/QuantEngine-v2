@@ -5,6 +5,9 @@ que la pantalla de settings era decorativa. Ahora ``apply`` muta el objeto de
 settings que los subsistemas leen en cada evaluación.
 """
 
+import json
+
+import pytest
 from app.config.settings import Settings
 from app.dashboard.api.config_store import RuntimeConfigStore, _is_live
 from app.execution.risk_manager import RiskManager
@@ -175,3 +178,92 @@ def test_daily_drawdown_filter_path_resolves():
     store = RuntimeConfigStore(None)
     store.apply(s, {"quant.filters.max_drawdown_pct": 7.5})
     assert s.quant.filters.max_drawdown_pct == 7.5
+
+
+# --------------------------------------------------------------------------
+# Robustez del fichero. El 13/08 un BOM al principio del JSON rompio el
+# `json.loads`, el `except` tiro el fichero ENTERO y el motor arranco sin
+# ningun override del operador: sin freno de perdida diaria, sin topes por
+# simbolo y con las estrategias apagadas de vuelta a activas. Nada lo dijo.
+# --------------------------------------------------------------------------
+
+
+def test_bom_does_not_discard_the_whole_file(tmp_path):
+    """El caso real: `Set-Content -Encoding utf8` de PowerShell 5.1 mete BOM."""
+    path = tmp_path / "runtime_config.json"
+    payload = {
+        "overrides": {"execution.risk.ignore_drawdown_limits": True},
+        "strategies": {"mss": {"enabled": False}},
+    }
+    # utf-8-sig al ESCRIBIR es exactamente lo que produce PowerShell.
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8-sig")
+
+    store = RuntimeConfigStore(path)
+    assert store.load_error is None
+    assert store.strategy_overrides() == {"mss": {"enabled": False}}
+    settings = Settings()
+    store.reapply(settings)
+    assert settings.execution.risk.ignore_drawdown_limits is True
+
+
+def test_corrupt_file_is_recorded_not_swallowed(tmp_path):
+    path = tmp_path / "runtime_config.json"
+    path.write_text("{ esto no es json", encoding="utf-8")
+    store = RuntimeConfigStore(path)
+    assert store.load_error is not None
+    assert "runtime_config.json" in store.load_error
+
+
+def test_corrupt_file_is_never_overwritten(tmp_path):
+    """El fichero es la unica copia: sobrescribirlo perderia todo para siempre.
+
+    Sin esta guarda, un JSON corrupto mas cualquier clic en el dashboard
+    reemplazaba la configuracion real por la vacia que se pudo cargar.
+    """
+    path = tmp_path / "runtime_config.json"
+    original = "{ overrides rotos pero recuperables a mano"
+    path.write_text(original, encoding="utf-8")
+
+    store = RuntimeConfigStore(path)
+    assert store.load_error is not None
+    store.set_strategy("mss", {"enabled": False})  # dispara _persist
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_healthy_file_still_persists(tmp_path):
+    """La guarda anterior no puede romper el camino normal."""
+    path = tmp_path / "runtime_config.json"
+    store = RuntimeConfigStore(path)
+    store.set_strategy("mss", {"enabled": False})
+    assert RuntimeConfigStore(path).strategy_overrides() == {"mss": {"enabled": False}}
+
+
+def test_startup_guard_blocks_on_unreadable_config(tmp_path, monkeypatch):
+    """Fail-closed: arrancar sin la config del operador es peor que no arrancar."""
+    from app.config.environment import Environment
+    from app.engine import startup_guard
+
+    path = tmp_path / "runtime_config.json"
+    path.write_text("{ roto", encoding="utf-8")
+    # El guard importa el singleton dentro de la función, así que basta con
+    # sustituir el atributo del módulo donde vive.
+    broken = RuntimeConfigStore(path)
+    monkeypatch.setattr("app.dashboard.api.config_store.config_store", broken, raising=False)
+
+    settings = Settings(environment=Environment.PAPER)
+    report = startup_guard.inspect_startup(settings)
+    failed = [c for c in report.checks if c.name == "runtime_config"]
+    assert failed and failed[0].passed is False
+
+    with pytest.raises(startup_guard.ContaminatedStartupError):
+        startup_guard.verify_clean_startup(settings)
+
+
+def test_startup_guard_passes_with_readable_config(tmp_path, monkeypatch):
+    from app.engine import startup_guard
+
+    healthy = RuntimeConfigStore(tmp_path / "runtime_config.json")
+    monkeypatch.setattr("app.dashboard.api.config_store.config_store", healthy, raising=False)
+    checks = startup_guard.inspect_startup(Settings()).checks
+    assert next(c for c in checks if c.name == "runtime_config").passed is True

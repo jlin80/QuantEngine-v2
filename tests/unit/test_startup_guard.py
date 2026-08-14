@@ -153,5 +153,6 @@ def test_the_report_says_what_failed_and_why():
         "clock_skew",
         "test_instrumentation",
         "backtest_loop",
+        "runtime_config",
     }
     assert all(c["detail"] for c in payload["checks"] if not c["passed"])

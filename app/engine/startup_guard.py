@@ -163,6 +163,37 @@ def _check_backtest_loop() -> StartupCheck:
     )
 
 
+def _check_runtime_config() -> StartupCheck:
+    """La configuración del operador tiene que haberse podido leer.
+
+    El 13/08 un BOM al principio del JSON rompió el ``json.loads`` del store, su
+    ``except`` descartó el fichero **entero** y el motor arrancó con cero
+    overrides: sin el freno de pérdida diaria, sin los topes por símbolo y con
+    las estrategias apagadas de vuelta a activas. Nada lo dijo — desde fuera,
+    arrancar sin configuración es idéntico a arrancar bien.
+
+    Igual que el reloj: *arrancar en silencio con configuración perdida es peor
+    que no arrancar*. Un motor caído se ve en el primer minuto; uno operando con
+    los frenos quitados, no.
+
+    Import diferido para no arrastrar la capa del dashboard al arranque del
+    motor sólo para mirarla, mismo criterio que ``_check_backtest_loop``.
+    """
+    from app.dashboard.api.config_store import config_store
+
+    if config_store.load_error is None:
+        return StartupCheck(name="runtime_config", passed=True)
+    return StartupCheck(
+        name="runtime_config",
+        passed=False,
+        detail=(
+            f"La configuración del operador no se pudo leer ({config_store.load_error}). "
+            f"Arrancar aplicaría los valores por defecto y se perderían los límites "
+            f"de riesgo configurados. Repara o retira el fichero antes de arrancar."
+        ),
+    )
+
+
 def inspect_startup(settings: Settings) -> StartupReport:
     """Run every startup check without raising.
 
@@ -179,6 +210,7 @@ def inspect_startup(settings: Settings) -> StartupReport:
             _check_clock_skew(settings.health.max_clock_skew_seconds),
             _check_test_instrumentation(),
             _check_backtest_loop(),
+            _check_runtime_config(),
         ),
     )
 
