@@ -33,6 +33,7 @@ from app.market.services import MarketDataService
 from app.market.storage import MarketDataWriter
 from app.ml.api import MLEngine
 from app.ml.notifications import MLNotifier
+from app.ml.schedule import WeeklyTrainingGate
 from app.monitoring.data_quality_service import DataQualityMonitor
 from app.monitoring.events import MarketDataBlind, MarketDataRecovered, SignalDrought
 from app.monitoring.health import HealthMonitor
@@ -50,6 +51,7 @@ from app.research.events import ResearchCycleRolledBack
 from app.research.notifications import ResearchNotifier
 from app.research.rollback import ResearchRollbackMonitor
 from app.scheduler.scheduler import AsyncScheduler
+from app.utils.time import utc_now
 
 
 class QuantEngine:
@@ -338,7 +340,41 @@ class QuantEngine:
             async def ml_meta_evaluation() -> None:
                 await ml_engine.run_meta_evaluation()
 
-            scheduler.add_job("ml_nightly_training", ml_nightly_training, interval_seconds=86_400)
+            training_cfg = self._settings.ml.training
+            if training_cfg.weekly_enabled:
+                # Entrenar con el mercado cerrado: el AutoML compite por CPU con
+                # el motor que está operando. No se usa `interval_seconds` de 7
+                # días porque el scheduler reinicia su reloj en cada arranque y
+                # ese job no dispararía nunca; se tiquea seguido y la puerta
+                # decide, contra la última ejecución persistida en disco.
+                gate = WeeklyTrainingGate(training_cfg)
+
+                async def ml_weekly_training() -> None:
+                    now = utc_now()
+                    verdict = gate.decide(now)
+                    if not verdict["run"]:
+                        self._log.debug("Entrenamiento ML omitido: %s", verdict["reason"])
+                        return
+                    self._log.info(
+                        "Entrenamiento ML lanzado (%s): %s",
+                        verdict["kind"],
+                        verdict["reason"],
+                    )
+                    result = await ml_engine.run_nightly_training()
+                    # Se marca pase lo que pase: si fallo por datos insuficientes
+                    # y no lo marcara, reintentaria cada 30 min toda la ventana.
+                    gate.mark_ran(now)
+                    self._log.info("Entrenamiento ML terminado: %s", result.get("status"))
+
+                scheduler.add_job(
+                    "ml_weekly_training",
+                    ml_weekly_training,
+                    interval_seconds=max(60.0, training_cfg.weekly_check_interval_seconds),
+                )
+            else:
+                scheduler.add_job(
+                    "ml_nightly_training", ml_nightly_training, interval_seconds=86_400
+                )
             scheduler.add_job("ml_drift_check", ml_drift_check, interval_seconds=21_600)
 
             # Segunda capa sobre el gate de validación (Bloque 5): un modelo

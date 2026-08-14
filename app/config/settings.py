@@ -163,8 +163,29 @@ class MLTrainingSettings(BaseModel):
     cv_folds: int = 5  # pliegues de validación cruzada
     walk_forward_folds: int = 4  # pliegues walk-forward (out-of-sample temporal)
     random_seed: int = 7
-    nightly_hour_utc: int = 3  # hora del entrenamiento nocturno programado
     retrain_min_new_trades: int = 30  # operaciones nuevas para reentrenar
+
+    # --- Ventana semanal de entrenamiento -------------------------------
+    # El entrenamiento compite por CPU con el motor que está operando, así que
+    # se lleva al fin de semana, con el mercado cerrado (XAUUSD cierra viernes
+    # ~21:00 UTC y no abre hasta domingo ~22:00 UTC: el sábado entero es seguro).
+    #
+    # NO se implementa como un `interval_seconds` de 7 días porque el scheduler
+    # es por intervalo y **reinicia su reloj en cada arranque**: en una VPS que
+    # se reinicia más a menudo que semanalmente, ese job no dispararía jamás.
+    # En su lugar el job tiquea seguido y decide dentro, con la última ejecución
+    # persistida en disco para sobrevivir a los reinicios.
+    weekly_enabled: bool = False  # False preserva el comportamiento previo
+    weekly_weekday: int = 5  # día ISO: lunes=0 … sábado=5, domingo=6
+    weekly_hour_utc: int = 6  # hora UTC de apertura de la ventana
+    weekly_window_hours: int = 12  # ancho de la ventana desde `weekly_hour_utc`
+    weekly_check_interval_seconds: float = 1800.0  # cada cuánto se comprueba
+    # Red de seguridad: si el motor estuvo caído todo el fin de semana, el
+    # entrenamiento se saltaría una semana entera en silencio. Pasado este
+    # margen se permite una ejecución de recuperación fuera de la ventana, y se
+    # deja dicho en el resultado para que no parezca la programada.
+    weekly_max_staleness_days: float = 10.0
+    schedule_state_path: Path = _PROJECT_ROOT / "data" / "ml" / "training_schedule.json"
 
 
 class MLModelSettings(BaseModel):

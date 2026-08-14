@@ -72,6 +72,12 @@ WHITELIST: tuple[str, ...] = (
     "discord.min_level",
     "ml.enabled",
     "ml.auto_activate",
+    # Ventana semanal de entrenamiento. El scheduler registra el job al
+    # arrancar, así que cambiarla exige reinicio y `apply` lo reporta.
+    "ml.training.weekly_enabled",
+    "ml.training.weekly_weekday",
+    "ml.training.weekly_hour_utc",
+    "ml.training.weekly_window_hours",
     "ml.meta.enabled",
     "ml.meta.apply_governance",
     "ml.meta.disable_after_periods",
