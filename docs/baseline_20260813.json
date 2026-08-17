@@ -33,5 +33,12 @@
       "dias_continuados",
       "salidas_por_ejecucion"
     ]
+  },
+  "pendientes_cierre_20260827": {
+    "graduation_gap": "python scripts/graduation_gap.py data/execution/journal.jsonl --since 2026-08-13 --equity 500",
+    "sesion_asia": {
+      "motivo": "El 16/08, sobre 824 ops de oro post-pivote (11/08), Asia (00-07 UTC) dio exp +0.088R con IC 95% bootstrap [+0.008, +0.170] (excluye cero) y estabilidad entre 2 mitades cronologicas (+0.101R / +0.075R). Contradice en magnitud al estudio riguroso del 11/08 (session_edge.py, 11.575 ops/50 dias, kill criteria + FDR) que dio 0 celdas con edge estable y un rango entre sesiones de solo 0.031R. La muestra del 16/08 es corta (4-5 dias), coincide con el arranque de esta misma ventana de medicion, y se probaron 26 combinaciones hora/sesion sin correccion por comparaciones multiples (~1.3 falsos positivos esperados al 95%).",
+      "accion": "Correr scripts/session_edge.py sobre XAUUSDM con la configuracion vigente (15 estrategias, sin las 4 degradadas) para responder con rigor si el efecto de Asia persiste. No actuar sobre la hipotesis antes de esto: sesgar hacia Asia ahora contaminaria esta misma muestra."
+    }
   }
 }
