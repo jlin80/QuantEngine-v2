@@ -267,3 +267,28 @@ def test_startup_guard_passes_with_readable_config(tmp_path, monkeypatch):
     monkeypatch.setattr("app.dashboard.api.config_store.config_store", healthy, raising=False)
     checks = startup_guard.inspect_startup(Settings()).checks
     assert next(c for c in checks if c.name == "runtime_config").passed is True
+
+
+# --------------------------------------------------------------------------
+# Frenos de perdida por periodo. El 18/08 `max_weekly_loss_pct` (8% por
+# defecto) bloqueo toda apertura durante 13h y no habia forma de ajustarlo
+# desde el dashboard salvo redeploy -- `ignore_drawdown_limits` nunca los
+# cubrio (decision deliberada del 12/08: drawdown y perdida realizada son
+# frenos distintos).
+# --------------------------------------------------------------------------
+
+
+def test_weekly_and_monthly_loss_limits_are_whitelisted_and_hot():
+    from app.dashboard.api.config_store import WHITELIST
+
+    assert "execution.risk.max_weekly_loss_pct" in WHITELIST
+    assert "execution.risk.max_monthly_loss_pct" in WHITELIST
+    assert _is_live("execution.risk.max_weekly_loss_pct") is True
+    assert _is_live("execution.risk.max_monthly_loss_pct") is True
+
+
+def test_weekly_loss_limit_applies_without_restart():
+    s = Settings()
+    store = RuntimeConfigStore(None)
+    store.apply(s, {"execution.risk.max_weekly_loss_pct": 500.0})
+    assert s.execution.risk.max_weekly_loss_pct == 500.0

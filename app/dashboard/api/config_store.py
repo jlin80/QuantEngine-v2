@@ -30,6 +30,13 @@ WHITELIST: tuple[str, ...] = (
     "quant.filters.max_drawdown_pct",
     "execution.risk.max_risk_per_trade_pct",
     "execution.risk.max_daily_loss_pct",
+    # `max_weekly_loss_pct`/`max_monthly_loss_pct` no estaban en la whitelist:
+    # el 18/08 el freno semanal (8% por defecto) bloqueó toda apertura durante
+    # ~13h sin que el operador tuviera dónde ajustarlo salvo redeploy. Mismo
+    # patrón que `max_daily_loss_pct` — nunca a 0 (pone el freno al máximo,
+    # no lo apaga; `_period_check` calcula `limit = -abs(...)`).
+    "execution.risk.max_weekly_loss_pct",
+    "execution.risk.max_monthly_loss_pct",
     "execution.risk.max_open_positions",
     "execution.risk.max_positions_per_symbol",
     "execution.risk.max_exposure_pct",
