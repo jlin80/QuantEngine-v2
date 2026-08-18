@@ -63,6 +63,13 @@ WHITELIST: tuple[str, ...] = (
     "execution.sizing.atr_stop_multiplier",
     "execution.sizing.reward_risk",
     "execution.sizing.min_stop_pct",
+    # Reductor de riesgo por volatilidad alta: por encima del umbral HIGH
+    # de quant.context, el riesgo cae proporcionalmente en vez de quedarse
+    # fijo. Nunca a 0 -> el piso (`volatility_risk_floor`) sí se puede
+    # ajustar, pero mandar 0 lo pone al mínimo real, no lo apaga; para
+    # apagarlo del todo está `volatility_risk_enabled`.
+    "execution.sizing.volatility_risk_enabled",
+    "execution.sizing.volatility_risk_floor",
     "quant.consensus.min_score",
     "quant.consensus.min_confidence",
     "quant.consensus.min_agreement",

@@ -125,6 +125,12 @@ class ExecutionEngine(Service):
         falsifier: Falsador del cambio de holding por estrategia (opcional).
             Mide la predicción del Bloque 1 y publica el veredicto, acierte o
             falle; no cambia ninguna configuración.
+        atr_pct_high_for: Umbral HIGH de volatilidad por símbolo (opcional).
+            El `VolatilityFilter` sólo bloquea LOW —"sin rango no hay
+            scalp"— y HIGH nunca frenó nada: el mismo umbral que clasifica el
+            régimen como volátil se reutiliza aquí para reducir el riesgo por
+            operación de forma gradual en vez de dejarlo fijo. Sin él, el
+            reductor de volatilidad queda desactivado (devuelve 1.0 siempre).
     """
 
     def __init__(
@@ -145,6 +151,7 @@ class ExecutionEngine(Service):
         experiments: StrategyExperimentManager | None = None,
         falsifier: HoldingChangeFalsifier | None = None,
         risk_multiplier_reader: Callable[[], float] | None = None,
+        atr_pct_high_for: Callable[[str], float] | None = None,
     ) -> None:
         super().__init__("execution_engine")
         self._settings = settings
@@ -166,6 +173,7 @@ class ExecutionEngine(Service):
         # en cada entrada, no se cachea: la calidad del dato cambia en segundos
         # y una lectura vieja es justo la que no protege.
         self._risk_multiplier_reader = risk_multiplier_reader
+        self._atr_pct_high_for = atr_pct_high_for
         self._subscription: Subscription | None = None
         self._manage_task: asyncio.Task[None] | None = None
         self._manage_passes = 0
@@ -526,6 +534,14 @@ class ExecutionEngine(Service):
         equity = self._portfolio.equity(self._positions.open_positions)
         win_rate, reward_risk = self._perf_inputs()
         spec = self._instrument_spec(symbol)
+        # Los reductores componen por PRODUCTO, no por mínimo (mismo criterio
+        # que el Bloque 12 entre infraestructura y calidad del dato): un feed
+        # dudoso EN una racha de volatilidad alta es peor que cualquiera de los
+        # dos por separado, y quedarse con el mínimo lo negaría.
+        infra_multiplier = (
+            1.0 if self._risk_multiplier_reader is None else self._risk_multiplier_reader()
+        )
+        volatility_multiplier = self._volatility_risk_multiplier(view, symbol)
         sizing = self._sizer.calculate(
             equity=equity,
             price=reference,
@@ -534,9 +550,7 @@ class ExecutionEngine(Service):
             win_rate=win_rate,
             reward_risk=reward_risk,
             spec=spec,
-            risk_multiplier=(
-                1.0 if self._risk_multiplier_reader is None else self._risk_multiplier_reader()
-            ),
+            risk_multiplier=infra_multiplier * volatility_multiplier,
             symbol=symbol,
         )
         if sizing.quantity <= 0:
@@ -1085,6 +1099,34 @@ class ExecutionEngine(Service):
         period = self._settings.sizing.atr_period
         candles = self._market.get_candles(symbol, Timeframe.M1, limit=period + 2)
         return atr_indicator(candles, period)
+
+    def _volatility_risk_multiplier(self, view: _MarketView, symbol: str) -> float:
+        """Reductor de riesgo por volatilidad alta (nunca 0, nunca sube tamaño).
+
+        El `VolatilityFilter` sólo bloquea LOW ("sin rango no hay scalp"); HIGH
+        nunca frenó nada — el umbral que clasifica el régimen como volátil
+        (``atr_pct_high_for``) se calculaba y se tiraba. Aquí se reutiliza como
+        el punto donde el riesgo por operación empieza a reducirse: por debajo,
+        riesgo normal; por encima, cae proporcionalmente al exceso de ATR sobre
+        el umbral, con un piso configurable — nunca a 0, mismo principio que
+        los frenos de pérdida por periodo (recortar del todo no es lo mismo que
+        recortar mucho, y aquí tampoco corresponde apagar la operativa).
+
+        Sin dato de ATR o sin umbral cableado, devuelve 1.0: la ausencia de
+        medición no es una penalización, es la regla del Bloque 11 aplicada
+        aquí también.
+        """
+        sizing = self._settings.sizing
+        if not sizing.volatility_risk_enabled or self._atr_pct_high_for is None:
+            return 1.0
+        atr_pct = view.atr_pct
+        if atr_pct is None or atr_pct <= 0:
+            return 1.0
+        high = self._atr_pct_high_for(symbol)
+        if high <= 0 or atr_pct <= high:
+            return 1.0
+        floor = max(0.0, min(1.0, sizing.volatility_risk_floor))
+        return max(floor, min(1.0, high / atr_pct))
 
     def _stop_distance(self, view: _MarketView, reference: float) -> float:
         """Stop distance: ATR × multiple, con piso porcentual y piso por spread.

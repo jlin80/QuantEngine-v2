@@ -292,3 +292,18 @@ def test_weekly_loss_limit_applies_without_restart():
     store = RuntimeConfigStore(None)
     store.apply(s, {"execution.risk.max_weekly_loss_pct": 500.0})
     assert s.execution.risk.max_weekly_loss_pct == 500.0
+
+
+# --------------------------------------------------------------------------
+# Reductor de riesgo por volatilidad. Ajustable en caliente para poder subir
+# o bajar el piso sin reiniciar el motor.
+# --------------------------------------------------------------------------
+
+
+def test_volatility_risk_settings_are_whitelisted_and_hot():
+    from app.dashboard.api.config_store import WHITELIST
+
+    assert "execution.sizing.volatility_risk_enabled" in WHITELIST
+    assert "execution.sizing.volatility_risk_floor" in WHITELIST
+    assert _is_live("execution.sizing.volatility_risk_enabled") is True
+    assert _is_live("execution.sizing.volatility_risk_floor") is True

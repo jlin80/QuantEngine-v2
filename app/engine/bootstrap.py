@@ -826,6 +826,12 @@ def _build_execution(container: Container, settings: Settings, bus: EventBus) ->
                 else None
             )
         ),
+        # Reductor de riesgo por volatilidad alta: reutiliza el umbral que ya
+        # clasifica el régimen (`quant.context.atr_pct_high_for`), que hasta
+        # ahora se calculaba y no accionaba nada. Es una función pura sobre
+        # settings, no un servicio: se cablea siempre, no sólo si el Quant Core
+        # está habilitado.
+        settings.quant.context.atr_pct_high_for,
     )
     container.register_instance(ExecutionEngine, engine)
 

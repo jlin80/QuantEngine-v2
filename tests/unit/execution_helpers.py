@@ -5,6 +5,7 @@ Todo con componentes reales: un ``ExecutionEngine`` sobre un
 """
 
 import random
+from collections.abc import Callable
 
 from app.cache.memory import InMemoryCache
 from app.cache.service import CacheService
@@ -53,6 +54,7 @@ def make_engine(
     settings: ExecutionSettings | None = None,
     *,
     seed: int = 7,
+    atr_pct_high_for: Callable[[str], float] | None = None,
 ) -> ExecutionEngine:
     """Construye un ExecutionEngine determinista sobre un mercado dado."""
     cfg = settings or make_execution_settings()
@@ -92,4 +94,6 @@ def make_engine(
         # de experimentos, que sólo propone desactivaciones.
         StrategyExperimentManager(cfg.experiments),
         HoldingChangeFalsifier(cfg.falsification, cfg),
+        risk_multiplier_reader=None,
+        atr_pct_high_for=atr_pct_high_for,
     )

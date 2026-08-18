@@ -637,3 +637,122 @@ async def test_symbol_override_lets_gold_open_without_loosening_globals():
     assert position is not None
     assert position.quantity > 0
     assert position.quantity == pytest.approx(0.01, abs=1e-9)
+
+
+# --------------------------------------------------------------------------
+# Reductor de riesgo por volatilidad alta. El VolatilityFilter solo bloquea
+# LOW ("sin rango no hay scalp"); HIGH nunca frenaba nada -- se clasificaba y
+# se tiraba. Reutiliza `atr_pct_high_for` para reducir el riesgo por operacion
+# de forma gradual en vez de dejarlo fijo, sin bloquear nunca del todo.
+# --------------------------------------------------------------------------
+
+
+def _vol_view(atr_pct: float | None) -> _MarketView:
+    return _MarketView(
+        atr=None,
+        atr_pct=atr_pct,
+        spread_bps=None,
+        regime="ranging",
+        volatility="normal",
+        volume=None,
+        last_price=None,
+        session="america",
+    )
+
+
+def test_volatility_multiplier_is_full_at_or_below_the_threshold():
+    market, _ = _market()
+    engine = make_engine(market, atr_pct_high_for=lambda symbol: 0.10)
+
+    assert engine._volatility_risk_multiplier(_vol_view(0.05), "XAUUSDM") == 1.0
+    assert engine._volatility_risk_multiplier(_vol_view(0.10), "XAUUSDM") == 1.0
+
+
+def test_volatility_multiplier_shrinks_proportionally_above_the_threshold():
+    """El doble del umbral -> mitad de riesgo (high/atr_pct)."""
+    market, _ = _market()
+    engine = make_engine(market, atr_pct_high_for=lambda symbol: 0.10)
+
+    assert engine._volatility_risk_multiplier(_vol_view(0.20), "XAUUSDM") == pytest.approx(0.5)
+
+
+def test_volatility_multiplier_never_goes_below_the_configured_floor():
+    """Nunca a 0: mismo principio que los frenos de perdida por periodo."""
+    market, _ = _market()
+    settings = make_execution_settings()
+    settings.sizing.volatility_risk_floor = 0.25
+    engine = make_engine(market, settings, atr_pct_high_for=lambda symbol: 0.10)
+
+    # 100x el umbral daria un multiplicador ~0.001 sin el piso.
+    assert engine._volatility_risk_multiplier(_vol_view(10.0), "XAUUSDM") == pytest.approx(0.25)
+
+
+def test_volatility_multiplier_never_increases_size():
+    """Un piso mal puesto por encima de 1.0 no puede subir el tamano."""
+    market, _ = _market()
+    settings = make_execution_settings()
+    settings.sizing.volatility_risk_floor = 5.0  # valor absurdo, defensivo
+    engine = make_engine(market, settings, atr_pct_high_for=lambda symbol: 0.10)
+
+    assert engine._volatility_risk_multiplier(_vol_view(0.05), "XAUUSDM") == 1.0
+
+
+def test_volatility_multiplier_is_neutral_without_atr_data():
+    """Ausencia de medicion no es penalizacion (misma regla que el Bloque 11)."""
+    market, _ = _market()
+    engine = make_engine(market, atr_pct_high_for=lambda symbol: 0.10)
+
+    assert engine._volatility_risk_multiplier(_vol_view(None), "XAUUSDM") == 1.0
+
+
+def test_volatility_multiplier_is_neutral_without_threshold_wired():
+    """Sin `atr_pct_high_for` cableado (Quant Core apagado), no penaliza."""
+    market, _ = _market()
+    engine = make_engine(market)  # atr_pct_high_for=None por defecto
+
+    assert engine._volatility_risk_multiplier(_vol_view(50.0), "XAUUSDM") == 1.0
+
+
+def test_volatility_risk_can_be_disabled():
+    market, _ = _market()
+    settings = make_execution_settings()
+    settings.sizing.volatility_risk_enabled = False
+    engine = make_engine(market, settings, atr_pct_high_for=lambda symbol: 0.10)
+
+    assert engine._volatility_risk_multiplier(_vol_view(50.0), "XAUUSDM") == 1.0
+
+
+def test_volatility_multiplier_uses_the_symbol_specific_threshold():
+    market, _ = _market()
+    thresholds = {"XAUUSDM": 0.07, "ETHUSDM": 0.14}
+    engine = make_engine(market, atr_pct_high_for=lambda symbol: thresholds[symbol])
+
+    # Mismo ATR%, distinto umbral por simbolo -> distinto multiplicador.
+    xau = engine._volatility_risk_multiplier(_vol_view(0.14), "XAUUSDM")
+    eth = engine._volatility_risk_multiplier(_vol_view(0.14), "ETHUSDM")
+    assert xau < 1.0
+    assert eth == 1.0
+
+
+async def test_high_volatility_shrinks_the_actual_position():
+    """Extremo a extremo: el reductor llega de verdad al tamano de la posicion."""
+    market, _ = _market()
+    settings = make_execution_settings()
+    settings.sizing.volatility_risk_floor = 0.1
+    calm = make_engine(market, settings, atr_pct_high_for=lambda symbol: 100.0)
+    volatile = make_engine(market, settings, atr_pct_high_for=lambda symbol: 0.01)
+
+    async def calm_view(symbol: str) -> _MarketView:
+        return _vol_view(0.02)
+
+    async def volatile_view(symbol: str) -> _MarketView:
+        return _vol_view(0.02)
+
+    calm._market_view = calm_view  # type: ignore[method-assign]
+    volatile._market_view = volatile_view  # type: ignore[method-assign]
+
+    calm_position = await calm.process_decision(_decision())
+    volatile_position = await volatile.process_decision(_decision())
+
+    assert calm_position is not None and volatile_position is not None
+    assert volatile_position.quantity < calm_position.quantity

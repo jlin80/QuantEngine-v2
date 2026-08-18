@@ -1406,6 +1406,15 @@ class SizingSettings(BaseModel):
     # por apalancamiento.
     risk_per_trade_pct_by_symbol: dict[str, float] = Field(default_factory=dict)
     max_position_pct_by_symbol: dict[str, float] = Field(default_factory=dict)
+    # Reductor de riesgo por volatilidad alta. El `VolatilityFilter` sólo
+    # bloquea LOW ("sin rango no hay scalp"); HIGH nunca frenó nada — se
+    # clasificaba y se tiraba. Por encima de `atr_pct_high_for` (mismo umbral
+    # de `quant.context`, reutilizado en vez de duplicado), el riesgo cae
+    # proporcionalmente al exceso de ATR, nunca a 0: mismo principio que los
+    # frenos de pérdida por periodo, cortar del todo no es lo mismo que
+    # cortar mucho.
+    volatility_risk_enabled: bool = True
+    volatility_risk_floor: float = 0.25  # nunca menos del 25% del riesgo normal
 
     def risk_per_trade_pct_for(self, symbol: str) -> float:
         """Riesgo por operación del símbolo, con el global como fallback."""
