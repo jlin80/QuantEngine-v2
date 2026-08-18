@@ -3070,6 +3070,102 @@ sigue resolviendo a `paper` con su motivo.
 no en dinero: las senales no ejecutadas no tienen sizing, y convertirlo exigiria
 asumir un tamano que nadie decidio.
 
+## ADR-115 · La volatilidad alta reduce el riesgo, no lo bloquea
+
+**Contexto.** El `VolatilityFilter` clasifica el ATR% de cada símbolo en
+LOW/NORMAL/HIGH (`quant.context.atr_pct_low_for` / `atr_pct_high_for`), pero
+sólo **bloquea LOW** — "sin rango no hay scalp". El estado HIGH se calculaba,
+se publicaba en el contexto de mercado, y no accionaba absolutamente nada: ni
+bloqueaba la entrada, ni reducía el tamaño de la posición, ni ensanchaba el
+stop de forma consistente (`atr_stop_multiplier` sólo gana cuando el ATR ya
+supera el piso porcentual, que para el ATR típico de XAUUSD rara vez ocurre).
+Confirmado leyendo el filtro completo: no hay ninguna rama que compare contra
+`VolatilityState.HIGH`.
+
+**Decisión.** Se reutiliza el mismo umbral HIGH —sin duplicar configuración—
+como el punto donde el riesgo por operación empieza a reducirse en vez de
+quedarse fijo:
+
+```
+atr_pct <= high  → multiplicador = 1.0 (riesgo normal)
+atr_pct  > high  → multiplicador = high / atr_pct, con piso configurable
+```
+
+El piso (`sizing.volatility_risk_floor`, por defecto 0.25) es deliberado:
+**nunca llega a 0**. Mismo principio que ya rige los frenos de pérdida por
+periodo — cortar del todo no es lo mismo que cortar mucho, y un pico de
+volatilidad no justifica apagar la operativa entera.
+
+**Composición.** El multiplicador entra al `risk_multiplier` que ya recibe
+`PositionSizer.calculate()` (Bloques 11/12: calidad de dato × infraestructura)
+y compone por **producto**, mismo criterio que esos dos bloques usan entre sí:
+una racha de volatilidad alta con un feed de datos dudoso es peor que
+cualquiera de las dos cosas por separado, y quedarse con el mínimo lo negaría.
+
+**Ausencia de medición no penaliza.** Sin ATR conocido, o sin el umbral
+cableado (Quant Core apagado), el reductor devuelve 1.0 — misma regla que ya
+rige en el Bloque 11: no hay evidencia, no hay penalización.
+
+**Por qué no se tocó el filtro de entrada.** Añadir un bloqueo binario en HIGH
+habría sido más simple, pero el propio Bloque 12 del 04/08 midió que picos de
+volatilidad genuinos no son necesariamente malas señales — bloquearlos del
+todo perdería operaciones potencialmente buenas junto con las malas. Reducir
+el tamaño deja que la señal se pruebe con menos capital en juego, en vez de
+decidir por ella.
+
+**Riesgos conocidos.** El umbral HIGH se calibró originalmente para clasificar
+el régimen, no para gobernar riesgo — puede no ser el punto óptimo para esto
+último. El piso de 0.25 es un valor de partida, no medido contra resultados
+reales todavía.
+
+**Tests.** 12 nuevos en `test_execution_engine.py`, incluido uno extremo a
+extremo que confirma que el reductor encoge el tamaño real de la posición
+(no sólo el número aislado) cuando el ATR supera el umbral.
+
+## ADR-116 · Un fichero de configuración ilegible detiene el arranque, no lo continúa vacío
+
+**Contexto.** El 13/08, escribiendo `logs/runtime_config.json` desde
+PowerShell con `Set-Content -Encoding utf8`, se coló un BOM al principio del
+fichero. `RuntimeConfigStore._load` leía con `utf-8` a secas: el BOM rompió el
+`json.loads`, el `except ValueError` capturó el fallo y **descartó el fichero
+entero**. El motor arrancó con cero overrides del operador — sin
+`ignore_drawdown_limits`, sin los topes de riesgo por símbolo, con el balance
+semilla del `.env` en vez del real, y con las estrategias apagadas de vuelta a
+activas. Nada lo dijo: desde fuera, arrancar sin configuración es idéntico a
+arrancar bien.
+
+**Por qué es grave y no un detalle de encoding.** Es la misma clase de fallo
+que ADR-091 (reloj) y ADR-092 (fuga de WebSocket): el proceso responde, los
+componentes figuran `ok`, y el motor opera *mal* de una forma que ninguna
+métrica de salud convencional detecta. La diferencia aquí es que lo que se
+pierde son específicamente los frenos de riesgo — el peor sitio posible para
+un fallo silencioso.
+
+**Tres arreglos, en orden de gravedad:**
+
+1. `_load` lee con `utf-8-sig` — inmune al BOM que cualquier herramienta de
+   Windows puede dejar.
+2. `_persist` se niega a escribir mientras `load_error` esté activo. Sin esto,
+   un fichero corrupto más cualquier clic en el dashboard **sobrescribía la
+   configuración real con la vacía que se pudo cargar** — el fichero es la
+   única copia, y la pérdida habría sido definitiva. Esta es la pérdida de
+   datos real; el BOM sólo fue el disparador.
+3. Cuarta comprobación del guard de arranque (`_check_runtime_config`, junto a
+   `clock_skew`, `test_instrumentation`, `backtest_loop`): si la configuración
+   del operador no se pudo leer, **el motor no arranca** en `paper` ni
+   `production`. Mismo criterio que el guard del reloj — un motor caído se ve
+   en el primer minuto; uno operando con los frenos quitados, no.
+
+**Por qué no basta con seguir arrancando y avisar por Discord.** El objetivo
+de este guard es específicamente el caso donde nadie está mirando en ese
+momento — que es exactamente cuando ocurrió el incidente real. Un aviso que
+depende de que alguien lo lea a tiempo no es una salvaguarda, es una
+esperanza.
+
+**Tests.** 3 nuevos que reproducen el BOM exacto, confirman que un fichero
+corrupto nunca se sobrescribe, y verifican que el guard aborta con
+`ContaminatedStartupError` cuando `load_error` está activo.
+
 ## Fidelidad del laboratorio: el Market Context en el backtest
 
 Hasta el 2026-08-11 el backtest construía el `ExecutionEngine` con

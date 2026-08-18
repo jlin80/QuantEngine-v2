@@ -6,6 +6,29 @@ versionado [SemVer](https://semver.org/lang/es/).
 ## [Unreleased]
 
 ### Fixed
+- **El dashboard tenía varios controles decorativos.** Enable/disable/weight de
+  estrategias sólo escribían la intención en `config_store`, que no leía nadie:
+  el motor seguía evaluando estrategias "desactivadas" indefinidamente. Ahora
+  las rutas llaman al `StrategyEngine` vivo y persisten la decisión, que
+  sobrevive al reinicio. El Config Center mostraba `[object Object]` en los
+  campos `dict` (`symbols_enabled`, los `*_by_symbol`) y guardarlo corrompía la
+  configuración real (`AttributeError` en el camino caliente de ejecución); el
+  frontend elige ahora el control por el tipo declarado del esquema, no por el
+  valor actual. El backtest runner ignoraba `strategy`/`start`/`end` en
+  silencio y `Cancel` decía éxito sin cancelar nada (la corrida es síncrona).
+- **CRITICO — un fichero de configuración con BOM borraba todos los frenos de
+  riesgo en silencio.** `Set-Content -Encoding utf8` de PowerShell 5.1 deja BOM;
+  `json.loads` con `utf-8` a secas lo rompía y el `except` descartaba el
+  fichero entero, arrancando el motor sin `ignore_drawdown_limits`, sin topes
+  de riesgo por símbolo y con estrategias "apagadas" de vuelta a activas.
+  Ahora se lee con `utf-8-sig`, `_persist` se niega a escribir mientras el
+  fichero de origen sea ilegible (evita sobrescribir la configuración real con
+  una vacía), y una cuarta comprobación del guard de arranque aborta el
+  arranque en `paper`/`production` si la configuración del operador no se
+  pudo leer (ADR-116).
+- **`max_weekly_loss_pct`/`max_monthly_loss_pct` no estaban en la whitelist del
+  Config Center** (sólo el diario lo estaba): el freno semanal bloqueó toda
+  apertura de XAUUSDM ~13h sin que hubiera dónde ajustarlo salvo redeploy.
 - **CRITICO — el reloj de backtest congelaba el motor en vivo.** El proveedor de
   tiempo era un global de módulo y el `BacktestLab` comparte proceso y event loop
   con el motor: un backtest cuyo bloque no se cerró dejó `utc_now()` congelado 4
@@ -39,8 +62,25 @@ versionado [SemVer](https://semver.org/lang/es/).
 - Deuda de calidad preexistente: 3 errores de `mypy` en `app/cache/redis_backend.py`
   causados por `types-redis` (stubs obsoletos que shadoweaban los tipos inline de
   redis-py) y un `noqa: BLE001` inútil en `app/market/feed/feed.py`.
+- `nightly_hour_utc` no lo leía nadie: el entrenamiento del ML nunca fue
+  nocturno, corría cada 24h desde el arranque del proceso.
 
 ### Added
+- **Reductor de riesgo por volatilidad alta (ADR-115).** El `VolatilityFilter`
+  sólo bloqueaba volatilidad LOW; HIGH se clasificaba y no accionaba nada.
+  Reutiliza el mismo umbral (`atr_pct_high_for`) para reducir el riesgo por
+  operación proporcionalmente al exceso de ATR, con un piso configurable que
+  nunca llega a 0 (`sizing.volatility_risk_floor`). Compone por producto con
+  el reductor de calidad de dato/infraestructura existente (Bloques 11/12).
+- **Cuatro pantallas de Edge Intelligence en el dashboard**: `/edge` (salud del
+  edge por estrategia + histórico), `/rejections` (qué puerta bloquea
+  operaciones, y cuál lo hace en solitario), `/costs` (reparto del bruto) y
+  `/diagnostics` (calidad del dato, meta riesgo, régimen, correlación,
+  portfolio, microestructura, benchmark). Cubren 12 endpoints que no tenían UI.
+- **Ventana semanal de entrenamiento del ML** con el mercado cerrado (sábado,
+  configurable). `WeeklyTrainingGate` decide contra la última ejecución
+  persistida en disco en vez de un intervalo fijo, que no dispararía nunca en
+  una máquina que se reinicia más a menudo que semanalmente.
 - **Edge Research Engine (Bloque 1, Edge Intelligence).** Motor nuevo
   (`app/engine/edge_research/`) que mide la **salud** del edge de cada
   estrategia: edge decay, half-life, stability score, edge persistence, PF /

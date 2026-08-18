@@ -2618,3 +2618,159 @@ una celda cortada antes de resolver su tesis pese a tener holding corto.
 Suite completa en verde, Ruff/Black/MyPy strict limpios. **No se cambio ningun
 umbral, ninguna config de produccion ni ninguna estrategia**: la tarea sigue
 cerrada con el mismo veredicto, ahora con las dos casillas que le faltaban.
+
+## 2026-08-13 - El dashboard deja de ser decorativo
+
+**Categoria:** dashboard · **Tags:** `config-center` `estrategias` `backtest-runner` `edge-intelligence` `whitelist`
+
+Barrido completo del dashboard buscando controles que no hacian lo que
+decian. Encontrados varios, todos con la misma forma: el boton devolvia un
+"guardado" correcto y el motor seguia exactamente igual.
+
+### Control de estrategias - enable/disable/weight no tocaban el motor
+
+Los endpoints solo escribian la intencion en `config_store`, que no leia
+nadie: ni el motor, ni el bootstrap. El boton "Disable" decia exito y la
+estrategia seguia evaluando indefinidamente. Arreglo: las rutas llaman al
+`StrategyEngine` vivo (los metodos `enable_strategy`/`disable_strategy`/
+`set_weight` ya existian y ya eran hot, solo no se llegaba a ellos) y ademas
+persisten la decision. `StrategyEngine` recibe un proveedor de overrides y
+los reaplica tras el descubrimiento, para que la decision sobreviva al
+reinicio en vez de perderse contra el `.env`.
+
+### Config Center - `[object Object]` sobre un `dict[str, bool]`
+
+El frontend elegia el control por `typeof entry.default`; los seis paths de
+tipo `dict` (`symbols_enabled`, los `*_by_symbol`...) caian a un input de
+texto que mostraba literalmente `[object Object]`. Guardarlo escribia esa
+cadena sobre el dict real y el siguiente tick moria con `AttributeError` al
+llamar `.get()` sobre un `str`, en el camino caliente de ejecucion. Arreglo:
+`effective()` publica el `kind` declarado por el esquema (no por el valor
+actual - un dict vacio no dice nada), el frontend usa un editor JSON para
+los campos compuestos, y `apply()` valida contra `TypeAdapter` antes de
+escribir nada, todo o nada.
+
+De paso: `risk.*` (el `RiskSettings` raiz, tres campos que no lee ningun
+modulo) fuera de la whitelist, y `quant.filters.max_drawdown_pct` -el freno
+diario real- dentro, porque no estaba.
+
+### Backtest runner - `strategy`/`start`/`end` se ignoraban en silencio
+
+El formulario los pedia (y exigia `strategy` para habilitar el boton) pero
+`submit_backtest` solo leia `symbol`/`bars`/`spread_bps`: corria siempre las
+20 estrategias sobre las ultimas 5000 velas. `Cancel` devolvia
+`{"status": "cancelled"}` sin cancelar nada - la corrida es sincrona dentro
+de la peticion, no hay job al que llegar. Ahora honra los tres parametros
+(aislando la estrategia por configuracion, mismo interruptor que usa el
+motor en vivo) y `Cancel` devuelve 409 honesto.
+
+### Cuatro pantallas nuevas: Edge Intelligence
+
+Los quince bloques de Edge Intelligence (ADR-100...114) tenian backend,
+tests y ADR desde el 05/08 y ninguna pantalla - el dashboard consumia 32 de
+los ~90 endpoints de lectura. `/edge`, `/rejections`, `/costs`,
+`/diagnostics`. Toda metrica no medible se pinta `-`, nunca `0`, misma regla
+que gobierna esos quince bloques.
+
+**Tests:** ~35 nuevos entre backend y frontend. Suite completa en verde,
+Ruff/Black/MyPy strict limpios, `tsc`+`eslint`+`next build` limpios.
+
+## 2026-08-14 - Ventana semanal de entrenamiento con el mercado cerrado
+
+**Categoria:** ml · **Tags:** `entrenamiento` `scheduler` `fin-de-semana`
+
+El entrenamiento del AutoML compite por CPU con el motor operando. Se lleva
+al fin de semana (XAUUSD cierra viernes ~21:00 UTC, no abre hasta domingo
+~22:00 UTC). De paso: `nightly_hour_utc` nunca fue nocturno - no lo leia
+nadie, y el job corria cada 86400 s desde el arranque del proceso; con los
+reinicios de estos dias, disparaba a media sesion.
+
+No se implemento como `interval_seconds` de 7 dias: el scheduler reinicia
+su reloj en cada arranque, y esta VPS se reinicia mas a menudo que
+semanalmente. El job tiquea cada 30 min y `WeeklyTrainingGate` decide,
+contra la ultima ejecucion persistida en disco - sobrevive a reinicios
+dentro de la ventana, no entrena al primer arranque fuera de ella, y tiene
+una red de recuperacion si el motor estuvo caido todo el fin de semana.
+
+Verificado en produccion el 16/08: disparo a las 06:23 UTC del sabado,
+termino a las 09:40 (3h17min), probo varios modelos sobre 2093 operaciones
+y **rechazo el mejor candidato** (`voting`, AUC 0.591 contra 0.684 del
+activo) - la regla "nunca activar un modelo inferior" funcionando sola, sin
+intervencion.
+
+**Tests:** 12 con reloj falso. Suite en verde.
+
+## 2026-08-16/18 - Cuatro estrategias fuera, el barrido de regimen sin evidencia, y el freno semanal que si funciono
+
+**Categoria:** riesgo · **Tags:** `edge-research` `regimen` `perdida-semanal` `session-asia`
+
+### Estrategias degradadas apagadas - con cuidado de no apagar las que aun ganan
+
+El Edge Report marcaba seis estrategias `degrading`, pero apagar la lista
+completa habria sido un error: `fair_value_gap` (+0.673R, PF 2.19) y
+`vwap_mean_reversion` (+0.137R) estaban marcadas por decaimiento/inestabi-
+lidad, no por perdidas - seguian ganando en el momento de mirar. Se
+apagaron solo las cuatro con expectativa negativa confirmada y n=300:
+`liquidity_sweep` (-0.30R), `mss` (-0.15R), `volume_profile` (-0.08R),
+`vwap_breakout` (-0.17R).
+
+### El barrido de regimen: falso la hipotesis en vez de confirmarla
+
+`scripts/regime_exit_sweep.py` (nuevo) comparo ocho configuraciones de la
+salida por `regime_change` sobre 20000 velas de oro, con controles en
+direccion contraria para distinguir efecto real de ruido. El mecanismo
+funciono como se esperaba -bajo `regime_change` del 75.7% al 0% quitandola
+del todo- pero la expectativa **no mejoro en ningun escenario** (-0.28R a
+-0.38R, PF 0.10-0.34 en todos). Los dos controles dieron resultados
+identicos al actual, confirmando que el efecto medido era real, no
+aleatoriedad del backtest. **Decision: no se toca la salida por regimen.**
+El hueco entre el edge virtual de las senales y lo realizado no viene
+principalmente de ahi.
+
+Aparte, se investigo una sospecha de edge por sesion (Asia +0.088R, IC 95%
+bootstrap excluye cero, n=824) que contradice en magnitud al estudio
+riguroso del 11/08 (`session_edge.py`, muestra 14x mayor, con correccion
+FDR) - anotado en `docs/baseline_20260813.json` para revisar con rigor en
+el cierre del 27/08, sin actuar sobre ella mientras tanto: sesgar ahora
+contaminaria la propia ventana de medicion.
+
+### El freno de perdida semanal bloqueo el motor 13 horas, y no habia donde ajustarlo
+
+El 18/08, `max_weekly_loss_pct` (8% por defecto) bloqueo toda apertura de
+XAUUSDM desde las 02:03 UTC - solo `max_daily_loss_pct` estaba en la
+whitelist del Config Center, `max_weekly_loss_pct`/`max_monthly_loss_pct`
+no. Encontrado al investigar por que el bot llevaba 12 horas "pegado" (en
+realidad generando decisiones normales, rechazadas todas en el Risk
+Manager). Anadidos ambos a la whitelist (aplican en caliente,
+`execution.risk.` ya estaba en `_LIVE_PREFIXES`), y por decision explicita
+del operador los tres limites de perdida por periodo se subieron a 1000%
+-nunca 0, misma trampa ya documentada- junto con `ignore_drawdown_limits`
+ya activo. Queda como unico freno por perdida el circuit breaker (5% en 15
+min); `max_consecutive_losses` ya estaba en 0 desde antes del 05/08.
+
+Reconstruyendo la curva de PnL del pivote a oro (11/08): pico +158.01 el
+17/08, caida a +80.83 el 18/08 - de esa caida de -77.19, **-52.93 pasaron
+antes** de tocar nada (el freno ya estaba conteniendo el mal dia) y
+**-24.26 despues** de subir los limites. El freno estaba haciendo
+exactamente el trabajo para el que existe cuando se le quito el margen.
+
+**Tests:** 2 nuevos (whitelist + aplicacion en caliente). Suite en verde.
+
+## 2026-08-18 - Reductor de riesgo por volatilidad alta
+
+**Categoria:** riesgo · **Tags:** `sizing` `volatilidad` `atr`
+
+Ver **ADR-115**. El `VolatilityFilter` solo bloqueaba volatilidad LOW; HIGH
+se clasificaba y no accionaba nada - ni bloqueo, ni reduccion de tamano. Se
+reutiliza el mismo umbral `atr_pct_high_for` (sin duplicar configuracion)
+como el punto donde el riesgo por operacion cae proporcionalmente al exceso
+de ATR, con un piso que nunca llega a 0 (`sizing.volatility_risk_floor`,
+por defecto 0.25). Compone por producto con el reductor de calidad de dato
+e infraestructura ya existente (Bloques 11/12).
+
+Desplegado y verificado en `qevps`: guard de arranque 4/4, 15/20
+estrategias intactas, reductor activo con piso 25%.
+
+**Tests:** 12 nuevos, incluido un extremo a extremo que confirma que el
+reductor encoge el tamano real de la posicion. Suite completa en verde,
+Ruff/Black/MyPy strict limpios.
