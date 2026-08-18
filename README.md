@@ -157,3 +157,4 @@ entorno del proceso → `config/<ambiente>.env` → `.env`.
 - [docs/architecture.md](docs/architecture.md) — decisiones técnicas (ADRs)
 - [docs/conventions.md](docs/conventions.md) — convenciones de commits y código
 - [docs/bitacora.md](docs/bitacora.md) — bitácora del proyecto (DocumentationService)
+- [docs/graduation_criteria.md](docs/graduation_criteria.md) — umbrales de graduación a live (fuente única)

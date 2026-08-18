@@ -156,6 +156,65 @@ def bootstrap_expectancy(
     return low, high, non_positive / resamples
 
 
+def bootstrap_difference(
+    treatment: Sequence[float],
+    control: Sequence[float],
+    *,
+    resamples: int = 10_000,
+    seed: int = 20260818,
+) -> tuple[float, float, float]:
+    """Bootstrap percentil de la diferencia de medias ``treatment - control``.
+
+    Hermana de :func:`bootstrap_expectancy`, para la pregunta distinta de *¿son
+    estos dos brazos diferentes?* en vez de *¿gana este brazo?*. Comparar dos
+    expectativas puntuales no responde eso: con ~1000 operaciones por brazo, una
+    diferencia de 0.05R cabe de sobra dentro del ruido de muestreo, y decidir
+    mirando cuál número es mayor es decidir a cara o cruz.
+
+    Los dos brazos se remuestrean **por separado** (bootstrap de dos muestras
+    independientes) porque no están emparejados: cambiar la regla de salida
+    cambia qué operaciones existen, no solo cómo terminan —una posición que se
+    cierra antes libera el hueco para una entrada que el otro brazo nunca vio—.
+    Tratarlos como pares emparejaría operaciones que no se corresponden.
+
+    Args:
+        treatment: R-múltiplos del brazo tratado (p. ej. sin salida por régimen).
+        control: R-múltiplos del brazo de control (p. ej. la config actual).
+        resamples: Remuestreos, fijado para que dos corridas coincidan.
+        seed: Semilla — un resultado que cambia entre corridas no es reportable.
+
+    Returns:
+        ``(ci_low, ci_high, p_value)`` al 95 % sobre la diferencia. El p-valor es
+        unilateral: proporción de remuestreos cuya diferencia **no** es positiva,
+        es decir, la evidencia contra "el tratamiento mejora al control".
+
+    Raises:
+        ValueError: Si alguno de los dos brazos está vacío.
+    """
+    if not treatment or not control:
+        raise ValueError("bootstrap de diferencia sobre un brazo vacío")
+    rng = random.Random(seed)
+    n_t = len(treatment)
+    n_c = len(control)
+    diffs: list[float] = []
+    non_positive = 0
+    for _ in range(resamples):
+        total_t = 0.0
+        for _ in range(n_t):
+            total_t += treatment[rng.randrange(n_t)]
+        total_c = 0.0
+        for _ in range(n_c):
+            total_c += control[rng.randrange(n_c)]
+        diff = total_t / n_t - total_c / n_c
+        diffs.append(diff)
+        if diff <= 0.0:
+            non_positive += 1
+    diffs.sort()
+    low = diffs[int(0.025 * (resamples - 1))]
+    high = diffs[int(0.975 * (resamples - 1))]
+    return low, high, non_positive / resamples
+
+
 def benjamini_hochberg(p_values: Sequence[float], *, q: float = 0.10) -> list[bool]:
     """Benjamini-Hochberg: qué hipótesis se rechazan controlando el FDR a ``q``.
 

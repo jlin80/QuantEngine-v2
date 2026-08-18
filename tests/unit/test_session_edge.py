@@ -2,9 +2,11 @@
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from app.backtesting.session_edge import (
     CellSample,
     benjamini_hochberg,
+    bootstrap_difference,
     bootstrap_expectancy,
     evaluate_cells,
     profit_factor,
@@ -65,6 +67,42 @@ def test_bootstrap_of_a_clearly_losing_cell_gives_high_p_value():
     low, _, p_value = bootstrap_expectancy([-1.0] * 40, resamples=1000)
     assert low < 0
     assert p_value == 1.0
+
+
+def test_bootstrap_difference_is_deterministic_and_brackets_the_gap():
+    treatment = [0.5, -1.0, 1.2, -1.0, 0.8, 2.0] * 8
+    control = [0.1, -1.0, 0.3, -1.0, 0.2, 0.4] * 8
+    low, high, p_value = bootstrap_difference(treatment, control, resamples=2000)
+    again = bootstrap_difference(treatment, control, resamples=2000)
+    assert (low, high, p_value) == again  # una cifra que cambia no es reportable
+
+    observed = sum(treatment) / len(treatment) - sum(control) / len(control)
+    assert low < observed < high
+    assert 0.0 <= p_value <= 1.0
+
+
+def test_bootstrap_difference_finds_no_gap_between_identical_arms():
+    """Dos brazos iguales tienen que dar un IC que contenga el cero.
+
+    Es el caso que protege del falso positivo: si esto excluyera cero, el script
+    del A/B declararia un efecto donde solo hay remuestreo.
+    """
+    arm = [0.4, -1.0, 1.1, -1.0, 0.7] * 10
+    low, high, _ = bootstrap_difference(arm, list(arm), resamples=2000)
+    assert low < 0.0 < high
+
+
+def test_bootstrap_difference_detects_a_clearly_better_arm():
+    low, _, p_value = bootstrap_difference([1.0] * 60, [-1.0] * 60, resamples=1000)
+    assert low > 0.0
+    assert p_value == 0.0
+
+
+def test_bootstrap_difference_rejects_an_empty_arm():
+    with pytest.raises(ValueError):
+        bootstrap_difference([], [1.0, 2.0])
+    with pytest.raises(ValueError):
+        bootstrap_difference([1.0, 2.0], [])
 
 
 def test_benjamini_hochberg_rejects_less_than_raw_threshold():

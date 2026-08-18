@@ -42,7 +42,13 @@ class FakeMT5:
         contract_size: float = 100.0,
         account_ok: bool = True,
         positions: list[Any] | None = None,
+        deal_commission: float = 0.0,
+        deal_swap: float = 0.0,
+        deal_in_history: bool = True,
     ) -> None:
+        self._deal_commission = deal_commission
+        self._deal_swap = deal_swap
+        self._deal_in_history = deal_in_history
         self._retcode = retcode
         self._symbol_known = symbol_known
         self._vmin = volume_min
@@ -85,13 +91,23 @@ class FakeMT5:
 
     def order_send(self, payload: dict[str, Any]) -> Any:
         self.sent.append(payload)
+        # Fiel al terminal real: ``OrderSendResult`` **no** trae ``commission``.
+        # Sólo el ticket del deal, con el que se consulta el historial.
         return SimpleNamespace(
             retcode=self._retcode,
             price=payload["price"],
             volume=payload["volume"],
             comment="done" if self._retcode == self.TRADE_RETCODE_DONE else "rejected",
-            commission=0.0,
+            deal=777,
         )
+
+    def history_deals_get(self, ticket: int) -> Any:
+        if not self._deal_in_history:
+            return ()
+        deal = SimpleNamespace(
+            ticket=ticket, commission=self._deal_commission, swap=self._deal_swap
+        )
+        return (deal,)
 
 
 def _ticker(symbol: str = "XAUUSD", bid: float = 2000.0, ask: float = 2000.5) -> Ticker:
@@ -139,6 +155,34 @@ def test_market_buy_fills_and_maps_payload() -> None:
     assert payload["sl"] == 1990.0
     assert payload["tp"] == 2020.0
     assert payload["symbol"] == "XAUUSD"
+
+
+def test_commission_comes_from_the_deal_not_the_order_result() -> None:
+    """La comisión sale del historial de deals, no del ``OrderSendResult``.
+
+    ``OrderSendResult`` no tiene campo ``commission``: leerla de ahí devolvía
+    siempre 0.0 y por eso el Trade Journal registraba coste cero.
+    """
+    fake = FakeMT5(deal_commission=-0.35, deal_swap=-0.05)
+    broker = _connected_broker(fake)
+
+    result = broker.execute(_order(), _ticker())
+
+    assert result.fill is not None
+    # Valor absoluto y swap incluido: 0.35 + 0.05.
+    assert result.fill.commission == pytest.approx(0.40)
+
+
+def test_commission_is_zero_when_the_deal_is_not_in_history_yet() -> None:
+    fake = FakeMT5(deal_commission=-9.0, deal_in_history=False)
+    broker = _connected_broker(fake)
+
+    result = broker.execute(_order(), _ticker())
+
+    # El fill no se bloquea por no poder leer el coste.
+    assert result.accepted
+    assert result.fill is not None
+    assert result.fill.commission == pytest.approx(0.0)
 
 
 def test_market_sell_uses_bid() -> None:

@@ -329,12 +329,51 @@ class MT5Broker:
             reference_price=ticker.mid,
             price=fill_price,
             spread_bps=ticker.spread_bps,
-            commission=abs(float(getattr(result, "commission", 0.0) or 0.0)),
+            commission=self._deal_commission(mt5, result),
             liquidity="taker",
             executed_at=utc_now(),
             broker_ref=str(order_ticket) if order_ticket else None,
         )
         return BrokerExecution(fill, RejectReason.NONE)
+
+    def _deal_commission(self, mt5: ModuleType, result: Any) -> float:
+        """Comisión realmente cobrada por el broker en la operación.
+
+        ``OrderSendResult`` **no expone** ``commission``: sus campos son retcode,
+        deal, order, volume, price, bid, ask, comment, request_id y
+        retcode_external. Leerla de ahí con ``getattr(..., 0.0)`` devolvía
+        siempre el default, y por eso las comisiones del Trade Journal sumaban
+        0.00 y toda expectativa histórica quedó sobrestimada.
+
+        La cifra real vive en el **deal** del historial, así que se consulta por
+        el ticket que sí devuelve ``order_send``. Se suma ``swap`` porque en
+        cuentas Exness el coste de mantener la posición llega por esa vía.
+
+        Args:
+            mt5: Módulo del terminal (inyectable en tests).
+            result: ``OrderSendResult`` de una orden ya ejecutada.
+
+        Returns:
+            El coste absoluto del fill, o ``0.0`` si el deal no se puede leer.
+        """
+        deal_ticket = getattr(result, "deal", None)
+        if not deal_ticket:
+            return 0.0
+        try:
+            deals = mt5.history_deals_get(ticket=int(deal_ticket))
+        except Exception:  # el terminal puede fallar; leer el coste no rompe el fill
+            _log.warning("No se pudo leer el deal %s para la comisión", deal_ticket)
+            return 0.0
+        if not deals:
+            # El deal puede no estar en el historial todavía: se prefiere 0.0 a
+            # bloquear el fill, pero queda registrado para no volver a creer que
+            # la comisión es cero de verdad.
+            _log.warning("Deal %s aún no disponible en el historial", deal_ticket)
+            return 0.0
+        deal = deals[0]
+        commission = abs(float(getattr(deal, "commission", 0.0) or 0.0))
+        swap = abs(float(getattr(deal, "swap", 0.0) or 0.0))
+        return commission + swap
 
     def instrument_spec(self, symbol: str) -> InstrumentSpec | None:
         """Contrato real del símbolo en el terminal (o ``None`` si no existe).
