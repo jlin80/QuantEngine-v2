@@ -2842,3 +2842,74 @@ pendiente.
 **Tests:** 7 nuevos (4 de `bootstrap_difference`, incluido el caso de dos brazos
 identicos que debe contener el cero, y 6 que fijan cada rama de la tabla de
 decision). Suite completa en verde, Ruff/Black limpios, MyPy sin errores nuevos.
+
+## 2026-08-19 - La ruina no es un bug: la cuenta no da para el lote minimo de oro
+
+**Categoria:** riesgo · **Tags:** `sizing` `ruina` `oro` `order-flow`
+
+El A/B de la salida por regimen dejo una pregunta sin responder: por que el
+drawdown llega al **100 %** en los cuatro brazos, y por que quintuplicar las
+velas apenas sube las operaciones un 11 % (1969 -> 2189). La respuesta no esta
+en el codigo de sizing, que es correcto. Esta en la aritmetica.
+
+| dato | valor |
+|---|---|
+| precio del oro | 4 495.65 USD/oz |
+| `trade_contract_size` XAUUSDm | 100 |
+| `volume_min` | 0.01 lotes |
+| **nocional del lote minimo** | **4 495.65 USD** |
+| `paper.initial_balance` (override del Config Center) | **200.00 USD** |
+| **apalancamiento del lote mas pequeno posible** | **22.5x** |
+
+Con un stop del 0.5 % del precio -normal en oro intradia- el riesgo por
+operacion es de 22.48 USD, o sea el **11.2 % de la cuenta**. El
+`risk_per_trade_pct` configurado es 0.5 %, y **es imposible de cumplir**: no se
+puede arriesgar 1 USD en una posicion cuyo tamano minimo arriesga 22.
+
+De ahi sale toda la cadena, y explica decisiones que parecian arbitrarias:
+
+1. La cuenta (200 USD) es demasiado pequena para el lote minimo de oro.
+2. Para que el oro pudiera operar, los topes tuvieron que abrirse a
+   `max_position_pct=1100 %` y `max_symbol_exposure=5500 %` - es decir, hubo que
+   abrirlos tanto que dejaron de proteger.
+3. Con ~11 % de la cuenta en riesgo por operacion, nueve perdidas seguidas son
+   la ruina.
+4. Y los frenos estan todos sueltos: `max_daily_loss_pct`, `max_weekly_loss_pct`
+   y `max_monthly_loss_pct` en **1000 %**, mas `ignore_drawdown_limits: true`.
+   Ninguno llega a actuar nunca.
+
+**Que NO cambia esto.** La expectativa de -0.27R esta en multiplos de R, que
+estan normalizados por el riesgo de cada operacion: no depende del tamano de la
+cuenta. El veredicto `edge_ausente_confirmado` se sostiene igual.
+
+**Que si cambia.** El 100 % de drawdown deja de ser evidencia sobre la
+estrategia y pasa a ser una consecuencia aritmetica del tamano de la cuenta.
+Son dos hallazgos distintos y hasta ahora estaban mezclados.
+
+**Consecuencia para la validacion multi-regimen** (gap 6): correr mas historico
+no da mas regimenes mientras la cuenta se arruine a las pocas semanas. Hay que
+resolver esto **antes**, y no es codigo: o un balance de paper acorde al
+nocional del oro, o un instrumento cuyo lote minimo quepa en la cuenta.
+
+### Order flow: descartado con evidencia, no por cansancio
+
+`_CAPABILITIES` del proveedor MT5 es `{TICKER, TRADES, CANDLES}` - sin
+ORDERBOOK - y el polling solo emite Ticker. Contrastado contra el journal real:
+de **2 781 operaciones cerradas, `cvd`, `delta_confirmation` y
+`orderbook_imbalance` aparecen CERO veces**. No estan infrautilizadas: estan
+inertes desde siempre.
+
+Exness no expone L2 del CFD, asi que no se arregla con configuracion. Y una
+fuente L2 real (p. ej. Binance) solo serviria para cripto, que es justo lo que
+se ha aparcado al decidir operar solo oro. La adquisicion de order flow queda
+**descartada**; lo que si procede es desactivarlas formalmente para que dejen
+de figurar como operativas. Linea preparada en `.env.example`.
+
+### Riesgo de portafolio con un solo simbolo (gap 4)
+
+Operar solo oro elimina la correlacion *entre* simbolos, pero no la
+concentracion: `max_positions_per_symbol` esta en 3 (override del Config
+Center; el de XAUUSDM son 5). Tres posiciones concurrentes a 22.5x cada una son
+**67x sobre una cuenta de 200 USD**. El grupo de correlacion deja de ser el
+control relevante; el numero que importa ahora es cuantas posiciones de oro
+simultaneas se permiten.
