@@ -2969,3 +2969,80 @@ senales: si estas 20 estrategias tienen algo que ofrecer sobre entradas de 1m.
 Binance (via `calibrate_stops.fetch_candles`), asi que corre sobre BTC spot y no
 sobre el CFD de Exness. Para una hipotesis de calidad de senal sirve igual, pero
 un resultado positivo habria exigido reconfirmarlo sobre datos del venue real.
+
+## 2026-08-19 - El journal real segmentado: mean_reversion fuera, FVG en observacion
+
+**Categoria:** research · **Tags:** `journal` `segmentacion` `fdr` `walk-forward`
+
+La pregunta era "que opere solo las buenas". No es implementable tal cual: cual
+operacion fue buena solo se sabe al cerrarla, y filtrar por el resultado es
+mirar el futuro. Lo unico accionable es buscar **condiciones observables al
+abrir**. Y habia una razon nueva para mirarlo: `session_edge` concluyo "no hay
+edge estable" sobre datos de BACKTEST, y el backtest no reproduce produccion
+(-0.27R contra +0.008R en oro).
+
+Sobre las 1 503 operaciones reales de XAUUSDM:
+
+### Donde se pierde
+
+| motivo de salida | ops | % | exp R | aporte total |
+|---|---|---|---|---|
+| take_profit | 101 | 6.7 | +1.518 | **+153.4R** |
+| manual | 140 | 9.3 | +0.224 | +31.3R |
+| regime_change | 992 | 66.0 | +0.029 | +28.8R |
+| trailing_stop | 53 | 3.5 | +0.203 | +10.7R |
+| **stop_loss** | **217** | **14.4** | **-0.976** | **-211.7R** |
+
+Todo lo que no es stop_loss suma +224R; los stops se llevan -212R. Y un dato
+que corrige una suposicion anterior: **`regime_change` es ligeramente POSITIVO**
+(+0.029R). Cierra dos de cada tres operaciones casi en tablas — no estaba
+haciendo dano, estaba haciendo casi nada.
+
+### Condiciones observables al entrar
+
+Con FDR (Benjamini-Hochberg, q=0.10) aplicado en **los dos sentidos**. El
+p-valor de `bootstrap_expectancy` es unilateral, asi que sin correr tambien la
+correccion sobre la hipotesis "esta celda pierde", desactivar por un IC suelto
+seria el mismo error que activar por uno: con 28 celdas alguna parece perdedora
+por azar.
+
+Ganadoras que sobreviven: `categoria=trend` (n=155, +0.133R, IC [+0.023,
++0.246]) y `strategy=fair_value_gap` (n=393, +0.120R, IC [+0.043, +0.199]).
+
+Perdedoras que sobreviven: `strategy=mean_reversion` (n=161, -0.152R, IC
+[-0.266, -0.042]), `categoria=mean_reversion` (n=270, -0.114R) y
+`regimen=reversal` (n=358, -0.084R).
+
+`vwap_mean_reversion` (n=109, -0.056R, IC [-0.201, **+0.095**]) **no**
+sobrevive: la categoria solo pierde porque `mean_reversion` tira de ella. Por
+eso se desactiva la estrategia y no la categoria entera.
+
+### El walk-forward enfria el lado ganador
+
+| pliegue | seleccion in-sample | OOS |
+|---|---|---|
+| 1 | **vacia** | - |
+| 2 | trend + fair_value_gap | n=170, +0.0003R |
+| 3 | fair_value_gap | n=119, +0.0676R |
+
+**OOS agregado: n=289, +0.0280R, IC [-0.0560, +0.1139], p=0.257.** Mantiene el
+signo en los dos pliegues con seleccion —que no habia pasado nunca— pero el IC
+contiene el cero con holgura: compatible con no tener ventaja.
+
+### Lo aplicado, y lo que no
+
+**Aplicado:** `execution.strategies_enabled = {"mean_reversion": false}` via
+Config Center (PATCH /api/config, auditado, en caliente, sin reinicio). Bloquea
+solo la APERTURA: la estrategia sigue emitiendo senales y votando, asi que el
+contrafactual se puede seguir midiendo y el cambio es reversible.
+
+**No aplicado:** ningun filtro que restrinja a `trend`/`fair_value_gap`. Con
++0.0280R fuera de muestra no despeja ningun liston, y cablearlo seria
+seleccionar sobre datos vistos — justo lo que prohibe el kill criteria. Se deja
+correr acumulando muestra: para distinguir un +0.12R real hacen falta del orden
+de 800-1000 operaciones OOS, unas 3-4 semanas al ritmo actual.
+
+**Herramientas:** `scripts/journal_segments.py` y
+`scripts/journal_walk_forward.py`, con 9 tests que fijan las dos trampas — que
+las dimensiones no puedan mirar `exit_reason`/`pnl`/`is_win`, y que la seleccion
+del walk-forward no vuelva a elegir mirando el out-of-sample.
