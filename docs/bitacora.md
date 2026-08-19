@@ -2774,3 +2774,71 @@ estrategias intactas, reductor activo con piso 25%.
 **Tests:** 12 nuevos, incluido un extremo a extremo que confirma que el
 reductor encoge el tamano real de la posicion. Suite completa en verde,
 Ruff/Black/MyPy strict limpios.
+
+## 2026-08-18 - La salida por regimen no era el confundido: el edge no existe
+
+**Categoria:** research · **Tags:** `ab-test` `regimen` `costes` `falsacion`
+
+Quedaba un confundido conocido en el veredicto `no_hay_edge_estable`: lo medido
+en produccion (-0.078R) llevaba la salida por regimen puesta, que se lleva el
+91.3 % de los cierres a los ~4 minutos, y los barridos de stops/objetivos
+corrieron con `context=None`, o sea sobre un motor que **no podia** cerrar por
+regimen. Nunca se habia comparado el mismo sistema consigo mismo, asi que
+"no hay edge" y "las estrategias nunca llegan a probar su tesis" seguian siendo
+hipotesis distintas y ninguna medicion las separaba.
+
+`scripts/regime_exit_ab.py` las separa: dos brazos, una sola variable
+(`exit_on_regime_change`), tabla de decision fijada en el codigo e impresa antes
+de correr. Con `bootstrap_difference()` (nuevo en `session_edge.py`) el IC al
+95 % va sobre la **diferencia** de medias, no sobre cada brazo por separado -
+comparar expectativas puntuales con ~2000 operaciones por brazo no distingue
+0.05R de ruido.
+
+Dos corridas sobre XAUUSDM con la configuracion real de produccion:
+
+| velas | brazo | ops | expectativa | IC 95 % | tesis % |
+|---|---|---|---|---|---|
+| 10 000 | control | 1969 | -0.2403R | [-0.2764, -0.2038] | 34.3 |
+| 10 000 | tratado | 1092 | -0.2474R | [-0.3193, -0.1775] | 99.0 |
+| 50 000 | control | 2189 | -0.2716R | [-0.3096, -0.2331] | 40.9 |
+| 50 000 | tratado | 2002 | -0.3011R | [-0.3569, -0.2461] | 99.2 |
+
+Diferencia (tratado - control): **-0.0071R** IC [-0.0856, +0.0704] p=0.574 en la
+de 10 000; **-0.0295R** IC [-0.0982, +0.0389] p=0.803 en la de 50 000. El cero
+esta dentro en ambas.
+
+El chequeo de manipulacion pasa sin ambiguedad: el brazo tratado cierra
+**0.0 %** por regimen y el 99 % por niveles propios de la estrategia. Es decir,
+esta vez las estrategias **si** llegaron a poner a prueba su tesis, y pierden
+lo mismo. La salida por regimen no estaba destruyendo el edge: no habia edge
+que destruir. El ultimo confundido conocido queda eliminado.
+
+**El numero real es tres veces peor que el reportado.** Las comisiones ahora se
+cobran (3 932 - 5 027 por brazo) donde la bitacora del 04/08 registraba 0.00, y
+la expectativa pasa de -0.078R a ~-0.27R. Causa raiz, corregida en este mismo
+commit: `OrderSendResult` de MT5 **no expone** `commission`, asi que el
+`getattr(result, "commission", 0.0)` de `MT5Broker` caia siempre al default. La
+cifra vive en el deal del historial; ahora se lee de ahi, sumando swap.
+
+**Lo que este experimento NO cierra.** Las operaciones apenas crecen un 11 % al
+quintuplicar las velas (1969 -> 2189) porque el drawdown llega al 100 % en los
+cuatro brazos: la cuenta se arruina pronto y despues no hay capital con que
+operar. La corrida de 50 dias no cubre 50 dias de operativa, cubre hasta la
+ruina. **La validacion multi-regimen sigue pendiente** y no se puede conseguir
+por esta via mientras el sizing lleve la cuenta a cero.
+
+Nada de produccion se toco: el script es de solo lectura, abre su propia
+conexion MT5 y no envia ordenes. El motor de `qevps` no se reinicio, asi que
+**el fix de comisiones esta en disco pero aun no activo en produccion**.
+
+**Nota de operacion.** La primera corrida se lanzo en `qevps` sin limite de
+prioridad y dejo la VPS al 90 % de CPU durante 45 minutos, compitiendo con el
+bucle de gestion de posiciones del motor vivo - justo lo que advierte
+`ResearchBudgetSettings`. Se aborto y se repitio en la maquina local, sin
+contencion (5m34s las 50 000 velas). El script no tiene guardas de recursos,
+al contrario que el ciclo del Research Lab; corregirlo o documentarlo queda
+pendiente.
+
+**Tests:** 7 nuevos (4 de `bootstrap_difference`, incluido el caso de dos brazos
+identicos que debe contener el cero, y 6 que fijan cada rama de la tabla de
+decision). Suite completa en verde, Ruff/Black limpios, MyPy sin errores nuevos.
