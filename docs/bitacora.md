@@ -2913,3 +2913,59 @@ Center; el de XAUUSDM son 5). Tres posiciones concurrentes a 22.5x cada una son
 **67x sobre una cuenta de 200 USD**. El grupo de correlacion deja de ser el
 control relevante; el numero que importa ahora es cuantas posiciones de oro
 simultaneas se permiten.
+
+## 2026-08-19 - El marco del regimen no cambia la expectativa: cuarta palanca nula
+
+**Categoria:** research · **Tags:** `multi-timeframe` `regimen` `falsacion`
+
+Quedaba una palanca sin probar. `multi_timeframe.py` mide la hipotesis que su
+propio docstring plantea: el motor es monotimeframe y, con `lookback` 50 en 1m,
+**toda su vision de mercado son 50 minutos**; media biblioteca son estrategias
+de estructura (`bos`, `choch`, `mss`, `order_block`, `fair_value_gap`) y la
+estructura leida en velas de 1m se rompe cada pocos minutos. Detectar estructura
+ahi seria detectar ruido.
+
+BTCUSDT, 20 000 velas 1m, spread 1.5 bps, entrada siempre en 1m, moviendo solo
+el marco del detector de regimen con ventanas temporales equiparadas:
+
+| regimen | lookback | ventana | trades | WR % | PF | **exp R** | ret % | PF s/spread |
+|---|---|---|---|---|---|---|---|---|
+| 1m (vigente) | 50 | 0.8 h | 5280 | 17.1 | 0.17 | **-0.276** | -59.6 | 0.22 |
+| 5m | 36 | 3 h | 2124 | 39.1 | 0.39 | **-0.283** | -31.1 | 0.47 |
+| 15m | 20 | 5 h | 2121 | 38.9 | 0.39 | **-0.287** | -31.2 | 0.47 |
+| 15m | 40 | 10 h | 2123 | 38.7 | 0.39 | **-0.292** | -31.5 | 0.47 |
+| 1h | 12 | 12 h | 2124 | 38.9 | 0.39 | **-0.284** | -31.1 | 0.47 |
+| 1h | 24 | 24 h | 2122 | 39.3 | 0.40 | **-0.279** | -30.9 | 0.47 |
+
+**La expectativa por operacion no se mueve: -0.276 a -0.292 R.** Todo el rango
+son 0.016R, ruido puro. El win rate mas que dobla (17 % -> 39 %) y el profit
+factor pasa de 0.17 a 0.39, pero la R media es la misma: el filtro cambia la
+forma de la distribucion (menos perdidas pequenas, mas grandes), no su centro.
+
+Y la mejora del retorno (-59.6 % -> -31.1 %) **no es mejora de edge**: las
+operaciones caen a la mitad (5280 -> 2122) con la misma expectativa por
+operacion. Es hacer menos veces algo que pierde, no hacerlo mejor.
+
+Detalle que conviene mirar: de 5m a 1h los resultados son casi identicos
+(2121-2124 operaciones, PF 0.39-0.40). Salir de 1m cambia algo; que marco
+superior se elija, practicamente nada.
+
+A spread CERO el PF sube de 0.22 a 0.47 y sigue muy por debajo de 1.
+
+### Cuatro palancas, cuatro nulos
+
+| palanca | resultado |
+|---|---|
+| instrumento | oro -0.27R, BTC -0.30R |
+| costes de ejecucion | a spread 0 sigue perdiendo (PF 0.22-0.47) |
+| tamano de cuenta / sizing | BTC bien dimensionado (DD 53 %, no 100 %) sigue en -0.30R |
+| marco del regimen | 1m a 1h, todo entre -0.276 y -0.292R |
+
+La gestion de riesgo no puede cambiar el signo de una expectativa negativa: solo
+la velocidad. Descartadas estas cuatro, lo que queda por examinar son las
+senales: si estas 20 estrategias tienen algo que ofrecer sobre entradas de 1m.
+
+**Nota de metodo:** `multi_timeframe.py` **no usa MT5**, descarga de la REST de
+Binance (via `calibrate_stops.fetch_candles`), asi que corre sobre BTC spot y no
+sobre el CFD de Exness. Para una hipotesis de calidad de senal sirve igual, pero
+un resultado positivo habria exigido reconfirmarlo sobre datos del venue real.

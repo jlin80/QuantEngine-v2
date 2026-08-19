@@ -3202,3 +3202,52 @@ cruza un borde. En el historial anterior el campo llega `None`: **ausente no es
 
 `_market_view` sigue usando `sessions[0]` para el modelo de slippage — deuda
 registrada, no corregida aquí.
+
+## ADR-117 · Cada activo en su venue: cripto por Binance, forex y metales por MT5
+
+**Contexto.** Hoy todo pasa por MT5/Exness, y eso mezcla tres problemas que no
+tienen por que ir juntos.
+
+*Datos.* `_CAPABILITIES` de MT5 es `{TICKER, TRADES, CANDLES}`: **sin
+ORDERBOOK**. Los proveedores de Binance, Bybit y OKX —ya escritos— declaran
+ademas `ORDERBOOK`, `FUNDING`, `LIQUIDATIONS` y `MARK_PRICE`. Por eso `cvd`,
+`delta_confirmation` y `orderbook_imbalance` llevan inertes desde siempre: cero
+operaciones en 2 781 del journal.
+
+*Tamano minimo.* El lote minimo del CFD de BTC en Exness son ~684 USD de
+nocional; en Binance spot el minimo son 5 USD con `stepSize` de 0.00001 BTC.
+Sobre una cuenta de 200 USD eso es la diferencia entre **342 % de exposicion
+forzada** y **2.5 % con granularidad real**. Todo el andamiaje de overrides al
+1100 %/5500 % existe unicamente para que un lote minimo demasiado grande quepa
+en una cuenta pequena.
+
+*Historico.* El terminal MT5 corta en 50 000 velas de 1m (34-50 dias segun
+simbolo); la REST de Binance da anos. La validacion multi-regimen estaba
+bloqueada por esto.
+
+*Medicion.* Se backtestea cripto con datos de Binance y se ejecutaria en el CFD
+de Exness, que cotiza ~10 bps por debajo con offset estable. Dato y venue no
+coinciden.
+
+**Decision.** El venue se elige por clase de activo, no por comodidad:
+
+| clase | datos | ejecucion |
+|---|---|---|
+| cripto | Binance | Binance (pendiente) |
+| forex, metales, indices | MT5 / Exness | MT5 |
+
+**Consecuencias.**
+
+- El proveedor de datos ya existe; **el broker de ejecucion de Binance no**.
+  `app/brokers/` solo contiene `mt5`. Hay que implementarlo contra la interfaz
+  `ExecutionBroker`, igual que `MT5Broker`.
+- Se hace contra **testnet**, no contra el exchange real: mantiene intacta la
+  regla de solo-paper y el guard anti-live.
+- Reabre la adquisicion de order flow (tarea 3), archivada el 2026-08-19 con el
+  argumento de que L2 solo serviria para cripto y cripto estaba aparcado. Al
+  dejar de estarlo, el argumento decae.
+- **Cuestion abierta que condiciona la implementacion:** el spot de Binance
+  **no permite ponerse corto**. La biblioteca emite senales en ambas
+  direcciones, asi que spot dejaria la mitad inutilizable. Futuros si permite
+  cortos (nocional minimo 50 USD en BTCUSDT, 20 USD en ETHUSDT) pero introduce
+  apalancamiento y financiacion. No se implementa nada hasta decidirlo.
