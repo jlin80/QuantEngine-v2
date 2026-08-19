@@ -70,6 +70,8 @@ python scripts/graduation_gap.py data/execution/journal.jsonl --since 2026-08-04
 |---|---|---|---|
 | Muestra de operaciones cerradas | ≥ 400 | `MIN_TRADES` | Con n=100 y +0.1R el error estándar tapa el resultado; 400 es el orden de magnitud donde una expectativa modesta empieza a ser medible |
 | Expectativa por operación | ≥ +0.10R | `MIN_EXPECTANCY_R` | Positiva **con margen**: exigir >0 aprueba un sistema que empata, y un sistema que empata en paper pierde en real (el paper no cobra swaps ni sufre requotes) |
+| **IC inferior de la expectativa** | **> 0** | `BOOTSTRAP_RESAMPLES` | Nunca se promueve por una estimación puntual. Con n=400 y desviación 1.5R el IC es de ±0.147: un +0.10R puntual **no** excluye el cero, así que sin esto se podía graduar un sistema sin ventaja medible |
+| **Pliegues walk-forward confirmados** | **≥ 2 de 3** | `MIN_WALK_FORWARD_FOLDS` | Una decisión que no sobrevive a datos que no vio es ajuste al pasado. Un pliegue solo confirma si el in-sample despeja el listón **y** el out-of-sample sale positivo |
 | Profit factor | ≥ 1.30 | `MIN_PROFIT_FACTOR` | Por debajo de ~1.2 el resultado lo domina el ruido |
 | Drawdown máximo sobre equity pico | ≤ 15 % | `MAX_DRAWDOWN_PCT` | — |
 | Días de operativa continuada | ≥ 60 | `MIN_DAYS_IN_PAPER` | El calendario importa aparte de la muestra: 400 operaciones en tres días miden un solo régimen con mucho detalle |
@@ -99,30 +101,45 @@ Toda decisión queda registrada, se promueva o no.
 
 ---
 
-## Lo que sigue sin estar definido
+## Huecos: dos cerrados, uno descartado, uno abierto
 
-Estos huecos son reales y **no** se cierran con este documento; se listan para
-que dejen de parecer decididos:
+### ✅ Cerrado — intervalo de confianza en la puerta B
 
-1. **No hay criterio de intervalo de confianza en la puerta B.** El análisis de
-   research usa bootstrap al 95 % (`bootstrap_expectancy()` en
-   `app/backtesting/session_edge.py`, que devuelve percentil inferior y p-valor),
-   pero `graduation.py` compara la expectativa **puntual** contra +0.10R sin
-   exigir que el IC inferior esté sobre cero. Con n=400 la diferencia importa.
-   *Pendiente: decidir si B incorpora `ci_low > 0` y con qué nivel.*
+Implementado como criterio `expectancy_ci`: el límite inferior del IC al 95 %
+(bootstrap de 10 000 remuestreos, reutilizando `bootstrap_expectancy()` de
+`app/backtesting/session_edge.py`) debe estar sobre cero. Se suma al umbral
+puntual de +0.10R, no lo sustituye.
 
-2. **No hay corte fijado para P(expectativa > 0).** La métrica se calcula en
-   research; nunca se fijó el umbral aceptable.
+### ✅ Cerrado — walk-forward en la puerta B
 
-3. **La puerta B no exige walk-forward.** A sí lo exige
-   (`require_walk_forward`), pero B —la que decide sobre live— no mira folds.
-   *Pendiente: decidir cuántos folds con conjunto de selección no vacío son
-   mínimo.* No es hipotético: los dos folds medidos en agosto de 2026 dieron
-   conjunto de selección **vacío**.
+Implementado como criterio `walk_forward`. El journal se ordena por salida y se
+parte en 4 bloques contiguos; para cada frontera, el in-sample es todo lo
+anterior y el out-of-sample el bloque siguiente.
 
-4. **A y B no comparten vocabulario de drawdown.** A mide drawdown de backtest
-   sobre capital inicial; B lo mide sobre equity pico del journal. Los números
-   (12 % y 15 %) no son directamente comparables.
+Un pliegue **confirma** sólo si el in-sample despeja `MIN_EXPECTANCY_R` (con
+esos datos se habría promovido) **y** el out-of-sample sale positivo. Si el
+in-sample no despeja, el pliegue no confirma nada: no es un fallo del sistema,
+es que no había decisión que validar, y contarlo como éxito premiaría la
+ausencia de señal. Es literalmente lo que pasó en agosto de 2026, cuando los
+dos pliegues medidos dieron conjunto de selección vacío.
+
+### ❌ Descartado — corte para P(expectativa > 0)
+
+**Es la misma evidencia que el IC, expresada de otra forma.** El bootstrap
+devuelve `p_value` = proporción de remuestreos cuya media no es positiva, o sea
+`1 − P(exp > 0)`. Exigir un corte aquí *además* de `ci_low > 0` cuenta un solo
+hecho dos veces y da falsa sensación de rigor.
+
+Se deja constancia de la decisión en vez de dejarlo como pendiente indefinido.
+
+### ⬜ Abierto — A y B no comparten vocabulario de drawdown
+
+A mide drawdown de backtest sobre capital inicial; B lo mide sobre equity pico
+del journal. Los números (12 % y 15 %) no son directamente comparables, así que
+el de B no es "más permisivo" que el de A — es otra cosa.
+
+*Pendiente: unificar la base, o documentar por qué son distintas a propósito.*
+Es housekeeping: no cambia qué se aprueba.
 
 ## Relación con los gaps de investigación
 

@@ -12,6 +12,16 @@ Trade Journal real.
 tiene ningún camino hacia `resolved_mode()`. Es un informe. La decisión de
 operar en real sigue siendo humana, manual y posterior — el guard anti-live
 permanece intacto pase lo que pase con estos números.
+
+Los umbrales son **constantes de módulo, no configuración**: un límite de
+habilitación de live que se afloja con una variable de entorno no es un
+control. Cambiarlos exige tocar este fichero, y por tanto aparece en el diff.
+
+*Criterio descartado a propósito:* se evaluó exigir un corte a
+``P(expectativa > 0)`` y se dejó fuera por redundante — el bootstrap devuelve
+ese mismo p-valor, así que es la misma evidencia que ``expectancy_ci``
+expresada de otra forma. Pedir las dos cosas cuenta un solo hecho dos veces y
+da falsa sensación de rigor. Ver ``docs/graduation_criteria.md``.
 """
 
 import statistics
@@ -20,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
+from app.backtesting.session_edge import bootstrap_expectancy
 from app.execution.models.enums import ExitReason
 from app.execution.models.trades import TradeRecord
 
@@ -71,6 +82,28 @@ switch, **sus estrategias casi nunca llegan a poner a prueba su propia tesis**.
 Un sistema así puede tener expectativa positiva y aun así no haber demostrado
 nada sobre sus señales — y lo que se graduaría a real es la ejecución, no la
 estrategia.
+"""
+
+BOOTSTRAP_RESAMPLES = 10_000
+"""Remuestreos del bootstrap de la expectativa. Fijo: dos informes del mismo
+journal tienen que dar el mismo número o no es reportable."""
+
+WALK_FORWARD_FOLDS = 3
+"""Pliegues cronológicos en los que se parte el journal para el walk-forward."""
+
+MIN_WALK_FORWARD_FOLDS = 2
+"""Pliegues que deben confirmar la decisión fuera de muestra.
+
+Exigir los tres sería exigir que el sistema no tenga un solo mal trimestre;
+exigir uno no distingue señal de suerte. Dos de tres es el punto donde una
+confirmación aislada deja de bastar.
+"""
+
+MIN_TRADES_PER_FOLD = 30
+"""Operaciones mínimas en un bloque para que su expectativa signifique algo.
+
+Un pliegue con menos no cuenta como confirmado **ni** como fallado: es
+inconcluyente, y se trata como no confirmado (fail-closed).
 """
 
 _THESIS_EXITS = frozenset(
@@ -179,10 +212,61 @@ def _max_drawdown_pct(trades: list[TradeRecord], starting_equity: float) -> floa
     return worst
 
 
+def _walk_forward_confirmations(trades: list[TradeRecord]) -> tuple[int, int]:
+    """Pliegues cuya decisión in-sample se sostiene fuera de muestra.
+
+    La estabilidad por sub-periodos —que el signo se repita— **no es lo mismo**
+    que el walk-forward: el walk-forward pregunta si una decisión tomada con
+    datos pasados sobrevive a datos que no vio. Aquí la "decisión" es la única
+    que toma esta puerta: *¿el sistema despejaba el listón de expectativa con lo
+    que se sabía hasta la frontera?*
+
+    El journal se ordena por salida y se parte en ``WALK_FORWARD_FOLDS + 1``
+    bloques contiguos. Para cada frontera, el in-sample es todo lo anterior y el
+    out-of-sample es el bloque siguiente, que no se vuelve a tocar.
+
+    Un pliegue **confirma** sólo si se dan las dos cosas: el in-sample despeja
+    ``MIN_EXPECTANCY_R`` (o sea, con esos datos se habría promovido) *y* el
+    out-of-sample sale positivo. Si el in-sample no despeja, el pliegue no
+    confirma nada — no es un fallo del sistema, es que no había nada que
+    validar, y contarlo como éxito sería premiar la ausencia de señal. Es
+    exactamente lo que ocurrió en agosto de 2026, cuando los dos pliegues
+    medidos dieron conjunto de selección vacío.
+
+    Args:
+        trades: Operaciones cerradas, en cualquier orden.
+
+    Returns:
+        ``(confirmados, evaluados)``. ``evaluados`` puede ser menor que
+        ``WALK_FORWARD_FOLDS`` si no hay muestra para tantos bloques.
+    """
+    ordered = sorted(trades, key=lambda t: t.exit_time)
+    blocks = WALK_FORWARD_FOLDS + 1
+    if len(ordered) < blocks * MIN_TRADES_PER_FOLD:
+        return 0, 0
+
+    size = len(ordered) // blocks
+    confirmed = 0
+    evaluated = 0
+    for fold in range(1, blocks):
+        in_sample = ordered[: fold * size]
+        out_sample = ordered[fold * size : (fold + 1) * size]
+        if len(out_sample) < MIN_TRADES_PER_FOLD:
+            continue
+        evaluated += 1
+        in_expectancy = statistics.fmean(t.r_multiple for t in in_sample)
+        if in_expectancy < MIN_EXPECTANCY_R:
+            continue  # no se habría promovido: nada que confirmar
+        if statistics.fmean(t.r_multiple for t in out_sample) > 0.0:
+            confirmed += 1
+    return confirmed, evaluated
+
+
 def evaluate_graduation(
     trades: list[TradeRecord],
     *,
     starting_equity: float = 500.0,
+    resamples: int = BOOTSTRAP_RESAMPLES,
 ) -> GraduationReport:
     """Measure the real journal against the graduation criteria.
 
@@ -190,6 +274,9 @@ def evaluate_graduation(
         trades: Operaciones cerradas a considerar (ya filtradas por era si se
             quiere medir sólo el historial limpio).
         starting_equity: Equity de partida para el drawdown porcentual.
+        resamples: Remuestreos del bootstrap. Sólo afecta a la **precisión** del
+            intervalo, nunca a dónde está el umbral, así que bajarlo en tests no
+            afloja ningún criterio.
 
     Returns:
         El informe con cada criterio, su valor real y lo que falta.
@@ -217,6 +304,9 @@ def evaluate_graduation(
     span = max(t.exit_time for t in trades) - min(t.entry_time for t in trades)
     days = span / timedelta(days=1)
 
+    ci_low, _, _ = bootstrap_expectancy(r_values, resamples=resamples)
+    wf_confirmed, wf_evaluated = _walk_forward_confirmations(trades)
+
     regimes = Counter(t.regime for t in trades if t.regime and t.regime != "unknown")
     covered = {name: count for name, count in regimes.items() if count >= MIN_TRADES_PER_REGIME}
     forced = sum(1 for t in trades if t.exit_reason not in _THESIS_EXITS)
@@ -241,6 +331,40 @@ def evaluate_graduation(
                 ""
                 if expectancy >= MIN_EXPECTANCY_R
                 else f"Faltan {MIN_EXPECTANCY_R - expectancy:.3f}R por operación."
+            ),
+        ),
+        GraduationCriterion(
+            name="expectancy_ci",
+            description="Límite inferior del IC 95 % de la expectativa (bootstrap)",
+            target="> 0.000R",
+            actual=f"{ci_low:+.3f}R",
+            passed=ci_low > 0.0,
+            gap=(
+                ""
+                if ci_low > 0.0
+                else (
+                    "La expectativa medida no se distingue de cero: con esta muestra, "
+                    "un sistema sin ventaja daría este resultado."
+                )
+            ),
+        ),
+        GraduationCriterion(
+            name="walk_forward",
+            description="Pliegues cuya decisión in-sample se sostiene fuera de muestra",
+            target=f">= {MIN_WALK_FORWARD_FOLDS} de {WALK_FORWARD_FOLDS}",
+            actual=(
+                f"{wf_confirmed} de {wf_evaluated} evaluados"
+                if wf_evaluated
+                else "sin muestra para partir en pliegues"
+            ),
+            passed=wf_confirmed >= MIN_WALK_FORWARD_FOLDS,
+            gap=(
+                ""
+                if wf_confirmed >= MIN_WALK_FORWARD_FOLDS
+                else (
+                    "Una decisión que no sobrevive a datos que no vio es un ajuste "
+                    "al pasado, no una ventaja."
+                )
             ),
         ),
         GraduationCriterion(
