@@ -3046,3 +3046,74 @@ de 800-1000 operaciones OOS, unas 3-4 semanas al ritmo actual.
 `scripts/journal_walk_forward.py`, con 9 tests que fijan las dos trampas — que
 las dimensiones no puedan mirar `exit_reason`/`pnl`/`is_win`, y que la seleccion
 del walk-forward no vuelva a elegir mirando el out-of-sample.
+
+## 2026-08-19 - Correcciones: ni las comisiones ni la ruina eran lo que dije
+
+**Categoria:** correccion · **Tags:** `comisiones` `sizing` `metodo`
+
+Dos entradas anteriores de hoy afirmaban cosas que no se sostienen al
+contrastarlas con datos reales. Se corrigen aqui en vez de editarlas, para que
+quede el rastro de que se creyo y por que estaba mal.
+
+### 1. Exness NO cobra comision separada
+
+La entrada "El marco del regimen no cambia la expectativa" y la de costes
+afirmaban que **"el numero real es tres veces peor: de -0.078R a ~-0.27R"**,
+atribuyendo la diferencia a comisiones que por fin se cobraban.
+
+Contrastado contra el terminal tras desplegar el fix:
+
+```
+cuenta 198454003 · Exness-MT5Trial11
+801 deals en las ultimas 48 h
+  con commission != 0:  0
+  con swap != 0:        0
+```
+
+Los 3 932 - 5 027 USD de "comisiones cobradas" que reporto el A/B salian del
+`CommissionEngine` **del backtest** (defaults `maker_bps=1.0`, `taker_bps=2.0`),
+no del broker. Eran coste **modelado**, no medido. Esta cuenta lleva todo el
+coste en el spread.
+
+Asi que el salto de -0.078R a -0.27R **no venia de comisiones reales**. Venia de
+que el backtest es sistematicamente mas pesimista que produccion, que es el
+problema de fondo y sigue abierto.
+
+**El fix del broker sigue siendo correcto y se queda.** `OrderSendResult` no
+expone `commission` y leerlo de ahi devolvia siempre el default; ahora se lee
+del deal del historial. En esta cuenta encuentra cero porque cero es la verdad.
+En una cuenta *raw spread* de Exness -que si cobra aparte- lo registraria,
+cosa que antes era imposible.
+
+### 2. La ruina no era aritmetica: asumi el tamano del stop
+
+La entrada "La ruina no es un bug" calculaba que con un stop del 0.5 % del
+precio el riesgo por operacion en oro era de 22.48 USD, el 11.2 % de una cuenta
+de 200. **Ese 0.5 % me lo invente**: no lo medi.
+
+Medido sobre las 1 552 operaciones perdedoras del journal real:
+
+| riesgo real por operacion perdedora | |
+|---|---|
+| mediana | **1.19 USD** |
+| media | 1.98 USD |
+| p90 | 6.18 USD |
+| maximo | 9.76 USD |
+
+El volumen mediano es 0.01 lotes y el stop implicito ronda el **0.026 %** del
+precio, no el 0.5 %. Sobre una cuenta de 500 USD la mediana es el **0.24 %**.
+
+Conclusiones que caen con ello: que oro sea "imposible" con esta cuenta, y que
+el drawdown del 100 % de los backtests fuera consecuencia inevitable del lote
+minimo. Lo era de la configuracion que YO puse en esos backtests
+(`risk_per_trade_pct=2.0`, 4x lo que corre en produccion), no del instrumento.
+
+La cuenta real no muere porque arriesga ~0.24 % por operacion y la expectativa
+global es -0.0406R, no -0.28R: un sangrado del orden del 10 % mensual, no ruina.
+
+### Leccion de metodo
+
+Las dos correcciones tienen la misma causa: **derivé de un supuesto en vez de
+medir**, teniendo el dato a mano en el journal. El patron a evitar es una
+cadena de razonamiento aritmeticamente impecable sobre un numero inventado —
+suena mas convincente que una medicion, y es lo contrario.
