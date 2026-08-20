@@ -3117,3 +3117,90 @@ Las dos correcciones tienen la misma causa: **derivé de un supuesto en vez de
 medir**, teniendo el dato a mano en el journal. El patron a evitar es una
 cadena de razonamiento aritmeticamente impecable sobre un numero inventado —
 suena mas convincente que una medicion, y es lo contrario.
+
+## 2026-08-20 - El motor dejaba de operar en silencio al bajar el balance
+
+**Categoria:** bug · **Tags:** `sizing` `lote-minimo` `silencio`
+
+Sintoma: balance 400 USD, cero operaciones nuevas, y **ningun freno activado**.
+`kill_switch=false`, `circuit_breaker=false`, `consecutive_losses=4`,
+`ignore_drawdown_limits=true`. Nada en el panel decia que pasaba.
+
+Lo que habia: **167 ordenes rechazadas de 442**, todas con el mismo motivo.
+
+```
+Order rejected XAUUSDM buy - sizing: el lote minimo (0.01) no cabe
+en el riesgo: caben 0.0000 lotes (invalid_quantity)
+```
+
+### La aritmetica
+
+El lote minimo es **indivisible** y su riesgo **no depende del equity**:
+
+| | |
+|---|---|
+| piso de stop (`min_stop_pct`) | 0.15 % del precio |
+| oro a 4 519 -> stop minimo | 6.78 |
+| riesgo del lote minimo (0.01 x contract_size 100) | **6.78 USD** |
+| presupuesto (`risk_per_trade_pct` 0.5 % x 400) | **2.00 USD** |
+
+6.78 > 2.00, y no existe medio lote. Para que cupiera con el 0.5 % harian falta
+**~1 350 USD** de cuenta: el motor iba a estar parado a cualquier balance por
+debajo de eso, indefinidamente y sin avisar.
+
+### Por que el rechazo era correcto y aun asi el resultado estaba mal
+
+El sizer rechazaba **a proposito**: inflar hasta `volume_min` fue el bug
+historico del oro (100x el riesgo previsto), y hay un comentario en el codigo
+advirtiendolo. La decision de rechazar es la correcta.
+
+Lo que faltaba es que un rechazo permanente por configuracion **no es un
+rechazo, es una parada**, y no habia nada que lo distinguiera.
+
+### El fix: la proteccion cambia de forma, no desaparece
+
+`sizing.min_lot_max_risk_pct` (0 = desactivado, comportamiento historico).
+Cuando el presupuesto no da para un lote minimo, se permite exactamente
+`volume_min` **si su riesgo real cabe en ese % del equity**.
+
+Sobre un tamano indivisible un presupuesto porcentual no puede expresarse -solo
+puede bloquear, nunca reducir-, pero un tope duro sobre el riesgo de esa unica
+posicion si. Ese tope pasa a ser la proteccion efectiva.
+
+Verificado contra la configuracion viva de produccion, con `3.5`:
+
+| equity | lotes | riesgo | resultado |
+|---|---|---|---|
+| 150 | 0.00 | - | rechaza (6.78 > 3.5 % de 150) |
+| 200 | 0.01 | 6.78 | opera por la excepcion |
+| 300 | 0.01 | 6.78 | opera por la excepcion |
+| **400** | **0.01** | **6.78** | **opera** (el caso que estaba parado) |
+| 600 | 0.01 | 6.78 | opera por el presupuesto normal |
+| 1400 | 0.03 | 20.34 | sizing normal, escala |
+
+El mismo ajuste sirve de ~194 USD hacia arriba sin volver a tocar nada, y por
+debajo deja de operar diciendo con numeros por que.
+
+Anadido a la whitelist del Config Center **a proposito**: es el parametro que
+decide si se puede operar con el balance actual, y quedarse fuera obligaria a
+reiniciar para reanudar la operativa.
+
+### Lo que hay que tener presente
+
+**3.5 % es 7x el `risk_per_trade_pct` nominal.** Solo aplica a operaciones que
+unicamente caben al minimo — pero con 400 USD y oro, son todas. Con la
+expectativa de -0.04R que mide el journal, sangra mas rapido que antes. Bajarlo
+a 2.0 cubre igual de 194 a 400 USD.
+
+### Falso positivo descartado durante el diagnostico
+
+Tras el reinicio se vieron cero ordenes creadas pese a decisiones aceptadas, lo
+que parecia otra regresion. No lo era: `symbols_enabled` tiene BTCUSDM, ETHUSDM
+y USTECM en `false` -solo oro opera-, y las decisiones aceptadas de esa ventana
+eran todas de esos tres. Oro salio `stand_aside`. El toggle de simbolo sale por
+`.debug`, asi que no aparece en el log a nivel INFO: **misma familia de
+problema** que el bug principal, un veto legitimo que no deja rastro visible.
+
+**Pendiente:** confirmar con un fill real de oro. La verificacion de arriba usa
+el sizer con la configuracion viva, que prueba el camino de codigo pero no
+sustituye a ver la orden entrar.
