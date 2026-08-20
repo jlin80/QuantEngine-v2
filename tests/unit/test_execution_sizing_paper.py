@@ -248,3 +248,95 @@ def test_settings_resolvers_fall_back_to_global_for_unlisted_symbols():
     assert settings.risk_per_trade_pct_for("ETHUSDM") == 0.5
     assert settings.max_position_pct_for("xauusdm") == 1100.0  # normaliza a mayúsculas
     assert settings.max_position_pct_for("BTCUSDM") == 20.0
+
+
+# ----------------------------------------------------------------------
+# Excepcion del lote minimo (indivisible)
+# ----------------------------------------------------------------------
+
+_XAU = InstrumentSpec(symbol="XAUUSD", contract_size=100.0, volume_min=0.01, volume_step=0.01)
+
+
+def test_min_lot_exception_is_off_by_default():
+    """El comportamiento historico se conserva: sin configurar, rechaza."""
+    sizer = PositionSizer(
+        SizingSettings(method="fixed_risk", risk_per_trade_pct=0.5, max_position_pct=1000.0)
+    )
+    result = sizer.calculate(equity=400.0, price=4_495.0, stop_distance=6.74, spec=_XAU)
+
+    assert result.quantity == 0.0
+    assert "no cabe en el riesgo" in result.reason
+
+
+def test_min_lot_exception_lets_the_engine_keep_trading_on_a_small_account():
+    """El caso del 2026-08-20: con 400 USD el presupuesto (2.00) no da para el
+    lote minimo (6.74 de riesgo), y el motor dejaba de operar en silencio."""
+    sizer = PositionSizer(
+        SizingSettings(
+            method="fixed_risk",
+            risk_per_trade_pct=0.5,
+            max_position_pct=1000.0,
+            min_lot_max_risk_pct=2.0,  # 2 % de 400 = 8.00 > 6.74
+        )
+    )
+    result = sizer.calculate(equity=400.0, price=4_495.0, stop_distance=6.74, spec=_XAU)
+
+    assert result.quantity == 0.01
+    assert result.units == 1.0
+    assert result.risk_amount == pytest.approx(6.74)
+    assert "tope" in result.reason
+
+
+def test_min_lot_exception_still_refuses_above_the_ceiling():
+    """El tope es la proteccion real: por encima, se rechaza igual que antes."""
+    sizer = PositionSizer(
+        SizingSettings(
+            method="fixed_risk",
+            risk_per_trade_pct=0.5,
+            max_position_pct=1000.0,
+            min_lot_max_risk_pct=1.0,  # 1 % de 400 = 4.00 < 6.74
+        )
+    )
+    result = sizer.calculate(equity=400.0, price=4_495.0, stop_distance=6.74, spec=_XAU)
+
+    assert result.quantity == 0.0
+    assert "no cabe en el riesgo" in result.reason
+
+
+def test_min_lot_exception_scales_with_equity_without_touching_config():
+    """Lo que pedia el operador: mismo ajuste sirviendo para 200, 300 o 400 USD.
+
+    Con el tope al 3.5 %, el lote minimo de oro (6.74 de riesgo) cabe desde
+    ~193 USD de cuenta hacia arriba, sin tocar nada entre medias.
+    """
+    sizer = PositionSizer(
+        SizingSettings(
+            method="fixed_risk",
+            risk_per_trade_pct=0.5,
+            max_position_pct=1000.0,
+            min_lot_max_risk_pct=3.5,
+        )
+    )
+    for equity in (200.0, 300.0, 400.0):
+        result = sizer.calculate(equity=equity, price=4_495.0, stop_distance=6.74, spec=_XAU)
+        assert result.quantity == 0.01, equity
+
+    # Y por debajo deja de operar, que es lo correcto: 3.5 % de 150 son 5.25.
+    assert (
+        sizer.calculate(equity=150.0, price=4_495.0, stop_distance=6.74, spec=_XAU).quantity == 0.0
+    )
+
+
+def test_min_lot_exception_never_inflates_a_lot_that_already_fits():
+    """No es una puerta trasera: si el presupuesto da para mas, manda el sizing."""
+    sizer = PositionSizer(
+        SizingSettings(
+            method="fixed_risk",
+            risk_per_trade_pct=1.0,
+            max_position_pct=1000.0,
+            min_lot_max_risk_pct=5.0,
+        )
+    )
+    result = sizer.calculate(equity=100_000.0, price=4_000.0, stop_distance=4.0, spec=_XAU)
+
+    assert result.quantity == 2.5  # el mismo de siempre, no volume_min

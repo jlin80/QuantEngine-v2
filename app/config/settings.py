@@ -1389,6 +1389,23 @@ class SizingSettings(BaseModel):
     # Con 8×, oro y USTEC no cambian (su piso porcentual ya es mayor) y sólo se
     # ensancha donde hacía falta.
     min_stop_spread_multiple: float = 8.0
+    # Excepcion del lote minimo. El lote minimo es INDIVISIBLE: en oro
+    # (contract_size=100, volume_min=0.01) con el piso de stop del 0.15 % son
+    # ~6.7 USD de riesgo, y para que eso quepa en un presupuesto del 0.5 %
+    # harian falta ~1 350 USD de cuenta. Por debajo, el sizer devuelve 0 lotes y
+    # el motor deja de operar **en silencio**, sin que ningun freno salte: es lo
+    # que paso el 2026-08-20 al bajar el balance a 400 USD.
+    #
+    # Con esto en > 0, cuando el presupuesto no da para un lote minimo se
+    # permite exactamente `volume_min` **si su riesgo real no supera este % del
+    # equity**. Ese porcentaje pasa a ser la proteccion efectiva, y sustituye
+    # tanto al presupuesto como al tope de notional (que sobre un tamano
+    # indivisible solo puede bloquear, no reducir).
+    #
+    # En 0.0 (por defecto) el comportamiento es el historico: rechazar. Subirlo
+    # es aceptar explicitamente arriesgar mas del `risk_per_trade_pct` nominal
+    # en las operaciones que solo caben al minimo.
+    min_lot_max_risk_pct: float = 0.0
     reward_risk: float = 1.5  # objetivo = riesgo × esta relación
     kelly_fraction: float = 0.25  # fracción parcial de Kelly
     max_position_pct: float = 20.0  # tope de notional como % del equity

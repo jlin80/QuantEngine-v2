@@ -70,6 +70,11 @@ WHITELIST: tuple[str, ...] = (
     # apagarlo del todo está `volatility_risk_enabled`.
     "execution.sizing.volatility_risk_enabled",
     "execution.sizing.volatility_risk_floor",
+    # Excepción del lote mínimo. Ajustable en caliente a propósito: es el
+    # parámetro que decide si el motor puede operar con el balance que haya
+    # ahora mismo, y quedarse fuera obligaría a reiniciar para reanudar la
+    # operativa — que es justo lo que pasó el 2026-08-20.
+    "execution.sizing.min_lot_max_risk_pct",
     "quant.consensus.min_score",
     "quant.consensus.min_confidence",
     "quant.consensus.min_agreement",

@@ -155,6 +155,9 @@ class PositionSizer:
         # muy superior al configurado (el bug histórico del oro).
         lots = spec.quantize(units / spec.contract_size if spec.contract_size > 0 else units)
         if not spec.fits(lots):
+            rescued = self._min_lot_exception(spec, equity, price, stop_distance)
+            if rescued is not None:
+                return rescued
             return SizingResult(
                 0.0,
                 method,
@@ -176,6 +179,62 @@ class PositionSizer:
             stop_distance=stop_distance,
             notional=round(final_units * price, 4),
             reason=reason,
+        )
+
+    def _min_lot_exception(
+        self,
+        spec: InstrumentSpec,
+        equity: float,
+        price: float,
+        stop_distance: float,
+    ) -> SizingResult | None:
+        """Permite exactamente ``volume_min`` si su riesgo cabe en el tope explícito.
+
+        El lote mínimo es **indivisible**: cuando no cabe en el presupuesto, la
+        alternativa a operarlo no es operar más pequeño, es no operar. Y no
+        operar ocurría **en silencio**, sin que ningún freno saltara — el motor
+        simplemente rechazaba cada orden.
+
+        La protección no desaparece, cambia de forma: en vez del presupuesto de
+        riesgo (que no puede expresarse en un tamaño indivisible) manda
+        ``sizing.min_lot_max_risk_pct``, un tope duro sobre el riesgo real de
+        esa única posición. Con eso el motor opera igual con 200 o con 400 USD
+        de cuenta, y deja de operar sólo cuando el riesgo del lote mínimo se
+        sale del tope — que es cuando debe dejar de operar, y entonces lo dice.
+
+        Args:
+            spec: Contrato del símbolo (contract_size, volume_min...).
+            equity: Equity actual de la cuenta.
+            price: Precio de referencia.
+            stop_distance: Distancia al stop, en precio.
+
+        Returns:
+            El sizing con ``volume_min`` si el riesgo cabe en el tope; ``None``
+            si la excepción está desactivada o el riesgo se pasa (y entonces
+            decide quien llama, que rechaza con su propio motivo).
+        """
+        ceiling_pct = self._settings.min_lot_max_risk_pct
+        if ceiling_pct <= 0 or spec.volume_min <= 0 or stop_distance <= 0:
+            return None
+
+        units = spec.units(spec.volume_min)
+        risk = units * stop_distance
+        ceiling = equity * ceiling_pct / 100.0
+        if risk > ceiling:
+            return None
+
+        return SizingResult(
+            quantity=round(spec.volume_min, 8),
+            units=round(units, 8),
+            method=self._settings.method,
+            risk_amount=round(risk, 4),
+            stop_distance=stop_distance,
+            notional=round(units * price, 4),
+            reason=(
+                f"lote mínimo ({spec.volume_min}): el presupuesto no daba, pero su "
+                f"riesgo {risk:.2f} cabe en el tope de {ceiling_pct:.2f}% "
+                f"({ceiling:.2f})"
+            ),
         )
 
     def _risk_based(
