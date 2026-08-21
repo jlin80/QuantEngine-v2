@@ -12,7 +12,10 @@ Recorre las velas en orden, instala el reloj de replay y, en cada vela:
 El motor **no reimplementa** ejecución, riesgo ni cartera: conduce el mismo
 ``ExecutionEngine`` de la Fase 5. Assumption declarada: el camino intrabar se
 aproxima como ``open → extremo adverso → extremo favorable → close`` según la
-dirección de la vela; una reproducción tick-a-tick queda como estructura futura.
+dirección de la vela, **más los stops y objetivos de las posiciones abiertas
+que caigan dentro de la vela**, para que una salida se rellene en su propio
+nivel y no en el extremo del rango; una reproducción tick-a-tick queda como
+estructura futura.
 """
 
 import asyncio
@@ -32,22 +35,60 @@ from app.execution.models import ExitReason
 from app.market.models import Candle
 
 
-def _ohlc_path(candle: Candle) -> tuple[float, ...]:
+def _ohlc_path(candle: Candle, levels: Sequence[float] = ()) -> tuple[float, ...]:
     """Return the intrabar price path used to check exits.
 
     Convención conservadora por dirección de vela: en una vela alcista se asume
     que primero visitó su mínimo (donde caen los stops de largos) y luego su
     máximo; en una bajista, al revés.
 
+    ``levels`` son los stops y objetivos de las posiciones abiertas. Se insertan
+    en el recorrido cuando caen dentro del rango de la vela, y esto **no es un
+    detalle**: sin ellos el único precio publicado por debajo de la entrada es
+    el **mínimo de la vela**, así que un stop se rellenaba ahí y no en su propio
+    nivel. Medido sobre XAUUSDM (2026-08-21), los stops del laboratorio costaban
+    **-1,202R** con el slippage apagado, contra **-0,975R** en producción: un
+    stop no puede costar más de 1R salvo por hueco, y aquí no había huecos, sino
+    que se cobraba la excursión completa de la vela.
+
     Args:
         candle: Vela a recorrer.
+        levels: Precios de salida a materializar si caen dentro de la vela.
 
     Returns:
-        Secuencia de precios ``open → … → close``.
+        Secuencia de precios ``open → … → close``, monótona por tramos.
     """
+    inside = sorted({level for level in levels if candle.low <= level <= candle.high})
     if candle.close >= candle.open:
-        return (candle.open, candle.low, candle.high, candle.close)
-    return (candle.open, candle.high, candle.low, candle.close)
+        first, second = candle.low, candle.high
+    else:
+        first, second = candle.high, candle.low
+
+    def _between(start: float, end: float) -> list[float]:
+        """Levels strictly between ``start`` and ``end``, in travel order."""
+        low, high = (start, end) if start <= end else (end, start)
+        segment = [level for level in inside if low < level < high]
+        return segment if start <= end else list(reversed(segment))
+
+    path: list[float] = [candle.open]
+    path.extend(_between(candle.open, first))
+    path.append(first)
+    path.extend(_between(first, second))
+    path.append(second)
+    path.extend(_between(second, candle.close))
+    path.append(candle.close)
+    return tuple(path)
+
+
+def _exit_levels(positions: Sequence[object]) -> tuple[float, ...]:
+    """Collect the stop and target prices of the open positions."""
+    levels: list[float] = []
+    for position in positions:
+        for name in ("stop_loss", "take_profit"):
+            value = getattr(position, name, None)
+            if value:
+                levels.append(float(value))
+    return tuple(levels)
 
 
 class BacktestEngine:
@@ -150,7 +191,8 @@ class BacktestEngine:
                 market.push_candle(candle)
                 if features is not None:
                     features.invalidate(config.symbol)
-                for price in _ohlc_path(candle):
+                levels = _exit_levels(stack.positions.open_positions)
+                for price in _ohlc_path(candle, levels):
                     market.push_price(
                         config.symbol, price, timestamp=candle.end, spread_bps=config.spread_bps
                     )

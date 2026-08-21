@@ -350,17 +350,29 @@ class QuantCoreDecisionSource:
     async def _decide_inner(
         self, symbol: str, candles: Sequence[Candle], index: int
     ) -> DecisionGenerated | None:
-        """Evaluate the strategy library for the current bar."""
-        decision = None
+        """Evaluate the strategy library for the current bar.
+
+        Las 20 estrategias se consultan **antes** de evaluar el consenso, igual
+        que en producción: allí el Signal Engine acumula las señales de todas y
+        el Decision Engine decide sobre el conjunto. Evaluar dentro del bucle
+        —una vez por señal admitida, cortando en la primera aceptada— hacía que
+        decidiera quien llegara primero en el orden de carga de plugins, con un
+        subconjunto del consenso.
+        """
+        # Un solo contexto por vela: todas las estrategias miran el mismo
+        # mercado en el mismo instante, así que reconstruirlo por estrategia
+        # sólo costaba tiempo.
+        context = await self._context_engine.build(symbol)
+        fired_at = utc_now()
+        submitted = False
         for strategy in self._strategies:
             if strategy.symbols and symbol not in {s.upper() for s in strategy.symbols}:
                 continue
             if strategy.cadence.kind is not CadenceKind.EVERY_CANDLE:
                 continue
-            context = await self._context_engine.build(symbol)
             ctx = AnalysisContext(
                 symbol=symbol,
-                fired_at=utc_now(),
+                fired_at=fired_at,
                 trigger="candle:1m",
                 market=self._market,
                 features=self._features,
@@ -369,12 +381,11 @@ class QuantCoreDecisionSource:
             signal = await strategy.analyze(ctx)
             if signal is None:
                 continue
-            if await self._signals.submit(signal):
-                candidate = await self._decisions.evaluate(symbol)
-                if candidate.accepted and candidate.action.value in ("open_long", "open_short"):
-                    decision = candidate
-                    break
-        if decision is None:
+            submitted = await self._signals.submit(signal) or submitted
+        if not submitted:
+            return None
+        decision = await self._decisions.evaluate(symbol)
+        if not decision.accepted or decision.action.value not in ("open_long", "open_short"):
             return None
         return DecisionGenerated(
             source="backtest-quantcore",
@@ -385,6 +396,14 @@ class QuantCoreDecisionSource:
             score=decision.score,
             confidence=decision.confidence,
             summary=decision.explanation[0] if decision.explanation else "",
+            # Sin atribución la ejecución no puede aplicar el toggle por
+            # estrategia (`execution.strategies_enabled`) ni el holding mínimo
+            # por estrategia del Bloque 1: ambos comprueban `decision.strategy`
+            # y con "" no bloquean ni resuelven nada. Es la vía por la que el
+            # laboratorio operaba estrategias que producción tiene apagadas.
+            strategy=decision.primary_strategy,
+            strategy_category=decision.primary_category,
+            signal_ids=decision.signals_considered,
         )
 
     # ------------------------------------------------------------------

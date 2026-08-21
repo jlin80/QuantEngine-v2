@@ -4,6 +4,7 @@ import asyncio
 from datetime import timedelta
 
 import pytest
+from app.config.settings import CommissionSettings
 from app.core.events.base import Event
 from app.core.events.bus import EventBus
 from app.engine.events import DecisionGenerated
@@ -41,7 +42,12 @@ def _market() -> tuple[MarketDataService, MarketStateStore]:
 
 async def test_accepted_decision_opens_a_position():
     market, _ = _market()
-    engine = make_engine(market)
+    # Comisión explícita: el default es cero porque Exness no cobra comisión
+    # separada, y esta prueba comprueba precisamente que la de apertura sale de
+    # la caja. Un broker que no cobra no puede demostrarlo.
+    engine = make_engine(
+        market, make_execution_settings(commission=CommissionSettings(taker_bps=2.0))
+    )
     position = await engine.process_decision(_decision())
     assert position is not None
     assert position.side.value == "long"

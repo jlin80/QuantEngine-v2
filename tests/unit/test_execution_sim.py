@@ -59,7 +59,11 @@ def test_latency_disabled_is_zero():
 
 def test_latency_accumulates_and_drifts_price():
     engine = LatencyEngine(
-        LatencySettings(network_ms=20, broker_ms=15, exchange_ms=10, internal_ms=5, jitter_ms=0),
+        # `enabled` explicito: el default es False (la latencia real ya esta
+        # dentro de lo observado en los stops); aqui se prueba el motor, no el default.
+        LatencySettings(
+            enabled=True, network_ms=20, broker_ms=15, exchange_ms=10, internal_ms=5, jitter_ms=0
+        ),
         random.Random(1),
     )
     quote = engine.sample()

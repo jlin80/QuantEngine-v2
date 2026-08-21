@@ -3,7 +3,7 @@
 import random
 
 import pytest
-from app.config.settings import SizingSettings
+from app.config.settings import CommissionSettings, SizingSettings
 from app.execution.commission import CommissionEngine
 from app.execution.latency import LatencyEngine
 from app.execution.models import InstrumentSpec, OrderRequest, OrderSide
@@ -51,7 +51,10 @@ def test_kelly_falls_back_without_history():
 
 
 def test_paper_fill_applies_costs_against_taker():
-    cfg = make_execution_settings()
+    # Tarifa explicita: el default es cero porque Exness no cobra comision
+    # separada. Lo que se prueba aqui es el motor de comisiones, no el default,
+    # asi que el broker de este test tiene que ser uno que cobre.
+    cfg = make_execution_settings(commission=CommissionSettings(taker_bps=2.0, maker_bps=1.0))
     rng = random.Random(3)
     broker = PaperBroker(
         cfg,

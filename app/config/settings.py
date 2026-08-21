@@ -1326,11 +1326,22 @@ class WatchdogSettings(BaseModel):
 
 
 class CommissionSettings(BaseModel):
-    """Motor de comisiones (nunca se hardcodea; cada broker su estructura)."""
+    """Motor de comisiones (nunca se hardcodea; cada broker su estructura).
+
+    Los defaults son **cero** porque el broker que se opera —CFD de Exness— no
+    cobra comisión separada: 801 deals reales, ninguno con ``commission != 0``.
+    Su coste vive en el spread, que se modela aparte; cobrarlo además aquí es
+    contarlo dos veces. Medido sobre XAUUSDM el 2026-08-21, los 2.0 bps que
+    había por defecto costaban **0.42R por operación** de coste inventado en el
+    backtest, y eran la mayor divergencia entre el laboratorio y producción.
+
+    Un venue que sí cobre (Binance, 0.05-0.10 % — ver ADR-117) debe declararlo
+    explícitamente, por símbolo o por configuración de ambiente.
+    """
 
     model: str = "per_notional"  # per_notional | per_unit | fixed | tiered
-    maker_bps: float = 1.0
-    taker_bps: float = 2.0
+    maker_bps: float = 0.0
+    taker_bps: float = 0.0
     per_unit: float = 0.0
     fixed: float = 0.0
     minimum: float = 0.0
@@ -1339,10 +1350,21 @@ class CommissionSettings(BaseModel):
 
 
 class SlippageSettings(BaseModel):
-    """Modelo de slippage: volumen, liquidez, volatilidad, horario y orden."""
+    """Modelo de slippage: volumen, liquidez, volatilidad, horario y orden.
+
+    ``base_bps`` bajó de 1.0 a 0.1 el 2026-08-21 tras medirlo: el modelo por
+    defecto cobraba **12x** el relleno adverso observado. La medición no puede
+    salir de ``slippage_bps`` del journal —vale 0.000 en las 1.693 operaciones
+    porque en demo ejecuta MT5 y ese campo lo rellena el Paper Engine, así que
+    mide ausencia de registro, no ausencia de slippage— sino de los stops: uno
+    debe costar exactamente 1R, y los reales cierran en **-0.975R**.
+
+    Importa más de lo que parece porque el stop de oro son ~15 bps: cada bps de
+    slippage es 1/15 de R.
+    """
 
     model: str = "dynamic"  # none | fixed | dynamic
-    base_bps: float = 1.0
+    base_bps: float = 0.1
     volatility_coeff: float = 0.5  # bps adicionales por 1% de ATR
     liquidity_coeff: float = 0.5  # bps adicionales cuando falta profundidad
     size_coeff: float = 0.3  # bps adicionales por impacto de tamaño
@@ -1355,9 +1377,14 @@ class SlippageSettings(BaseModel):
 
 
 class LatencySettings(BaseModel):
-    """Latencia simulada (red + broker + exchange + interna) que mueve el fill."""
+    """Latencia simulada (red + broker + exchange + interna) que mueve el fill.
 
-    enabled: bool = True
+    Apagada por defecto desde el 2026-08-21: su deriva de precio ya está dentro
+    de lo que se observa en los stops reales (-0.975R), así que sumarla encima
+    del slippage recalibrado contaría el mismo efecto dos veces.
+    """
+
+    enabled: bool = False
     network_ms: float = 20.0
     broker_ms: float = 15.0
     exchange_ms: float = 10.0
