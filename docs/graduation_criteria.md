@@ -68,9 +68,9 @@ python scripts/graduation_gap.py data/execution/journal.jsonl --since 2026-08-04
 
 | Criterio | Umbral | Constante | De dónde sale |
 |---|---|---|---|
-| Muestra de operaciones cerradas | ≥ 400 | `MIN_TRADES` | Con n=100 y +0.1R el error estándar tapa el resultado; 400 es el orden de magnitud donde una expectativa modesta empieza a ser medible |
+| Muestra de operaciones cerradas | ≥ 400 | `MIN_TRADES` | Con n=100 y +0.1R el error estándar tapa el resultado; 400 es el orden de magnitud donde una expectativa modesta empieza a ser medible. **Confirmado con dato real (2026-08-21):** la desviación de R medida es **0.710** (no 1.5, que era un supuesto), así que para que el IC excluya el cero con una expectativa verdadera de +0.10R bastan **n ≥ 194**. El umbral de 400 tiene margen de sobra |
 | Expectativa por operación | ≥ +0.10R | `MIN_EXPECTANCY_R` | Positiva **con margen**: exigir >0 aprueba un sistema que empata, y un sistema que empata en paper pierde en real (el paper no cobra swaps ni sufre requotes) |
-| **IC inferior de la expectativa** | **> 0** | `BOOTSTRAP_RESAMPLES` | Nunca se promueve por una estimación puntual. Con n=400 y desviación 1.5R el IC es de ±0.147: un +0.10R puntual **no** excluye el cero, así que sin esto se podía graduar un sistema sin ventaja medible |
+| **IC inferior de la expectativa** | **> 0** | `BOOTSTRAP_RESAMPLES` | Nunca se promueve por una estimación puntual. Con la desviación **medida** de 0.710 y n=400, el IC es de ±0.070: un +0.10R puntual sí excluye el cero, pero por poco — y con la desviación de 1.5R que se supuso al escribir esto, no lo excluiría. El criterio sobrevive a haber corregido el supuesto, que es la prueba que importa |
 | **Pliegues walk-forward confirmados** | **≥ 2 de 3** | `MIN_WALK_FORWARD_FOLDS` | Una decisión que no sobrevive a datos que no vio es ajuste al pasado. Un pliegue solo confirma si el in-sample despeja el listón **y** el out-of-sample sale positivo |
 | Profit factor | ≥ 1.30 | `MIN_PROFIT_FACTOR` | Por debajo de ~1.2 el resultado lo domina el ruido |
 | Drawdown máximo sobre equity pico | ≤ 15 % | `MAX_DRAWDOWN_PCT` | — |
@@ -82,9 +82,38 @@ python scripts/graduation_gap.py data/execution/journal.jsonl --since 2026-08-04
 Cuenta como salida **de tesis** (no forzada) solo: `TAKE_PROFIT`, `STOP_LOSS`,
 `TRAILING_STOP`, `BREAK_EVEN`.
 
-> El criterio de salidas forzadas es el que hoy está más lejos de cumplirse:
-> las mediciones de agosto de 2026 dan `regime_change` en el **91.3 %** de los
-> cierres, casi el doble del tope. Ver `docs/session_edge.md`.
+> El criterio de salidas forzadas es el que hoy está más lejos de cumplirse.
+> La cifra del **91.3 %** de `docs/session_edge.md` es de una configuración
+> anterior; medido el 2026-08-21 sobre el tramo con la configuración actual
+> (desde el 2026-08-11) son **73.2 %**. Sigue por encima del tope, pero la
+> distancia se redujo a la mitad.
+
+## Estado medido — 2026-08-21
+
+`python scripts/graduation_gap.py data/execution/journal.jsonl --since 2026-08-11 --equity 500`
+sobre 1.737 operaciones, con el laboratorio y los costes ya reconciliados
+(commit `4603253`):
+
+| Criterio | Objetivo | Real | |
+|---|---|---|---|
+| Muestra | ≥ 400 | 1.737 | ✅ |
+| Regímenes con ≥ 30 operaciones | ≥ 3 | 4 | ✅ |
+| Expectativa | ≥ +0.10R | **−0.001R** | ❌ faltan 0.101R |
+| IC inferior | > 0 | −0.034R | ❌ |
+| Pliegues walk-forward | ≥ 2 de 3 | **0 de 3** | ❌ |
+| Profit factor | ≥ 1.30 | 1.00 | ❌ |
+| Drawdown sobre equity pico | ≤ 15 % | 38.1 % | ❌ |
+| Días de operativa continuada | ≥ 60 | 10.1 | ❌ |
+| Salidas forzadas | ≤ 50 % | 73.2 % | ❌ |
+
+**7 de 9 pendientes.** Los dos que se cumplen son los de muestra y cobertura de
+regímenes: hay datos de sobra, y lo que falta es la ventaja, no la evidencia.
+
+Vale la pena leer juntos los dos primeros fallos: la expectativa está en −0.001R
+y su intervalo va de −0.034 a +0.032. El sistema **no pierde** de forma medible;
+simplemente no gana. Y el walk-forward da 0 de 3 pliegues no porque el
+out-of-sample fallara, sino porque el in-sample nunca despejó el listón: no hubo
+decisión que validar.
 
 ## C. Promoción de candidato — Fase 10
 
@@ -143,8 +172,19 @@ Es housekeeping: no cambia qué se aprueba.
 
 ## Relación con los gaps de investigación
 
-- Los umbrales de expectativa de B se calcularon sobre operaciones **sin
-  comisiones ni slippage real** (gap 2): las comisiones registradas suman 0.00,
-  así que cualquier expectativa histórica está sobrestimada.
-- El requisito de ≥ 3 regímenes de B choca con el techo de **35 días** de
-  histórico de MT5 (gap 6).
+- **Gap 2 (costes) — resuelto al revés de como se creía.** Se temía que la
+  expectativa histórica estuviera *sobrestimada* por no cobrar comisiones. Es al
+  contrario: Exness **no cobra comisión separada** (801 deals, ninguno con
+  `commission != 0`), y quien la cobraba era el `CommissionEngine` del
+  laboratorio, a razón de 0.42R por operación. El journal real no está
+  sobrestimado; el backtest estaba infravalorado. Corregido en `4603253`.
+- **Gap 6 (regímenes) — medido y cerrado.** El criterio de ≥ 3 regímenes se
+  cumple (4 con más de 30 operaciones). Pero ninguno tiene edge que sobreviva al
+  kill criteria: ver `scripts/regime_edge.py`. Cubrir regímenes y tener ventaja
+  en ellos son cosas distintas, y el criterio actual sólo comprueba la primera.
+- **Techo de histórico:** los **35 días** que da el terminal MT5 siguen
+  limitando cualquier validación sobre periodos de mercado distintos.
+- **Sobre el criterio de ≥ 30 operaciones por régimen:** basta para declarar el
+  régimen *cubierto*, que es para lo que está. No basta para medir su
+  expectativa: con desviación 0.710, n=30 da un error estándar de **0.130R**.
+  Conviene no confundir las dos lecturas.
