@@ -1408,6 +1408,41 @@ class SizingSettings(BaseModel):
     # angostos que el propio spread cuando el ATR (velas desde ticks
     # dispersos) sale artificialmente bajo — sin esto el stop se dispara
     # casi al entrar por simple ruido/spread, no por movimiento real.
+    #
+    # ⚠️ La justificación de arriba se comprobó el 2026-08-21 y **es falsa**.
+    # El ATR(14) de 1m sobre las BARRAS NATIVAS de MT5 (que no vienen de ticks)
+    # tiene mediana de **4.49 bps** en XAUUSDm, así que `atr × 1.5` daría 6.73
+    # bps: el ATR no sale artificialmente bajo por construirse desde ticks, es
+    # genuinamente pequeño. Este piso, a 15 bps, es **3.3× el ATR real**, y en
+    # la práctica gana siempre — la distancia mediana del stop medida sobre
+    # 1.732 operaciones reales es exactamente 15.00 bps.
+    #
+    # Consecuencia: `atr_stop_multiplier` no adapta nada, y con `reward_risk`
+    # en 1.5 el objetivo queda a 22.5 bps = 5 ATR, que el precio de 1m casi
+    # nunca recorre. Por eso `take_profit` es el 6 % de las salidas y la salida
+    # por régimen se lleva el 73 % — el criterio de graduación que más lejos
+    # está de cumplirse.
+    #
+    # **Se midió bajarlo, y NO conviene.** Barrido sobre 10.000 velas de
+    # XAUUSDm con el laboratorio ya reconciliado:
+    #
+    #   piso    expectativa   regime_change   stop_loss   take_profit
+    #   0.15     -0.0015R         76.5%         12.1%         6.5%
+    #   0.10     -0.0472R         53.3%         26.9%        12.2%
+    #   0.07     -0.0532R         40.6%         34.2%        17.0%
+    #   0.05     -0.0726R         31.8%         39.6%        19.2%
+    #
+    # La mezcla de salidas mejora en cada escalón —el objetivo pasa del 6.5 %
+    # al 19.2 % y las salidas forzadas bajan del 76.5 % al 31.8 %, cumpliendo
+    # el criterio de graduación— y la expectativa empeora en cada escalón.
+    # El stop ancho no desperdiciaba operaciones: dejaba que la salida por
+    # régimen las cerrara cerca de plano (+0.05R). Al estrecharlo, esas mismas
+    # se vuelven pérdidas de -1R que el objetivo no compensa aunque se alcance
+    # tres veces más.
+    #
+    # Corolario incómodo pero medido: el criterio de graduación de "<= 50 %
+    # de salidas forzadas" está en conflicto con la expectativa en este
+    # sistema. Se puede cumplir, pero sólo empeorando el resultado.
     min_stop_pct: float = 0.15
     # Piso adicional: el stop nunca puede estar a menos de N veces el spread.
     # `min_stop_pct` es global, pero el spread varía mucho entre símbolos (XAU
@@ -1473,6 +1508,16 @@ class ExecutionRiskSettings(BaseModel):
     """Risk Manager profesional: límites, filtros y cortacircuitos."""
 
     max_risk_per_trade_pct: float = 0.5
+    # Límites de pérdida realizada. **0 desactiva el freno.** Hasta el
+    # 2026-08-21 no era así: el límite se calculaba como `-abs(balance × 0/100)`
+    # = 0 y la comparación `realized <= 0` se cumplía siempre, incluso sin una
+    # sola pérdida — poner 0 para quitar el freno lo dejaba permanentemente
+    # disparado. Mismo criterio en `circuit_breaker_loss_pct` y `max_spread_bps`.
+    #
+    # ⚠️ Se miden sobre `initial_balance` (el de la config), no sobre el equity
+    # vivo. Con la semilla en 1000 y la cuenta real en ~400, un "3 % diario" es
+    # en realidad el 7,5 % del equity que hay. Documentado, no cambiado: tocarlo
+    # altera el comportamiento de un freno de seguridad y es decisión aparte.
     max_daily_loss_pct: float = 3.0
     max_weekly_loss_pct: float = 8.0
     max_monthly_loss_pct: float = 15.0

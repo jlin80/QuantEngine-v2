@@ -87,6 +87,27 @@ Cuenta como salida **de tesis** (no forzada) solo: `TAKE_PROFIT`, `STOP_LOSS`,
 > anterior; medido el 2026-08-21 sobre el tramo con la configuración actual
 > (desde el 2026-08-11) son **73.2 %**. Sigue por encima del tope, pero la
 > distancia se redujo a la mitad.
+>
+> ⚠️ **Este criterio está en conflicto con la expectativa, y hay que decidirlo.**
+> Barrido de `min_stop_pct` sobre el laboratorio reconciliado:
+>
+> | piso | expectativa | salidas forzadas |
+> |---|---|---|
+> | 0.15 (actual) | **−0.0015R** | 76.5 % ❌ |
+> | 0.10 | −0.0472R | 53.3 % ❌ |
+> | 0.07 | −0.0532R | 40.6 % ✅ |
+> | 0.05 | −0.0726R | 31.8 % ✅ |
+>
+> El criterio **se puede cumplir**, pero sólo empeorando el resultado en cada
+> escalón. Se escribió razonando sobre el mecanismo —«si la ejecución cierra la
+> mayoría, lo que se graduaría es la ejecución»— y el dato dice que aquí la
+> salida por régimen **aporta**: cierra cerca de plano (+0.05R) operaciones que
+> con un stop estrecho serían pérdidas de −1R.
+>
+> Esto también reordena el hallazgo del 2026-07-29 («las señales tienen edge y
+> la ejecución lo destruye»): se apoyaba en el evaluador continuo, que resuelve
+> contra TP/SL sin salida por régimen. Con el laboratorio reconciliado, el dato
+> dice lo contrario.
 
 ## Estado medido — 2026-08-21
 

@@ -74,6 +74,43 @@ async def test_symbol_toggle_blocks_entry():
     assert not engine.positions.open_positions
 
 
+async def test_strategy_toggle_blocks_entry():
+    """Una estrategia desactivada no abre, aunque la decision venga aceptada.
+
+    Esta salvaguarda no tenia test propio, y el 2026-08-21 se descubrio que
+    llevaba un mes inerte en el backtest: la fuente de decisiones del
+    laboratorio construia el evento SIN `strategy`, asi que la comprobacion
+    `if strategy and ...` no bloqueaba nunca. El toggle funcionaba en
+    produccion y no en el laboratorio, y nada lo delataba.
+    """
+    market, _ = _market()
+    engine = make_engine(
+        market, make_execution_settings(strategies_enabled={"fair_value_gap": False})
+    )
+    decision = DecisionGenerated(
+        source="test",
+        decision_id="d1",
+        symbol="BTCUSDT",
+        action="open_long",
+        accepted=True,
+        score=80.0,
+        confidence=0.8,
+        summary="fvg",
+        strategy="fair_value_gap",
+    )
+    assert await engine.process_decision(decision) is None
+    assert not engine.positions.open_positions
+
+
+async def test_a_decision_without_attribution_is_never_blocked():
+    """Sin atribucion no se bloquea nada: es la semantica declarada del toggle."""
+    market, _ = _market()
+    engine = make_engine(
+        market, make_execution_settings(strategies_enabled={"fair_value_gap": False})
+    )
+    assert await engine.process_decision(_decision()) is not None
+
+
 async def test_symbol_toggle_defaults_to_enabled():
     """Lo no listado en el toggle se sigue operando con normalidad."""
     market, _ = _market()

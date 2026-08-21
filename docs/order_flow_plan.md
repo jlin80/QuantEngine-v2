@@ -25,28 +25,42 @@ Esto confirma por prueba directa lo que la bitácora del 2026-08-04 dedujo del
 `_CAPABILITIES` del proveedor: `delta`, `cvd` y `orderbook_imbalance` no están
 *aproximados*, están **ausentes**.
 
-## Lo que sí hay, y hoy no se usa
+## Lo que sí hay, y ya se usa (2026-08-21)
 
-Los ticks llegan con **resolución de milisegundos** (`time_msc`). Eso permite
-microestructura basada en cotizaciones, que es más débil que el order flow real
-pero es medible con lo que ya se tiene:
+Los ticks llegan con **resolución de milisegundos** (`time_msc`). Con eso se
+puede clasificar el agresor por la **regla del tick**, que es el proxy estándar
+cuando no hay tape: un quote que sube se atribuye al comprador, uno que baja al
+vendedor, y uno que no mueve el precio hereda el lado del anterior.
 
-- intensidad de actualización de cotizaciones (ticks por segundo) como proxy de
-  actividad;
-- asimetría entre actualizaciones del bid y del ask;
-- dinámica del spread (ensanchamientos previos a movimientos);
-- retroceso del precio tras rachas de ticks en una dirección.
+**Implementado en `CandleAggregator.add_ticker`.** Antes doblaba con
+`side=None`, así que `buy_volume` y `sell_volume` quedaban en cero en **todas**
+las velas construidas desde quotes — que son todas, porque producción corre con
+`aggregate_from_ticks=True`. De ahí que `delta_confirmation` y `cvd` calcularan
+siempre 0 y aun así figuraran activas y votando en el consenso.
 
-Ninguno es order flow. Conviene que se llamen por su nombre y no reutilicen las
-etiquetas `delta`/`cvd`, precisamente para no repetir el problema actual: tres
-módulos que figuran activos y no miden nada.
+### Qué mide realmente, y qué no
 
-## Acción inmediata, sin coste ni infraestructura
+Mide **presión de cotización**, no agresión ejecutada. El CFD no publica
+operaciones, así que no hay agresión real que medir. Es un proxy más débil que
+el delta de un tape y no debe leerse como si fuera lo mismo. Está escrito así en
+el docstring para que no se confunda dentro de seis meses.
 
-**Desactivar `delta`, `cvd` y `orderbook_imbalance`.** Están declaradas activas
-y votando en el consenso con datos que no existen. Ya figuraba como pendiente
-nº2 del 2026-08-04 y sigue sin hacerse. Es la única parte de este plan que no
-depende de una decisión de gasto.
+### Consecuencia operativa que hay que vigilar
+
+Este cambio **despierta dos estrategias que llevaban meses mudas**. Pasan de no
+emitir ninguna señal a emitir y votar. Sobre un sistema cuya expectativa es
+−0.001R y sin validación previa de esas dos, encenderlas y dejarlas operar sería
+cambiar el sistema a ciegas.
+
+Por eso se despliegan con `execution.strategies_enabled` en `false` para las
+tres: **siguen emitiendo señales y el evaluador continuo las mide, pero no
+abren posiciones**. Es exactamente la semántica para la que existe ese toggle
+—medir el contrafactual sin arriesgar— y evita el patrón que ya costó caro
+antes: dar por bueno un cambio porque desplegó sin errores.
+
+`orderbook_imbalance` es distinto: **no tiene arreglo en este venue**. No hay
+libro que aproximar, ni con la regla del tick ni con nada. Queda desactivada y
+esa es su situación definitiva mientras el bróker sea Exness.
 
 ## Opciones para conseguir L2 de verdad
 
@@ -89,10 +103,13 @@ es pagar por una precisión que no se puede comprobar.
 
 El orden que sí tiene sentido:
 
-1. **Desactivar los tres módulos inertes** (gratis, hoy).
-2. **Construir los proxies de cotización** con los ticks que ya llegan, y
-   medirlos con el mismo kill criteria que se usó para sesiones y regímenes. Si
-   ni siquiera esos aportan, el order flow real tampoco va a salvar el enfoque.
+1. ✅ **Hecho.** Regla del tick en el agregador (`delta` y `cvd` ya reciben
+   dato real) y `orderbook_imbalance` desactivada, que era lo único posible.
+2. **Medir esas dos con el evaluador continuo**, sin dejarlas operar, y
+   aplicarles el mismo kill criteria que se usó para sesiones y regímenes
+   (`scripts/regime_edge.py` sirve de plantilla). Si ni siquiera el proxy de
+   cotización aporta, el order flow real tampoco va a salvar el enfoque — y esa
+   es información barata sobre una decisión cara.
 3. **Sólo entonces** evaluar la opción A o C, con la pregunta ya acotada.
 
 La opción B queda descartada salvo que se decida operar el futuro: pagar por el

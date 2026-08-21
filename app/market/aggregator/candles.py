@@ -88,6 +88,10 @@ class CandleAggregator:
         self._timeframes = tuple(tf for tf in timeframes if tf is not Timeframe.TICK)
         self._building: dict[tuple[str, Timeframe], _Building] = {}
         self._closed_count = 0
+        # Estado de la regla del tick, por símbolo: último precio visto y último
+        # lado atribuido (para los quotes que no mueven el precio).
+        self._last_price: dict[str, float] = {}
+        self._last_side: dict[str, TradeSide] = {}
 
     @property
     def timeframes(self) -> tuple[Timeframe, ...]:
@@ -123,7 +127,21 @@ class CandleAggregator:
 
         Fuente de velas para feeds *sin* tape de trades (p. ej. MT5): cada quote
         aporta un punto de precio (mid) y cuenta como un tick de volumen, igual
-        que el ``tick_volume`` de MT5. No clasifica agresor (sin lado).
+        que el ``tick_volume`` de MT5.
+
+        **Clasificación de agresor por la regla del tick.** Antes se doblaba con
+        ``side=None``, así que ``buy_volume`` y ``sell_volume`` quedaban en cero
+        en todas las velas y las estrategias ``delta_confirmation`` y ``cvd``
+        calculaban siempre 0 — figuraban activas y votaban en el consenso sin
+        medir nada (verificado en producción el 2026-08-21). La regla del tick
+        es el proxy estándar cuando no hay tape: un quote que sube respecto al
+        anterior se atribuye al comprador, uno que baja al vendedor, y uno que
+        no se mueve hereda el lado del anterior.
+
+        Mide **presión de cotización, no agresión ejecutada** — el CFD de Exness
+        no publica operaciones (``last`` y ``volume`` llegan a cero), así que no
+        hay agresión real que medir. Es un proxy más débil que el delta de un
+        tape, y conviene no leerlo como si fuera lo mismo.
 
         Args:
             ticker: Quote normalizado.
@@ -134,7 +152,31 @@ class CandleAggregator:
         price = ticker.last if ticker.last else ticker.mid
         if price <= 0:
             return []
-        return self._fold(ticker.symbol, ticker.provider, ticker.exchange_ts, price, 1.0)
+        side = self._tick_rule_side(ticker.symbol, price)
+        return self._fold(ticker.symbol, ticker.provider, ticker.exchange_ts, price, 1.0, side=side)
+
+    def _tick_rule_side(self, symbol: str, price: float) -> TradeSide | None:
+        """Classify a quote as buyer- or seller-initiated (tick rule).
+
+        Devuelve ``None`` sólo en el primer quote de un símbolo, cuando no hay
+        precio previo con el que comparar: ahí no se sabe el lado, y suponerlo
+        sería inventar la primera unidad de delta de cada arranque.
+        """
+        previous = self._last_price.get(symbol)
+        self._last_price[symbol] = price
+        if previous is None:
+            return None
+        side: TradeSide | None
+        if price > previous:
+            side = TradeSide.BUY
+        elif price < previous:
+            side = TradeSide.SELL
+        else:
+            # Quote sin cambio: hereda el lado anterior (regla del tick clásica).
+            side = self._last_side.get(symbol)
+        if side is not None:
+            self._last_side[symbol] = side
+        return side
 
     def _fold(
         self,

@@ -138,7 +138,14 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def check_spread(self, spread_bps: float | None) -> RiskCheck:
-        """Reject entries when the spread is too wide."""
+        """Reject entries when the spread is too wide.
+
+        Un ``max_spread_bps`` <= 0 desactiva el filtro, en vez de rechazar todo
+        spread positivo — que es lo que hacía y es justo lo contrario de lo que
+        se pretende al poner un cero.
+        """
+        if self._settings.max_spread_bps <= 0:
+            return RiskCheck(True)
         if spread_bps is not None and spread_bps > self._settings.max_spread_bps:
             return RiskCheck(
                 False,
@@ -268,6 +275,14 @@ class RiskManager:
             ),
         )
         for rule, realized, limit_pct in checks:
+            # Un porcentaje <= 0 significa **freno desactivado**, no "freno al
+            # máximo". Antes se calculaba `limit = 0` y la condición
+            # `realized <= 0` se cumplía siempre — incluso sin una sola pérdida:
+            # poner 0 para quitar el freno lo dejaba permanentemente disparado.
+            # Es la trampa que documentó la bitácora del 2026-08-04 y que aquí
+            # se cierra.
+            if limit_pct <= 0:
+                continue
             limit = -abs(self._initial_balance * limit_pct / 100.0)
             if realized <= limit:
                 return RiskCheck(
@@ -320,6 +335,9 @@ class RiskManager:
 
     def _check_circuit_breaker(self, now: datetime) -> None:
         """Trip the circuit breaker when the window loss exceeds the limit."""
+        # Mismo criterio que en los límites de pérdida: 0 desactiva.
+        if self._settings.circuit_breaker_loss_pct <= 0:
+            return
         window = timedelta(minutes=self._settings.circuit_breaker_window_minutes)
         realized = sum(pnl for ts, pnl in self._ledger if now - ts <= window)
         limit = -abs(self._initial_balance * self._settings.circuit_breaker_loss_pct / 100.0)
