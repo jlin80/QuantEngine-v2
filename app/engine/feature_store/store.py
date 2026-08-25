@@ -29,7 +29,7 @@ from app.analytics.indicators import (
     volume_profile,
     vwap_bands,
 )
-from app.market.models import Candle, Timeframe, TradeSide
+from app.market.models import Candle, Timeframe, Trade, TradeSide
 from app.market.services import MarketDataService
 from app.utils.time import utc_now
 
@@ -341,6 +341,12 @@ class FeatureStore:
         limit = int(params.get("trades", 200))
         trades = self._market.get_recent_trades(symbol, limit)
         if not trades:
+            # Mismo fallback que la feature objeto `orderflow`: sin tape, el
+            # volumen firmado de las velas es la única direccionalidad que hay.
+            # `None` se conserva si tampoco hay velas con lado — ausencia de
+            # medición, no un cero.
+            trades = self._flow_from_candles(symbol, params)
+        if not trades:
             return None
         return sum(
             t.size if t.side is TradeSide.BUY else -t.size if t.side is TradeSide.SELL else 0.0
@@ -406,6 +412,14 @@ class FeatureStore:
     async def _orderflow(self, symbol: str, params: dict[str, Any]) -> object:
         trades = self._market.get_recent_trades(symbol, int(params.get("trades", 200)))
         book = self._market.get_orderbook(symbol)
+        if not trades:
+            # Sin tape (MT5 nunca emite `Trade`: su polling sólo publica
+            # `Ticker`), esta feature salía vacía y `delta_confirmation` y `cvd`
+            # no emitían una sola señal — verificado en producción el
+            # 2026-08-25, cuatro días después de poblar el volumen firmado de
+            # las velas. Poblar la vela era necesario pero no suficiente: los
+            # indicadores leen de aquí.
+            trades = self._flow_from_candles(symbol, params)
         return analyze_order_flow(
             trades,
             book,
@@ -413,6 +427,46 @@ class FeatureStore:
             absorption_move_pct=float(params.get("absorption_move_pct", 0.05)),
             absorption_min_ratio=float(params.get("absorption_min_ratio", 0.65)),
         )
+
+    def _flow_from_candles(self, symbol: str, params: dict[str, Any]) -> list[Trade]:
+        """Synthesize aggressive flow from the signed volume of recent candles.
+
+        Cada vela aporta **dos** agresiones sintéticas —una compradora y una
+        vendedora, al cierre de la vela y con el tamaño de su ``buy_volume`` /
+        ``sell_volume``—, que es toda la resolución direccional que hay cuando
+        el venue no publica operaciones. El volumen firmado lo produce la regla
+        del tick del agregador (``CandleAggregator.add_ticker``).
+
+        **Es un proxy de presión de cotización, no de agresión ejecutada.** No
+        recupera el tamaño de las órdenes ni su secuencia real, así que las
+        heurísticas del indicador que dependen de trades individuales (iceberg,
+        trades grandes) quedan sin fundamento aquí. Delta, CVD y agresión sí son
+        interpretables.
+
+        Devuelve vacío si las velas tampoco traen volumen firmado, para que la
+        feature siga declarando ausencia en vez de inventar un cero.
+        """
+        candles = self._candles(symbol, params, int(params.get("flow_candles", 60)))
+        trades: list[Trade] = []
+        for candle in candles:
+            for side, size in (
+                (TradeSide.BUY, candle.buy_volume),
+                (TradeSide.SELL, candle.sell_volume),
+            ):
+                if size <= 0:
+                    continue
+                trades.append(
+                    Trade(
+                        symbol=candle.symbol,
+                        provider=candle.provider,
+                        price=candle.close,
+                        size=size,
+                        side=side,
+                        exchange_ts=candle.end,
+                        local_ts=candle.end,
+                    )
+                )
+        return trades
 
     async def _liquidity(self, symbol: str, params: dict[str, Any]) -> object:
         candles = self._candles(symbol, params, 120)

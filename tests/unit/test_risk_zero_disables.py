@@ -77,3 +77,32 @@ def test_a_positive_max_spread_still_filters():
     manager = _manager(max_spread_bps=5.0)
     assert not manager.check_spread(50.0).allowed
     assert manager.check_spread(1.0).allowed
+
+
+def test_the_drawdown_alarm_fires_even_with_the_brake_off():
+    """Desactivar el freno no debe desactivar el aviso.
+
+    La cuenta demo llego al 52.5 % de drawdown el 2026-08-25 y nada lo dijo:
+    `update_equity` salia en silencio con `ignore_drawdown_limits`. Es la misma
+    leccion del incidente del reloj — el motor estuvo 4 dias sin operar y nada
+    aviso — aplicada al riesgo.
+    """
+    manager = _manager(ignore_drawdown_limits=True, kill_switch_drawdown_pct=20.0)
+
+    manager.update_equity(10.0)
+    assert not manager.drawdown_alarm
+
+    manager.update_equity(52.5)
+    assert manager.drawdown_alarm
+    # Y sigue sin frenar: es un aviso, no un freno.
+    assert not manager.kill_switch_active
+    assert manager.evaluate_entry(_query()).allowed
+
+
+def test_the_drawdown_alarm_rearms_after_recovering():
+    manager = _manager(ignore_drawdown_limits=True, kill_switch_drawdown_pct=20.0)
+    manager.update_equity(30.0)
+    assert manager.drawdown_alarm
+
+    manager.update_equity(5.0)
+    assert not manager.drawdown_alarm

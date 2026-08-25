@@ -69,6 +69,8 @@ class RiskManager:
         self._circuit_reason = ""
         self._circuit_until: datetime | None = None
         self._last_drawdown_pct = 0.0
+        # Latch del aviso de drawdown cuando el freno está desactivado.
+        self._drawdown_alarm = False
         self._log = logging.getLogger("app.execution.risk")
 
     # ------------------------------------------------------------------
@@ -326,12 +328,55 @@ class RiskManager:
                     "Kill switch por drawdown liberado: ignore_drawdown_limits está activo"
                 )
                 self.reset_kill_switch()
+            # Desactivar el FRENO no debe desactivar el AVISO. Hasta el
+            # 2026-08-25 esta rama salía en silencio: la cuenta demo llegó al
+            # 52.5 % de drawdown y nada lo dijo. Es la misma lección del
+            # incidente del reloj (2026-08-04) —"el motor estuvo 4 días sin
+            # operar y nada avisó"— aplicada al riesgo: quien apaga un freno
+            # decide asumir la pérdida, no dejar de verla.
+            self._raise_drawdown_alarm(drawdown_pct)
             return
         if drawdown_pct >= self._settings.kill_switch_drawdown_pct > 0:
             self.engage_kill_switch(
                 f"drawdown {drawdown_pct:.1f}% ≥ {self._settings.kill_switch_drawdown_pct:.1f}%",
                 by_drawdown=True,
             )
+
+    def _raise_drawdown_alarm(self, drawdown_pct: float) -> None:
+        """Latch an alarm when the drawdown crosses the threshold with the brake off.
+
+        Con **latch**: se avisa en la transición, no en cada vuelta del bucle de
+        gestión (que corre cada 2 s). Una alarma que se repite cada dos segundos
+        se silencia sola, y una alarma silenciada es peor que ninguna — mismo
+        criterio que las alarmas de motor ciego y mudo.
+
+        Se rearma al recuperarse por debajo del umbral, para que un segundo
+        episodio vuelva a avisar.
+        """
+        threshold = self._settings.kill_switch_drawdown_pct
+        if threshold <= 0:
+            return
+        if drawdown_pct >= threshold:
+            if not self._drawdown_alarm:
+                self._drawdown_alarm = True
+                self._log.warning(
+                    "AVISO de drawdown: %.1f%% >= %.1f%% — el freno está desactivado "
+                    "(ignore_drawdown_limits), así que no se detiene nada",
+                    drawdown_pct,
+                    threshold,
+                )
+        elif self._drawdown_alarm:
+            self._drawdown_alarm = False
+            self._log.warning(
+                "Drawdown recuperado por debajo del umbral (%.1f%% < %.1f%%)",
+                drawdown_pct,
+                threshold,
+            )
+
+    @property
+    def drawdown_alarm(self) -> bool:
+        """Si el drawdown superó el umbral con el freno desactivado."""
+        return self._drawdown_alarm
 
     def _check_circuit_breaker(self, now: datetime) -> None:
         """Trip the circuit breaker when the window loss exceeds the limit."""
@@ -372,6 +417,9 @@ class RiskManager:
             "consecutive_losses": self._consecutive_losses,
             "drawdown_pct": round(self._last_drawdown_pct, 4),
             "ignore_drawdown_limits": self._settings.ignore_drawdown_limits,
+            # Visible aunque el freno esté apagado: es la diferencia entre
+            # asumir una pérdida y no verla.
+            "drawdown_alarm": self._drawdown_alarm,
             "realized_today": round(self._realized_since(_start_of_day(utc_now())), 4),
             "limits": {
                 "max_risk_per_trade_pct": self._settings.max_risk_per_trade_pct,

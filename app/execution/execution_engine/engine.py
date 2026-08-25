@@ -840,7 +840,24 @@ class ExecutionEngine(Service):
     async def _refresh_risk(self) -> None:
         """Update drawdown-driven risk state and flatten on kill switch."""
         snapshot = self._portfolio.snapshot(self._positions.open_positions)
+        was_alarmed = self._risk.drawdown_alarm
         self._risk.update_equity(snapshot.drawdown_pct)
+        # Aviso de drawdown con el freno desactivado: no detiene nada, pero se
+        # publica igual. El bus lo lleva a Discord como cualquier otro evento de
+        # riesgo. Sólo en la transición — el RiskManager ya trae el latch.
+        if self._risk.drawdown_alarm and not was_alarmed:
+            await self._publish(
+                ev.RiskTriggered(
+                    source="execution_engine",
+                    rule="drawdown_alarm",
+                    symbol="",
+                    detail=(
+                        f"drawdown {snapshot.drawdown_pct:.1f}% ≥ "
+                        f"{self._settings.risk.kill_switch_drawdown_pct:.1f}% — el freno está "
+                        f"desactivado (ignore_drawdown_limits), no se detiene nada"
+                    ),
+                )
+            )
         active = self._risk.kill_switch_active
         # El latch evita anunciar el mismo disparo en cada vuelta del bucle,
         # pero debe rearmarse al liberar el switch: si no, un segundo disparo
