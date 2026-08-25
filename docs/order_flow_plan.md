@@ -103,8 +103,18 @@ es pagar por una precisión que no se puede comprobar.
 
 El orden que sí tiene sentido:
 
-1. ✅ **Hecho.** Regla del tick en el agregador (`delta` y `cvd` ya reciben
-   dato real) y `orderbook_imbalance` desactivada, que era lo único posible.
+1. ✅ **Hecho, en dos mitades.** La regla del tick en el agregador (2026-08-21)
+   pobló el volumen firmado de las velas, pero **no bastó**: cuatro días después
+   `delta_confirmation` y `cvd` seguían sin emitir una sola señal, porque leen
+   la feature `orderflow`, que se construye con `get_recent_trades()` — y MT5
+   nunca emite `Trade`. La segunda mitad (2026-08-25) añade
+   `FeatureStore._flow_from_candles`, que sintetiza el flujo desde el volumen
+   firmado cuando no hay tape. `orderbook_imbalance` queda desactivada, que era
+   lo único posible.
+
+   Lección que conviene guardar: poblar el dato no es lo mismo que conectarlo.
+   La verificación del 08-21 miró las velas y dio por bueno el arreglo; la que
+   valía era mirar si las estrategias emitían.
 2. **Medir esas dos con el evaluador continuo**, sin dejarlas operar, y
    aplicarles el mismo kill criteria que se usó para sesiones y regímenes
    (`scripts/regime_edge.py` sirve de plantilla). Si ni siquiera el proxy de
