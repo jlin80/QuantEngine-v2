@@ -93,8 +93,16 @@ def _virtual(name: str, expectancy: float, evaluated: int = 300) -> VirtualStrat
     )
 
 
-def test_virtual_evidence_carries_the_weight_when_executed_sample_is_thin():
-    """4 operaciones cerradas no son evidencia; 300 señales evaluadas sí aportan."""
+def test_good_virtual_evidence_never_raises_the_effective_score():
+    """La evidencia virtual sólo puede frenar, nunca empujar (2026-08-26).
+
+    Antes esta prueba exigía lo contrario: que 300 señales evaluadas subieran el
+    score de una estrategia con 4 operaciones cerradas. Se midió el sesgo del
+    evaluador contra la ejecución real y resultó no sólo optimista sino
+    optimista de forma DESIGUAL — sesgo medio +0.3457R, rango -0.0684 a +1.1039,
+    y el orden cambia en 8 de 10 posiciones. Promover con ese ranking es
+    promover casi al azar. Ver `docs/evaluator_bias.md`.
+    """
     manager = _manager(min_trades=20)
     labeled = [("order_block", t) for t in strategy_trades("order_block", 4, win_rate=0.5)]
 
@@ -103,7 +111,25 @@ def test_virtual_evidence_carries_the_weight_when_executed_sample_is_thin():
     decision = next(d for d in report.decisions if d["strategy"] == "order_block")
     assert decision["evidence"]["source"] == "blended"
     assert decision["evidence"]["executed_weight"] == pytest.approx(0.2)
-    assert decision["metrics"]["effective_score"] > decision["metrics"]["score"]
+    assert decision["evidence"]["virtual_capped"] is True
+    assert decision["metrics"]["effective_score"] == decision["metrics"]["score"]
+
+
+def test_bad_virtual_evidence_still_drags_the_score_down():
+    """Lo que sí conserva valor: salir mal AUN con una estimación sesgada al alza.
+
+    Una estrategia que el evaluador optimista ya puntúa por debajo de su
+    resultado ejecutado es mala con bastante seguridad, así que el mezclado
+    sigue pudiendo bajarla.
+    """
+    manager = _manager(min_trades=20)
+    labeled = [("order_block", t) for t in strategy_trades("order_block", 4, win_rate=1.0)]
+
+    report = manager.evaluate(labeled, {"order_block": _virtual("order_block", -2.0)})
+
+    decision = next(d for d in report.decisions if d["strategy"] == "order_block")
+    assert decision["metrics"]["effective_score"] < decision["metrics"]["score"]
+    assert decision["evidence"]["virtual_capped"] is False
 
 
 def test_executed_evidence_wins_once_the_sample_is_sufficient():

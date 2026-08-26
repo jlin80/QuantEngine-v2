@@ -211,6 +211,21 @@ class MetaStrategyManager:
         una estrategia por su rendimiento virtual, que no incluye costes,
         slippage ni salidas por régimen.
 
+        **La evidencia virtual sólo puede frenar, nunca empujar** (2026-08-26).
+        Se midió el sesgo del evaluador contra la ejecución real y no sólo es
+        optimista: es optimista de forma **desigual**. Sesgo medio +0.3457R,
+        rango de -0.0684R a +1.1039R, y **el orden cambia en 8 de 10
+        posiciones** — `choch` y `vwap_mean_reversion` figuran entre las mejores
+        virtualmente y son perdedoras reales. Un sesgo constante desplazaría a
+        todas por igual y no rompería un ranking; este lo reordena, así que
+        usarlo para *promover* es promover casi al azar. Ver
+        ``docs/evaluator_bias.md``.
+
+        Lo que sí conserva valor: una estrategia que sale mal **incluso con una
+        estimación sesgada al alza** es mala con bastante seguridad. Por eso el
+        mezclado se acota a la baja. Es la misma regla que Edge Research ya
+        aplica a su multiplicador (ADR-100): frena, no empuja.
+
         Returns:
             El score efectivo y la traza de qué evidencia lo sostiene.
         """
@@ -224,11 +239,13 @@ class MetaStrategyManager:
             }
         virtual_score = virtual.score()
         blended = executed_weight * score.score + (1.0 - executed_weight) * virtual_score
-        return blended, {
+        effective = min(blended, score.score)
+        return effective, {
             "source": "blended" if score.trades else "virtual",
             "executed_weight": round(executed_weight, 4),
             "executed_trades": score.trades,
             "virtual_score": round(virtual_score, 2),
+            "virtual_capped": effective < blended,
             "virtual": virtual.to_dict(),
         }
 
