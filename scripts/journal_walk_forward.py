@@ -33,7 +33,14 @@ FOLDS = 3
 RESAMPLES = 3000
 
 
-def load(path: Path, symbol: str) -> list[dict[str, Any]]:
+def load(path: Path, symbol: str, desde: str = "") -> list[dict[str, Any]]:
+    """Operaciones del simbolo, opcionalmente desde una fecha de entrada.
+
+    El filtro por fecha existe porque el journal abarca varias configuraciones
+    de produccion (el Bloque 1 y el arreglo de sizing del 2026-08-11 cambiaron
+    el comportamiento). Un walk-forward que mezcla eras mide el cambio de
+    configuracion tanto como la persistencia del edge.
+    """
     rows = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
@@ -43,14 +50,37 @@ def load(path: Path, symbol: str) -> list[dict[str, Any]]:
             r = json.loads(line)
         except Exception:
             continue
-        if str(r.get("symbol", "")).upper() == symbol.upper():
-            rows.append(r)
+        if str(r.get("symbol", "")).upper() != symbol.upper():
+            continue
+        if desde and str(r.get("entry_time") or "")[:10] < desde:
+            continue
+        rows.append(r)
     rows.sort(key=lambda r: str(r.get("exit_time") or ""))
     return rows
 
 
+_SESSION_HOURS = {"asia": (0, 9), "europe": (7, 16), "america": (13, 22)}
+
+
+def _sessions_at(hour: int) -> str:
+    """Sesiones activas a una hora UTC, unidas por '+'.
+
+    Mismas ventanas que `MarketContextEngine`, solapes incluidos: el motor
+    devuelve una tupla de sesiones activas, no una sola, asi que 07-09 UTC es
+    la celda `asia+europe` y no se reparte a dedo entre las dos.
+    """
+    active = [
+        name
+        for name, (start, end) in _SESSION_HOURS.items()
+        if (start <= hour < end) or (start > end and (hour >= start or hour < end))
+    ]
+    return "+".join(active) if active else "fuera"
+
+
 def dims(r: dict[str, Any]) -> dict[str, str]:
+    entry = str(r.get("entry_time") or "")
     return {
+        "sesion": _sessions_at(int(entry[11:13])) if len(entry) >= 13 else "?",
         "strategy": str(r.get("strategy") or "?"),
         "categoria": str(r.get("strategy_category") or "?"),
         "regimen": str(r.get("regime") or "?"),
@@ -78,7 +108,8 @@ def select(rows: list[dict[str, Any]]) -> set[tuple[str, str]]:
 def main() -> int:
     path = Path(sys.argv[1])
     symbol = sys.argv[2] if len(sys.argv) > 2 else "XAUUSDM"
-    rows = load(path, symbol)
+    desde = sys.argv[3] if len(sys.argv) > 3 else ""
+    rows = load(path, symbol, desde)
     blocks = FOLDS + 1
     size = len(rows) // blocks
     print(f"{symbol}: {len(rows)} operaciones, {blocks} bloques de ~{size}\n")

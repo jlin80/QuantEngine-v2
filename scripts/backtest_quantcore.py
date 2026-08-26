@@ -23,6 +23,7 @@ from collections import Counter
 from app.backtesting.mt5_history import pull_candles
 from app.backtesting.quant_source import run_quantcore_backtest
 from app.config.settings import get_settings
+from app.engine.plugins import PluginLoader
 from app.market.models import Candle
 
 
@@ -237,6 +238,11 @@ def main() -> None:
         help="Una sola corrida con desglose de comision (misma poblacion) y de salidas",
     )
     parser.add_argument(
+        "--solo",
+        default="",
+        help="Corre UNA sola estrategia, desactivando las demas en el plugin loader",
+    )
+    parser.add_argument(
         "--live-config",
         action="store_true",
         help="Corre con los overrides del Config Center (logs/runtime_config.json), "
@@ -262,6 +268,23 @@ def main() -> None:
         print(f"Configuracion del operador aplicada ({len(applied)} overrides):")
         for line in applied:
             print(f"  - {line}")
+
+    if args.solo:
+        # Aislar una estrategia: el consenso promedia 20, y varias estan
+        # correlacionadas entre si, asi que el voto de cualquiera queda diluido.
+        # Se desactivan en el loader (no con `strategies_enabled`, que solo
+        # bloquea la apertura): aqui interesa que ni siquiera voten.
+        from app.config.settings import QuantStrategySettings
+
+        loader = PluginLoader(list(settings.quant.plugin_dirs))
+        apagadas = 0
+        for cls in loader.discover():
+            if cls.name == args.solo:
+                continue
+            settings.quant.strategies.setdefault(cls.name, QuantStrategySettings()).enabled = False
+            apagadas += 1
+        settings.quant.strategies.setdefault(args.solo, QuantStrategySettings()).enabled = True
+        print(f"Solo {args.solo}: {apagadas} estrategias desactivadas en el loader")
 
     print(f"Jalando {args.bars} velas 1m de {args.symbol} desde MT5...")
     candles = _pull_mt5_candles(args.symbol, args.bars)

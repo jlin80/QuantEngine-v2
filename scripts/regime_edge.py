@@ -1,8 +1,8 @@
-"""¿Hay edge estable en algún régimen de mercado? (Gap de investigación nº6).
+"""¿Hay edge estable por régimen o por sesión? (Gaps de investigación 6 y 3).
 
-Segmenta el Trade Journal **real** por el régimen observado al abrir la
-posición y aplica el mismo kill criteria que `docs/session_edge.md` fijó para
-las sesiones, para no cambiar la vara de medir según el resultado:
+Segmenta el Trade Journal **real** por el régimen o la sesión observados al
+abrir la posición y aplica el mismo kill criteria que `docs/session_edge.md`
+fijó para las sesiones, para no cambiar la vara de medir según el resultado:
 
 1. muestra mínima por celda,
 2. intervalo de confianza bootstrap que no toque el cero,
@@ -14,8 +14,15 @@ reconciliado con producción (2026-08-21) pero sigue sin el canal de cierres
 `manual` del broker y construye las velas desde barras nativas en vez de desde
 ticks. Para una pregunta de segmentación, el registro real es la fuente directa.
 
+La sesión se deriva de la hora UTC de entrada con las mismas ventanas que usa
+``MarketContextEngine`` (asia 0-9, europa 7-16, américa 13-22). **Se solapan a
+propósito**: el motor devuelve una tupla de sesiones activas, no una sola, así
+que el solape es una celda propia (`asia+europa`) y no se reparte a dedo entre
+las dos. Repartirlo sería inventar una desambiguación que el motor no hace.
+
 Uso:
     python -m scripts.regime_edge --symbol XAUUSDM --desde 2026-08-11
+    python -m scripts.regime_edge --por sesion
 """
 
 from __future__ import annotations
@@ -28,14 +35,29 @@ import statistics as st
 from collections import defaultdict
 from pathlib import Path
 
+# Mismas ventanas que `QuantContextSettings.session_hours`.
+_SESSION_HOURS = {"asia": (0, 9), "europe": (7, 16), "america": (13, 22)}
+
 _MIN_TRADES = 30
 _FDR_Q = 0.05
 _BOOTSTRAP = 2000
 _SUBPERIODS = 3
 
 
-def _load(path: Path, symbol: str, desde: str, hasta: str) -> list[tuple[str, str, float]]:
-    """Read (fecha, régimen, R) for the closed trades in range."""
+def _sessions_at(hour: int) -> str:
+    """Active sessions for a UTC hour, joined (empty -> "fuera de sesion")."""
+    active = [
+        name
+        for name, (start, end) in _SESSION_HOURS.items()
+        if (start <= hour < end) or (start > end and (hour >= start or hour < end))
+    ]
+    return "+".join(active) if active else "fuera"
+
+
+def _load(
+    path: Path, symbol: str, desde: str, hasta: str, por: str = "regimen"
+) -> list[tuple[str, str, float]]:
+    """Read (fecha, celda, R) for the closed trades in range."""
     rows: list[tuple[str, str, float]] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -54,7 +76,12 @@ def _load(path: Path, symbol: str, desde: str, hasta: str) -> list[tuple[str, st
             r = record.get("r_multiple")
             if r is None:
                 continue
-            rows.append((day, str(record.get("regime") or "unknown"), float(r)))
+            if por == "sesion":
+                hour = int(str(record.get("entry_time"))[11:13])
+                cell = _sessions_at(hour)
+            else:
+                cell = str(record.get("regime") or "unknown")
+            rows.append((day, cell, float(r)))
     return rows
 
 
@@ -100,26 +127,30 @@ def main() -> None:
     parser.add_argument("--desde", default="2026-08-11", help="Inicio (config actual)")
     parser.add_argument("--hasta", default="2026-12-31")
     parser.add_argument("--journal", default="data/execution/journal.jsonl")
+    parser.add_argument("--por", choices=("regimen", "sesion"), default="regimen")
     args = parser.parse_args()
 
-    rows = _load(Path(args.journal), args.symbol, args.desde, args.hasta)
+    rows = _load(Path(args.journal), args.symbol, args.desde, args.hasta, args.por)
     if not rows:
         print("Sin operaciones en el rango.")
         return
 
-    by_regime: dict[str, list[float]] = defaultdict(list)
-    for _, regime, r in rows:
-        by_regime[regime].append(r)
+    by_cell: dict[str, list[float]] = defaultdict(list)
+    for _, cell, r in rows:
+        by_cell[cell].append(r)
 
     days = sorted({day for day, _, _ in rows})
     chunk = max(1, len(days) // _SUBPERIODS)
     windows = [set(days[i : i + chunk]) for i in range(0, len(days), chunk)][:_SUBPERIODS]
 
     rng = random.Random(7)
-    print(f"{args.symbol}  {args.desde} → {args.hasta}   n={len(rows)}  dias={len(days)}")
+    print(
+        f"{args.symbol}  por {args.por}  {args.desde} → {args.hasta}   "
+        f"n={len(rows)}  dias={len(days)}"
+    )
     print()
     header = (
-        f"{'regimen':<14}{'n':>6}{'expect.':>10}"
+        f"{'celda':<20}{'n':>6}{'expect.':>10}"
         f"{'IC 95% bootstrap':>26}{'p':>9}  {'signo estable':<14}"
     )
     print(header)
@@ -127,11 +158,11 @@ def main() -> None:
 
     elegibles: dict[str, float] = {}
     detalle: dict[str, tuple[int, float, tuple[float, float], bool]] = {}
-    for regime, values in sorted(by_regime.items(), key=lambda kv: -len(kv[1])):
+    for regime, values in sorted(by_cell.items(), key=lambda kv: -len(kv[1])):
         n = len(values)
         mean = sum(values) / n
         if n < _MIN_TRADES:
-            print(f"{regime:<14}{n:>6}{mean:>+10.4f}{'(muestra insuficiente)':>26}")
+            print(f"{regime:<20}{n:>6}{mean:>+10.4f}{'(muestra insuficiente)':>26}")
             continue
         low, high = _bootstrap_ci(values, rng)
         p = _p_value(values)
@@ -142,7 +173,7 @@ def main() -> None:
                 signs.append(sum(sub) / len(sub))
         estable = bool(signs) and (all(s > 0 for s in signs) or all(s < 0 for s in signs))
         print(
-            f"{regime:<14}{n:>6}{mean:>+10.4f}"
+            f"{regime:<20}{n:>6}{mean:>+10.4f}"
             f"{f'[{low:+.4f}, {high:+.4f}]':>26}{p:>9.4f}  {'si' if estable else 'NO':<14}"
         )
         detalle[regime] = (n, mean, (low, high), estable)
@@ -160,7 +191,7 @@ def main() -> None:
     )
     print()
     if not aprobadas:
-        print("VEREDICTO: no hay edge estable por regimen con la muestra disponible.")
+        print(f"VEREDICTO: no hay edge estable por {args.por} con la muestra disponible.")
     else:
         for regime in sorted(aprobadas):
             n, mean, _, _ = detalle[regime]
