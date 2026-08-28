@@ -11,10 +11,15 @@ El Portfolio Manager no posee las posiciones (eso es del Position Manager):
 recibe la lista de abiertas para valorar la cartera bajo demanda.
 """
 
+import json
+import logging
 from collections.abc import Iterable
+from pathlib import Path
 
 from app.execution.models import PortfolioSnapshot, Position
 from app.utils.time import utc_now
+
+_log = logging.getLogger("app.execution.portfolio")
 
 
 class PortfolioManager:
@@ -24,21 +29,64 @@ class PortfolioManager:
         initial_balance: Balance inicial de la cuenta (paper).
         base_currency: Divisa base.
         leverage: Apalancamiento nominal (1.0 = sin apalancamiento).
+        peak_path: Fichero donde persistir el **máximo histórico de equity**.
+            Con ``None`` (backtests, tests) no se persiste nada.
     """
 
     def __init__(
-        self, initial_balance: float, *, base_currency: str = "USD", leverage: float = 1.0
+        self,
+        initial_balance: float,
+        *,
+        base_currency: str = "USD",
+        leverage: float = 1.0,
+        peak_path: Path | None = None,
     ) -> None:
         self._initial_balance = initial_balance
         self._balance = initial_balance
         self._base_currency = base_currency
         self._leverage = max(1.0, leverage)
-        self._peak_equity = initial_balance
+        self._peak_path = peak_path
+        self._stored_peak = self._load_peak()
+        self._peak_equity = max(initial_balance, self._stored_peak)
         self._total_trades = 0
         self._wins = 0
         self._losses = 0
         self._commission_paid = 0.0
         self._last_floating = 0.0
+
+    def _load_peak(self) -> float:
+        """Read the stored high-water mark (0.0 if there is none or it is unreadable).
+
+        Un fichero ilegible no puede tumbar el arranque del motor: se avisa y se
+        sigue con 0.0, que es el comportamiento anterior a persistir nada.
+        """
+        if self._peak_path is None or not self._peak_path.exists():
+            return 0.0
+        try:
+            data = json.loads(self._peak_path.read_text(encoding="utf-8"))
+            return float(data.get("peak_equity", 0.0))
+        except (OSError, ValueError, TypeError) as exc:
+            _log.warning("No se pudo leer el pico de equity (%s); se arranca sin el", exc)
+            return 0.0
+
+    def _remember_peak(self) -> None:
+        """Persist the high-water mark when it grows.
+
+        **Un depósito no borra el pico anterior.** Es deliberado: si al ingresar
+        dinero se reiniciara la referencia, bastaría recargar la cuenta para que
+        un drawdown desapareciera de la vista, y el freno dejaria de ver
+        justamente la situación en la que más importa.
+        """
+        if self._peak_path is None or self._peak_equity <= self._stored_peak:
+            return
+        self._stored_peak = self._peak_equity
+        try:
+            self._peak_path.parent.mkdir(parents=True, exist_ok=True)
+            self._peak_path.write_text(
+                json.dumps({"peak_equity": round(self._peak_equity, 4)}), encoding="utf-8"
+            )
+        except OSError as exc:
+            _log.warning("No se pudo guardar el pico de equity (%s)", exc)
 
     def restore(
         self,
@@ -65,7 +113,8 @@ class PortfolioManager:
             commission_paid: Comisiones acumuladas.
         """
         self._balance = balance
-        self._peak_equity = max(peak_equity, balance)
+        self._peak_equity = max(peak_equity, balance, self._stored_peak)
+        self._remember_peak()
         self._total_trades = total_trades
         self._wins = wins
         self._losses = losses
@@ -87,9 +136,17 @@ class PortfolioManager:
         self._balance = balance
         if set_baseline:
             self._initial_balance = balance
-            self._peak_equity = balance
+            # El pico NO se reinicia con el arranque. Antes sí, y por eso el
+            # drawdown era ciego entre reinicios: la cuenta demo llegó al 52.5 %
+            # el 2026-08-25, la máquina reinició, y el motor volvió marcando
+            # 0 %. La herramienta que lee el journal veía 67.4 % al mismo tiempo
+            # que la API en vivo decía 6.86 %. Un freno cuya memoria se borra en
+            # cada arranque no es un freno — y esta se borraba también en cada
+            # despliegue.
+            self._peak_equity = max(balance, self._stored_peak)
         else:
             self._peak_equity = max(self._peak_equity, balance)
+        self._remember_peak()
 
     @property
     def balance(self) -> float:
@@ -184,6 +241,7 @@ class PortfolioManager:
         used = self.used_capital(open_positions)
         exposure = self.exposure(open_positions)
         self._peak_equity = max(self._peak_equity, equity)
+        self._remember_peak()
         drawdown_pct = 0.0
         if self._peak_equity > 0:
             drawdown_pct = max(0.0, (self._peak_equity - equity) / self._peak_equity * 100.0)

@@ -1739,6 +1739,11 @@ class ExecutionSettings(BaseModel):
     strategies_enabled: dict[str, bool] = Field(default_factory=dict)
     report_interval_seconds: float = 3600.0  # resumen periódico a Discord
     journal_path: Path = _PROJECT_ROOT / "data" / "execution" / "journal.jsonl"
+    # Máximo histórico de equity, persistido aparte del ciclo de vida del
+    # proceso: es la base del drawdown y del kill switch, y hasta el 2026-08-28
+    # se reiniciaba en cada arranque. Un freno cuya memoria se borra al
+    # reiniciar no frena nada — y el motor reinicia en cada despliegue.
+    equity_peak_path: Path = _PROJECT_ROOT / "data" / "execution" / "equity_peak.json"
     persist_journal: bool = True
     commission: CommissionSettings = Field(default_factory=CommissionSettings)
     slippage: SlippageSettings = Field(default_factory=SlippageSettings)

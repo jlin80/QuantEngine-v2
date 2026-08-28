@@ -716,6 +716,7 @@ def _build_execution(container: Container, settings: Settings, bus: EventBus) ->
         initial_balance,
         base_currency=execution.base_currency,
         leverage=execution.leverage,
+        peak_path=execution.equity_peak_path,
     )
     risk = RiskManager(execution.risk, initial_balance)
     orders = OrderManager()
